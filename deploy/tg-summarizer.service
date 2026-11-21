@@ -1,0 +1,23 @@
+[Unit]
+Description=Telegram Forum Daily Summarizer Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_LINUX_USER
+WorkingDirectory=/home/YOUR_LINUX_USER/tg-daily-summarizer
+EnvironmentFile=/home/YOUR_LINUX_USER/tg-daily-summarizer/.env
+ExecStart=/home/YOUR_LINUX_USER/tg-daily-summarizer/.venv/bin/python -m bot.main
+
+Restart=always
+RestartSec=5s
+
+# Security and resource restrictions
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-summarizer
+
+[Install]
+WantedBy=multi-user.target
