@@ -133,7 +133,8 @@ async def run_summary_for_topic(
         )
         if mark_summarized and messages:
             msg_ids = [m["id"] for m in messages]
-            await repository.mark_messages_summarized(msg_ids)
+            deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
+            logger.info("Deleted %s below-threshold messages for topic '%s' to free storage.", deleted_cnt, topic_name)
         return False, f"تعداد پیام‌ها ({len(messages)}) کمتر از حداقل حد نصاب ({min_msgs}) بود."
 
     # Generate summary with AI
@@ -141,6 +142,7 @@ async def run_summary_for_topic(
         summary_text = await summarize_topic_messages(
             topic_name=topic_name,
             messages=messages,
+            chat_id=chat_id,
             min_messages=min_msgs,
             is_nightly=is_nightly,
             llm_client=llm_client,
@@ -171,7 +173,7 @@ async def run_summary_for_topic(
 
     if dest_mode == "aggregate" and dest_tid is not None:
         target_thread = dest_tid
-        content_to_send = f"📂 <b>تاپیک مبدا: {topic_name}</b>\n\n{summary_text}"
+        content_to_send = f"📂 <b>تاپیک مبدا: {topic_name}</b>\n\n\n{summary_text}"
     else:
         target_thread = thread_id
         content_to_send = summary_text
@@ -191,8 +193,8 @@ async def run_summary_for_topic(
     if delivered:
         if mark_summarized:
             msg_ids = [m["id"] for m in messages]
-            await repository.mark_messages_summarized(msg_ids)
-            logger.info("Marked %s messages as summarized in topic '%s'.", len(msg_ids), topic_name)
+            deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
+            logger.info("Deleted %s summarized messages in topic '%s' to free database space.", deleted_cnt, topic_name)
         return True, "خلاصه با موفقیت ارسال شد."
     else:
         logger.error("Failed delivering summary for topic '%s' in chat %s.", topic_name, chat_id)

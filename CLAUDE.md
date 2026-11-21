@@ -60,12 +60,13 @@ tg-daily-summarizer/
 │   │   └── jobs.py          # APScheduler nightly job (00:01 Tehran), daily retention cleanup
 │   └── utils/
 │       ├── general_topic.py # Normalizes General topic (None/1 -> 1; send target -> None)
+│       ├── link_parser.py   # Parses Telegram topic/message links and validates group chat IDs
 │       ├── noise_filter.py  # Strips greetings, filler, emojis, punctuation, normalizes ي/ك
 │       ├── text_split.py    # Tag-aware smart message chunker (<= 4000 chars)
 │       ├── dates.py         # Jalali (jdatetime) & Gregorian helpers in Asia/Tehran
 │       ├── retry.py         # Async exponential backoff with jitter on 429/5xx/network errors
 │       └── logging_setup.py # Rotating UTF-8 file handler (5MB x 5) & console handler
-├── tests/                   # Complete offline unit tests (17 passing tests)
+├── tests/                   # Complete offline unit tests (32 passing tests)
 ├── deploy/                  # Linux systemd unit (tg-summarizer.service)
 ├── .env.example             # Documented template with all 22 environment keys
 └── README.md                # Comprehensive Persian documentation

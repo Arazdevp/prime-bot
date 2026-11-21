@@ -331,6 +331,22 @@ async def mark_messages_summarized(message_ids: list[int]) -> None:
         await conn.commit()
 
 
+async def delete_messages_by_ids(message_ids: list[int]) -> int:
+    """Delete messages permanently by their database primary IDs to reclaim disk space."""
+    if not message_ids:
+        return 0
+
+    conn = get_db()
+    lock = get_write_lock()
+    placeholders = ",".join("?" for _ in message_ids)
+    sql = f"DELETE FROM messages WHERE id IN ({placeholders});"
+
+    async with lock:
+        cursor = await conn.execute(sql, message_ids)
+        await conn.commit()
+        return cursor.rowcount
+
+
 async def delete_old_messages(retention_days: int) -> int:
     """Delete messages older than retention_days (UTC). Returns count of deleted messages."""
     conn = get_db()

@@ -15,6 +15,7 @@ from bot.utils.dates import (
     get_tehran_now,
 )
 from bot.utils.general_topic import resolve_thread_id, to_send_thread_id
+from bot.utils.link_parser import parse_topic_link
 
 logger = logging.getLogger(__name__)
 
@@ -223,13 +224,26 @@ async def cmd_mode(message: Message) -> None:
 
 @router.message(Command("set_destination"))
 async def cmd_set_destination(message: Message) -> None:
-    """Set current topic as aggregate summary destination."""
+    """Set current topic or specified topic link/ID as aggregate summary destination."""
     if not message.chat:
         return
     await try_delete_command(message)
 
-    thread_id = resolve_thread_id(message)
     chat_id = message.chat.id
+    args = (message.text or "").split()[1:]
+
+    if args:
+        raw_arg = args[0].strip()
+        _, thread_id, error = parse_topic_link(raw_arg, current_chat_id=chat_id)
+        if error or thread_id is None:
+            await send_topic_reply(
+                message,
+                f"⚠️ <b>خطا در تنظیم مقصد خلاصه:</b>\n\n{error or 'شناسه تاپیک معتبر نیست.'}",
+            )
+            return
+    else:
+        thread_id = resolve_thread_id(message)
+
     topic_name = await repository.get_topic_name(chat_id, thread_id)
     if not topic_name:
         topic_name = "عمومی" if thread_id == 1 else f"تاپیک {thread_id}"
@@ -237,7 +251,7 @@ async def cmd_set_destination(message: Message) -> None:
     await repository.set_group_destination(chat_id, "aggregate", thread_id)
     await send_topic_reply(
         message,
-        f"📌 مقصد ارسال تمامی خلاصه‌های روزانه روی تاپیک <b>«{topic_name}»</b> (حالت تجمیعی) تنظیم شد.",
+        f"📌 مقصد ارسال تمامی خلاصه‌های روزانه روی تاپیک <b>«{topic_name}»</b> (شناسه: <code>{thread_id}</code>) تنظیم شد.",
     )
 
 
@@ -395,13 +409,13 @@ async def cmd_help(message: Message) -> None:
         "🔹 <code>/add_topic</code> — افزودن تاپیک فعلی به پایش خلاصه‌سازی\n"
         "🔹 <code>/remove_topic</code> — خروج تاپیک فعلی از پایش خلاصه‌سازی\n"
         "🔹 <code>/mode whitelist|blacklist</code> — تغییر حالت پایش به لیست سفید یا سیاه\n"
-        "🔹 <code>/set_destination</code> — تنظیم تاپیک فعلی به عنوان مقصد تجمیعی خلاصه‌ها\n"
+        "🔹 <code>/set_destination [لینک|شناسه]</code> — تنظیم تاپیک مقصد تجمیعی خلاصه‌ها (با ارسال در همان تاپیک یا ارسال لینک تاپیک)\n"
         "🔹 <code>/reset_destination</code> — بازگرداندن مقصد خلاصه‌ها به هر تاپیک مجزا\n"
         "🔹 <code>/summary_on</code> — فعال‌سازی موقت سیستم خلاصه‌سازی برای گروه\n"
         "🔹 <code>/summary_off</code> — غیرفعال‌سازی سیستم خلاصه‌سازی برای گروه\n"
         "🔹 <code>/summarize_now [keep]</code> — اجرای دستی خلاصه‌سازی برای تاپیک فعلی\n"
         "🔹 <code>/summarize_all [keep]</code> — اجرای دستی خلاصه‌سازی برای همه تاپیک‌های گروه\n"
         "🔹 <code>/help</code> — نمایش همین پیام راهنما\n\n"
-        "<i>نکته: پارامتر <code>keep</code> در دستورات دستی مانع از علامت‌گذاری پیام‌ها به عنوان خلاصه‌شده می‌شود (مناسب تست).</i>"
+        "<i>نکته: پارامتر <code>keep</code> در دستورات دستی مانع از حذف پیام‌ها از دیتابیس می‌شود (مناسب تست). در حالت عادی، پس از خلاصه‌سازی موفق پیام‌ها از دیتابیس پاک می‌شوند تا فضا اشغال نشود.</i>"
     )
     await send_topic_reply(message, help_text)

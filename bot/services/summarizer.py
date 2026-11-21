@@ -8,70 +8,88 @@ from zoneinfo import ZoneInfo
 from bot.config import get_settings
 from bot.services.llm_client import BaseLLMClient, get_llm_client
 from bot.utils.dates import format_date_heading, get_tehran_now
+from bot.utils.link_parser import get_clean_chat_id
 from bot.utils.retry import async_retry
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، ساختاریافته، سلیس و بدون حاشیه به زبان فارسی است.
+SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، ساختاریافته، بسیار خوانا، سلیس و بدون حاشیه به زبان فارسی است.
 
 قوانین حیاتی:
 ۱. فقط و فقط از اطلاعات موجود در پیام‌ها استفاده کنید. هرگز از خود چیزی حدس نزنید یا اضافه نکنید.
 ۲. خوش‌وبش، احوالپرسی، تعارفات و پیام‌های بی‌محتوا را کاملاً نادیده بگیرید.
 ۳. اسامی افراد، پیوندها (لینک‌ها) و اعداد/مبالغ مهم را با نهایت دقت و بدون تحریف حفظ کنید.
-۴. صرفاً از تگ‌های مجاز HTML تلگرام استفاده کنید: <b>, <i>, <code>, <blockquote>, <a href="...">. هیچ‌گونه مارک‌داون (مانند ** یا #) استفاده نکنید. کاراکترهای < و > و & در متن ساده را حتماً Escape کنید.
-۵. ساختار خروجی شما باید دقیقاً به شکل زیر باشد (بخش‌های بدون محتوا را حذف کنید):
+۴. قانون پیوند آبی به پیام‌های کلیدی:
+در متن ورودی، هر پیام با شناسه مانند [#پیام ۱۲۳] مشخص شده است. هر زمان که یک تصمیم نهایی، خبر مهم، پاسخ کلیدی، راه‌حل، یا سؤال بی‌پاسخ مطرح شد، عبارت خلاصه آن نکته را حتماً به پیام اصلی پیوند دهید تا در تلگرام به رنگ آبی و قابل کلیک باشد:
+<a href="https://t.me/c/{clean_chat_id}/MESSAGE_ID">متن نکته مهم یا تصمیم</a>
+(فقط عبارت کلیدی مرتبط را لینک کنید و از لینک کردن کل پاراگراف خودداری نمایید).
+۵. قانون فاصله‌گذاری و خوانایی:
+بین هر سرفصل و مبحث، حتماً دو خط خالی (فاصله باز) قرار دهید تا متن به هیچ عنوان فشرده نباشد و کاملاً خوانا، تفکیک‌شده و چشم‌نواز باشد.
+۶. صرفاً از تگ‌های مجاز HTML تلگرام استفاده کنید: <b>, <i>, <code>, <blockquote>, <a href="...">. هیچ‌گونه مارک‌داون (مانند ** یا #) استفاده نکنید. کاراکترهای < و > و & در متن ساده را حتماً Escape کنید.
+۷. ساختار خروجی شما باید دقیقاً به شکل زیر با هدینگ‌های مشخص و دو خط خالی بین بخش‌ها باشد (بخش‌های بدون محتوا را حذف کنید):
 
 📌 <b>خلاصه تاپیک: {topic_name}</b>
 {date_heading}
 
+
 🔹 <b>محورهای اصلی بحث</b>
-• نکته اول به صورت موجز و روان
-• نکته دوم...
+▫️ <b>عنوان مبحث اول:</b>
+• شرح گفتگو و <a href="https://t.me/c/{clean_chat_id}/ID">نکته کلیدی به رنگ آبی</a>...
+
 
 ✅ <b>تصمیم‌ها و جمع‌بندی‌ها</b>
-• تصمیم‌های اتخاذ شده یا نتایج نهایی (در صورت عدم وجود این بخش را حذف کنید)
+• <a href="https://t.me/c/{clean_chat_id}/ID">تصمیم اتخاذ شده</a> یا نتیجه نهایی (در صورت عدم وجود حذف شود)
+
 
 🔗 <b>لینک‌ها و منابع مهم</b>
-• پیوندها به صورت <a href="...">عنوان لینک</a> یا توضیحات مختصر (در صورت عدم وجود این بخش را حذف کنید)
+• پیوندها به صورت <a href="...">عنوان لینک</a> یا توضیحات مختصر (در صورت عدم وجود حذف شود)
+
 
 ❓ <b>سؤالات بی‌پاسخ</b>
-• سؤالات مهمی که در گفتگوها مطرح شده اما بی‌پاسخ مانده‌اند (در صورت عدم وجود این بخش را حذف کنید)
+• <a href="https://t.me/c/{clean_chat_id}/ID">سؤال مهم بی‌پاسخ</a> (در صورت عدم وجود حذف شود)
 
-۶. طول کل خروجی معمولاً باید زیر ۳۰۰۰ کاراکتر باشد مگر اینکه حجم محتوای معنادار واقعاً زیاد باشد.
-۷. هیچ‌گونه مقدمه، نتیجه‌گیری، سلام، خداحافظی یا اشاره به این‌که شما هوش مصنوعی هستید اضافه نکنید."""
+۸. طول کل خروجی معمولاً باید زیر ۳۵۰۰ کاراکتر باشد مگر اینکه حجم محتوای معنادار واقعاً زیاد باشد.
+۹. هیچ‌گونه مقدمه، نتیجه‌گیری، سلام، خداحافظی یا اشاره به این‌که شما هوش مصنوعی هستید اضافه نکنید."""
 
-SYSTEM_PROMPT_CHUNK = """شما یک دستیار هوشمند خلاصه‌سازی هستید. یک بخش از پیام‌های روزانه یک تاپیک تلگرام به شما داده می‌شود. وظیفه شما استخراج نکات کلیدی، مباحث معنادار، اسامی مهم، تصمیمات، لینک‌ها و سؤالات مطرح‌شده در این بخش است.
+SYSTEM_PROMPT_CHUNK = """شما یک دستیار هوشمند خلاصه‌سازی هستید. یک بخش از پیام‌های روزانه یک تاپیک تلگرام به همراه شناسه پیام‌ها به شما داده می‌شود. وظیفه شما استخراج نکات کلیدی، مباحث معنادار، اسامی مهم، تصمیمات، لینک‌ها و سؤالات مطرح‌شده در این بخش است.
 
 قوانین:
 ۱. متن خلاصه را موجز، دقیق و به زبان فارسی سلیس بنویسید.
 ۲. احوالپرسی و پیام‌های فاقد بار اطلاعاتی را کاملاً حذف کنید.
-۳. از تگ‌های HTML مجاز تلگرام استفاده کنید.
-۴. از حدس زدن پرهیز کنید و لینک‌ها و اسامی را دقیقاً قید نمایید.
-۵. مقدمه یا توضیحی اضافه نکنید و صرفاً نکات استخراج‌شده را بنویسید."""
+۳. برای هر نکته یا تصمیم مهم، شناسه پیام آن را حفظ کنید (یا با تگ <a href="https://t.me/c/{clean_chat_id}/ID"> پیوند دهید).
+۴. از تگ‌های HTML مجاز تلگرام استفاده کنید.
+۵. بین هر مبحث فاصله مناسب قرار دهید."""
 
 SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد هستید. به شما خلاصه‌های بخش‌های مختلف از گفتگوهای یک تاپیک تلگرام داده می‌شود. وظیفه شما ترکیب، یکپارچه‌سازی و حذف موارد تکراری برای تولید خلاصه نهایی و جامع روزانه به زبان فارسی است.
 
 قوانین حیاتی:
-۱. ساختار نهایی باید دقیقاً و الزاماً مطابق این الگو باشد:
+۱. ساختار نهایی باید دقیقاً و الزاماً مطابق این الگو با هدینگ‌های مشخص و دو خط خالی بین هر بخش باشد:
 
 📌 <b>خلاصه تاپیک: {topic_name}</b>
 {date_heading}
 
+
 🔹 <b>محورهای اصلی بحث</b>
-• نکات اصلی بحث...
+▫️ <b>مبحث:</b>
+• نکات اصلی گفتگو...
+
 
 ✅ <b>تصمیم‌ها و جمع‌بندی‌ها</b>
 • تصمیم‌ها... (در صورت عدم وجود حذف شود)
 
+
 🔗 <b>لینک‌ها و منابع مهم</b>
-• لینک‌ها... (در صورت عدم وجود حذف شود)
+• پیوندها... (در صورت عدم وجود حذف شود)
+
 
 ❓ <b>سؤالات بی‌پاسخ</b>
 • سؤالات بی‌جواب... (در صورت عدم وجود حذف شود)
 
-۲. فقط از تگ‌های HTML مجاز تلگرام (<b>, <i>, <code>, <blockquote>, <a href="...">) استفاده کنید و هیچ مارک‌داونی به کار نبرید.
-۳. طول خروجی ترجیحاً زیر ۳۰۰۰ کاراکتر باشد.
-۴. هیچ مقدمه، مؤخره یا توضیحی فراتر از قالب ساختاریافته فوق اضافه نکنید."""
+۲. قانون لینک آبی: هر تصمیم مهم، نکته اساسی یا راه‌حل را با تگ <a href="https://t.me/c/{clean_chat_id}/ID">متن مهم</a> پیوند دهید تا به رنگ آبی و قابل کلیک نمایش داده شود.
+۳. فاصله‌گذاری: حتماً بین هر بخش دو خط خالی قرار دهید تا متن بسیار خوانا و باز باشد.
+۴. فقط از تگ‌های مجاز تلگرام (<b>, <i>, <code>, <blockquote>, <a href="...">) استفاده کنید و هیچ مارک‌داونی به کار نبرید.
+۵. طول خروجی ترجیحاً زیر ۳۵۰۰ کاراکتر باشد.
+۶. هیچ مقدمه، مؤخره یا توضیحی فراتر از قالب ساختاریافته فوق اضافه نکنید."""
 
 ALLOWED_HTML_TAGS = {
     "b",
@@ -100,7 +118,7 @@ MEDIA_TYPE_MARKERS = {
 
 
 def format_messages(messages: list[dict]) -> str:
-    """Format raw message records into chronological Persian transcripts."""
+    """Format raw message records into chronological Persian transcripts with message IDs."""
     tehran_tz = ZoneInfo("Asia/Tehran")
     formatted_lines: list[str] = []
 
@@ -112,6 +130,9 @@ def format_messages(messages: list[dict]) -> str:
             time_str = tehran_dt.strftime("%H:%M")
         except Exception:
             time_str = "00:00"
+
+        msg_id = msg.get("message_id")
+        id_str = f"[#پیام {msg_id}] " if msg_id else ""
 
         sender_name = msg.get("sender_name") or "کاربر"
         reply_name = msg.get("reply_to_name")
@@ -125,7 +146,7 @@ def format_messages(messages: list[dict]) -> str:
         media_prefix = MEDIA_TYPE_MARKERS.get(media_type, "")
 
         text = (msg.get("text") or "").strip()
-        formatted_lines.append(f"[{time_str}] {sender_name}{reply_str}: {media_prefix}{text}")
+        formatted_lines.append(f"{id_str}[{time_str}] {sender_name}{reply_str}: {media_prefix}{text}")
 
     return "\n".join(formatted_lines)
 
@@ -157,8 +178,8 @@ def chunk_transcript(transcript: str, max_chars: int = 24000) -> list[str]:
     return chunks
 
 
-def sanitize_telegram_html(text: str) -> str:
-    """Clean model output, convert markdown, escape stray characters, and balance allowed HTML tags."""
+def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
+    """Clean model output, convert HTML/markdown headings, escape stray characters, and balance allowed tags."""
     if not text:
         return ""
 
@@ -166,15 +187,29 @@ def sanitize_telegram_html(text: str) -> str:
     cleaned = re.sub(r"^```(?:html)?\s*", "", text.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    # 2. Convert common markdown patterns to HTML
-    cleaned = re.sub(r"#{1,6}\s+(.+)", r"<b>\1</b>", cleaned)
+    # 2. Convert HTML headings <h1>..<h6> to Telegram-friendly styled bold headings with generous spacing
+    cleaned = re.sub(r"<h1>(.*?)</h1>", r"\n\n\n📌 <b>\1</b>\n\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<h2>(.*?)</h2>", r"\n\n\n🔹 <b>\1</b>\n\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<h3>(.*?)</h3>", r"\n\n▫️ <b>\1</b>\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(r"<h[4-6]>(.*?)</h[4-6]>", r"\n\n▪️ <b>\1</b>\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    # 3. Convert Markdown headings #..### to styled bold headings with double newlines
+    cleaned = re.sub(r"(?m)^#\s+(.+)$", r"\n\n📌 <b>\1</b>\n", cleaned)
+    cleaned = re.sub(r"(?m)^##\s+(.+)$", r"\n\n🔹 <b>\1</b>\n", cleaned)
+    cleaned = re.sub(r"(?m)^###\s+(.+)$", r"\n\n▫️ <b>\1</b>\n", cleaned)
+    cleaned = re.sub(r"(?m)^#{4,6}\s+(.+)$", r"\n\n▪️ <b>\1</b>\n", cleaned)
+
+    # 4. Convert other common markdown patterns
     cleaned = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", cleaned)
     cleaned = re.sub(r"__(.+?)__", r"<u>\1</u>", cleaned)
 
-    # 3. Escape lone ampersands not already part of valid entities
+    # 5. Escape lone ampersands not already part of valid entities
     cleaned = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", cleaned)
 
-    # 4. Tokenize and sanitize tags
+    # 6. Normalize multiple empty lines to at most two empty lines (3 newlines)
+    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
+
+    # 7. Tokenize and sanitize tags
     tag_pattern = re.compile(r"<(/)?([a-zA-Z0-9_-]+)(?:\s+([^>]*))?>")
     tokens: list[str] = []
     last_idx = 0
@@ -208,7 +243,11 @@ def sanitize_telegram_html(text: str) -> str:
                 if tag_name == "a":
                     # Extract href attribute safely
                     href_match = re.search(r'href=[\"\']([^\"\']+)[\"\']', attributes)
-                    href = href_match.group(1) if href_match else "#"
+                    href = href_match.group(1).strip() if href_match else "#"
+                    # Auto-expand relative message IDs (#123, 123, /123, msg:123)
+                    num_match = re.match(r"^(?:#|/|msg:)?(\d+)$", href)
+                    if num_match and clean_chat_id:
+                        href = f"https://t.me/c/{clean_chat_id}/{num_match.group(1)}"
                     tokens.append(f'<a href="{html.escape(href)}">')
                 else:
                     tokens.append(f"<{tag_name}>")
@@ -232,6 +271,7 @@ def sanitize_telegram_html(text: str) -> str:
 async def summarize_topic_messages(
     topic_name: str,
     messages: list[dict],
+    chat_id: int | None = None,
     min_messages: int = 5,
     is_nightly: bool = True,
     llm_client: BaseLLMClient | None = None,
@@ -254,25 +294,30 @@ async def summarize_topic_messages(
     if llm_client is None:
         llm_client = get_llm_client(settings)
 
+    target_chat = chat_id or (messages[0].get("chat_id") if messages else None)
+    clean_chat_id = get_clean_chat_id(target_chat) if target_chat else ""
+
     transcript = format_messages(messages)
     date_heading = format_date_heading(get_tehran_now(), is_nightly=is_nightly)
 
     # Check if single call or map-reduce
     if len(transcript) <= settings.CHUNK_MAX_CHARS:
-        system_prompt = SYSTEM_PROMPT_SINGLE.replace("{topic_name}", topic_name).replace(
-            "{date_heading}", date_heading
+        system_prompt = (
+            SYSTEM_PROMPT_SINGLE.replace("{topic_name}", topic_name)
+            .replace("{date_heading}", date_heading)
+            .replace("{clean_chat_id}", clean_chat_id or "chat")
         )
         user_content = (
             f"متن گفتگوهای تاپیک «{topic_name}»:\n\n"
             f"{transcript}\n\n"
-            "لطفاً خلاصه جامع و ساختاریافته را به زبان فارسی طبق دستورالعمل ارائه دهید."
+            "لطفاً خلاصه جامع و ساختاریافته را به زبان فارسی طبق دستورالعمل با دو خط فاصله بین بخش‌ها و پیوندهای آبی به پیام‌های مهم ارائه دهید."
         )
 
         async def _call_single() -> str:
             return await llm_client.generate(system_prompt=system_prompt, user_content=user_content)
 
         raw_output = await async_retry(_call_single, retries=settings.AI_MAX_RETRIES)
-        return sanitize_telegram_html(raw_output)
+        return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id)
 
     else:
         # Map-Reduce pipeline
@@ -285,17 +330,18 @@ async def summarize_topic_messages(
             len(chunks),
         )
 
+        chunk_prompt = SYSTEM_PROMPT_CHUNK.replace("{clean_chat_id}", clean_chat_id or "chat")
         partial_summaries: list[str] = []
         for i, chunk in enumerate(chunks, start=1):
             chunk_user_content = (
                 f"بخش {i} از {len(chunks)} پیام‌های تاپیک «{topic_name}»:\n\n"
                 f"{chunk}\n\n"
-                "نکات کلیدی و مباحث معنادار این بخش را استخراج کنید."
+                "نکات کلیدی، تصمیمات و مباحث معنادار این بخش را به همراه شناسه‌های پیام استخراج کنید."
             )
 
             async def _call_chunk(c_content: str = chunk_user_content) -> str:
                 return await llm_client.generate(
-                    system_prompt=SYSTEM_PROMPT_CHUNK,
+                    system_prompt=chunk_prompt,
                     user_content=c_content,
                 )
 
@@ -303,13 +349,15 @@ async def summarize_topic_messages(
             partial_summaries.append(partial_summary.strip())
 
         # Merge step
-        merge_system_prompt = SYSTEM_PROMPT_MERGE.replace("{topic_name}", topic_name).replace(
-            "{date_heading}", date_heading
+        merge_system_prompt = (
+            SYSTEM_PROMPT_MERGE.replace("{topic_name}", topic_name)
+            .replace("{date_heading}", date_heading)
+            .replace("{clean_chat_id}", clean_chat_id or "chat")
         )
         merge_user_content = (
             f"خلاصه‌های استخراج‌شده از {len(partial_summaries)} بخش مختلف تاپیک «{topic_name}»:\n\n"
             + "\n\n---\n\n".join(partial_summaries)
-            + "\n\nلطفاً این بخش‌ها را ترکیب کرده و خلاصه نهایی جامع را ارائه دهید."
+            + "\n\nلطفاً این بخش‌ها را ترکیب کرده و خلاصه نهایی جامع را با دو خط فاصله و لینک‌های آبی به پیام‌ها ارائه دهید."
         )
 
         async def _call_merge() -> str:
@@ -319,4 +367,4 @@ async def summarize_topic_messages(
             )
 
         merged_output = await async_retry(_call_merge, retries=settings.AI_MAX_RETRIES)
-        return sanitize_telegram_html(merged_output)
+        return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id)
