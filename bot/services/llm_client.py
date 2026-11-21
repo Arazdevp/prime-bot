@@ -1,6 +1,7 @@
 """LLM client abstraction for Google Gemini REST API and OpenAI-compatible endpoints."""
 
 from abc import ABC, abstractmethod
+import json
 import logging
 from typing import Any
 import httpx
@@ -177,6 +178,7 @@ class OpenAIClient(BaseLLMClient):
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
         payload = {
@@ -187,6 +189,7 @@ class OpenAIClient(BaseLLMClient):
             ],
             "temperature": 0.3,
             "max_tokens": 2048,
+            "stream": False,
         }
 
         try:
@@ -206,8 +209,25 @@ class OpenAIClient(BaseLLMClient):
 
         try:
             data = response.json()
-        except Exception as exc:
-            raise LLMError(f"Failed to decode OpenAI JSON response: {exc}", status_code=200) from exc
+        except Exception:
+            # Fallback: router might have returned SSE streaming lines (data: {...})
+            accumulated: list[str] = []
+            for line in response.text.splitlines():
+                line = line.strip()
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    try:
+                        chunk = json.loads(line[6:])
+                        choices_chunk = chunk.get("choices", [])
+                        if choices_chunk:
+                            delta = choices_chunk[0].get("delta", {})
+                            chunk_content = delta.get("content") or choices_chunk[0].get("message", {}).get("content")
+                            if chunk_content:
+                                accumulated.append(chunk_content)
+                    except Exception:
+                        pass
+            if accumulated:
+                return "".join(accumulated).strip()
+            raise LLMError(f"Failed to decode OpenAI JSON response: {response.text[:200]}", status_code=200)
 
         choices = data.get("choices")
         if not choices or not isinstance(choices, list) or len(choices) == 0:
