@@ -86,6 +86,7 @@ tg-daily-summarizer/
 6. **Languages:**
    - All code, identifiers, comments, and docstrings MUST be in **English**.
    - All user-facing bot messages, admin replies, and AI system prompts MUST be in fluent **Persian**.
+7. **Automatic Git Commit & Push:** After completing any feature update, bug fix, or code modification (once verified and passing tests via `pytest`), AI assistants MUST automatically stage all changes (`git add -A`), commit with a concise Conventional Commit message, and immediately push to remote (`git push origin main`). Never leave uncommitted or unpushed changes at the end of a task.
 
 ---
 
