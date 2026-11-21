@@ -71,8 +71,29 @@ async def capture_message(message: Message) -> None:
         if not message.chat:
             return
 
-        # 1. Skip bots
-        if message.from_user and message.from_user.is_bot:
+        # Check for topic name in reply_to_message.forum_topic_created before noise/monitored checks
+        if (
+            message.reply_to_message
+            and message.reply_to_message.forum_topic_created
+            and message.reply_to_message.forum_topic_created.name
+        ):
+            raw_name = message.reply_to_message.forum_topic_created.name
+            topic_name = raw_name.strip() if raw_name else None
+            if topic_name:
+                chat_id = message.chat.id
+                thread_id = resolve_thread_id(message)
+                if thread_id == 1 and message.reply_to_message.message_id:
+                    thread_id = message.reply_to_message.message_id
+                current_name = await repository.get_topic_name(chat_id, thread_id)
+                if current_name != topic_name:
+                    await repository.upsert_topic(
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        name=topic_name,
+                    )
+
+        # 1. Skip bots (unless sender_chat is set, e.g. GroupAnonymousBot)
+        if message.from_user and message.from_user.is_bot and not message.sender_chat:
             return
 
         # 2. Skip animations, stickers, and purely decorative media
@@ -134,12 +155,15 @@ async def capture_message(message: Message) -> None:
         # 7. Extract sender name
         sender_name: str
         user_id: int | None = None
-        if message.from_user:
+        if message.sender_chat:
+            if message.chat and message.sender_chat.id == message.chat.id:
+                sender_name = "ادمین ناشناس"
+            else:
+                sender_name = message.sender_chat.title or "کانال/گروه"
+            user_id = message.sender_chat.id
+        elif message.from_user:
             sender_name = message.from_user.full_name
             user_id = message.from_user.id
-        elif message.sender_chat:
-            sender_name = message.sender_chat.title or "کانال/گروه"
-            user_id = message.sender_chat.id
         else:
             sender_name = "کاربر"
 
@@ -151,10 +175,12 @@ async def capture_message(message: Message) -> None:
         reply = message.reply_to_message
         if reply and not reply.forum_topic_created:
             reply_to_message_id = reply.message_id
-            if reply.from_user:
-                reply_to_name = reply.from_user.full_name
+            if reply.sender_chat and message.chat and reply.sender_chat.id == message.chat.id:
+                reply_to_name = "ادمین ناشناس"
             elif reply.sender_chat:
                 reply_to_name = reply.sender_chat.title or "کانال/گروه"
+            elif reply.from_user:
+                reply_to_name = reply.from_user.full_name
             else:
                 reply_to_name = "کاربر"
 

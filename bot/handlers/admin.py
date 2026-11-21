@@ -222,6 +222,44 @@ async def cmd_mode(message: Message) -> None:
     )
 
 
+@router.message(Command("set_min"))
+async def cmd_set_min(message: Message) -> None:
+    """Set minimum messages threshold (1-100) to trigger summarization."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    chat_id = message.chat.id
+    args = (message.text or "").split()[1:]
+
+    if not args:
+        await send_topic_reply(
+            message,
+            "⚠️ لطفاً تعداد حداقل پیام را بین ۱ تا ۱۰۰ مشخص کنید:\n"
+            "<code>/set_min 5</code>",
+        )
+        return
+
+    try:
+        min_val = int(args[0].strip())
+        if not (1 <= min_val <= 100):
+            raise ValueError()
+    except ValueError:
+        await send_topic_reply(
+            message,
+            "⚠️ عدد وارد شده نامعتبر است. لطفاً یک عدد صحیح بین <b>۱ تا ۱۰۰</b> وارد کنید:\n"
+            "<code>/set_min 5</code>",
+        )
+        return
+
+    await repository.ensure_group_settings(chat_id)
+    await repository.set_group_min_messages(chat_id, min_val)
+    await send_topic_reply(
+        message,
+        f"🔢 حداقل تعداد پیام برای خلاصه‌سازی تاپیک‌های این گروه به <b>{min_val}</b> پیام تنظیم شد.",
+    )
+
+
 @router.message(Command("set_destination"))
 async def cmd_set_destination(message: Message) -> None:
     """Set current topic or specified topic link/ID as aggregate summary destination."""
@@ -409,6 +447,7 @@ async def cmd_help(message: Message) -> None:
         "🔹 <code>/add_topic</code> — افزودن تاپیک فعلی به پایش خلاصه‌سازی\n"
         "🔹 <code>/remove_topic</code> — خروج تاپیک فعلی از پایش خلاصه‌سازی\n"
         "🔹 <code>/mode whitelist|blacklist</code> — تغییر حالت پایش به لیست سفید یا سیاه\n"
+        "🔹 <code>/set_min 1-100</code> — تنظیم حداقل تعداد پیام لازم برای خلاصه‌سازی هر تاپیک\n"
         "🔹 <code>/set_destination [لینک|شناسه]</code> — تنظیم تاپیک مقصد تجمیعی خلاصه‌ها (با ارسال در همان تاپیک یا ارسال لینک تاپیک)\n"
         "🔹 <code>/reset_destination</code> — بازگرداندن مقصد خلاصه‌ها به هر تاپیک مجزا\n"
         "🔹 <code>/summary_on</code> — فعال‌سازی موقت سیستم خلاصه‌سازی برای گروه\n"

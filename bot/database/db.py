@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS topics (
     chat_id INTEGER NOT NULL,
     thread_id INTEGER NOT NULL,
     name TEXT,
-    is_active INTEGER NOT NULL DEFAULT 1,
+    is_active INTEGER,
     updated_at TEXT,
     PRIMARY KEY(chat_id, thread_id)
 );
@@ -49,6 +49,37 @@ CREATE TABLE IF NOT EXISTS group_settings (
     min_messages INTEGER NOT NULL DEFAULT 5
 );
 """
+
+
+async def _apply_migrations(conn: aiosqlite.Connection) -> None:
+    """Run database schema migrations based on PRAGMA user_version."""
+    cursor = await conn.execute("PRAGMA user_version;")
+    row = await cursor.fetchone()
+    current_version = row[0] if row else 0
+
+    if current_version < 1:
+        cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='topics';"
+        )
+        table_row = await cursor.fetchone()
+        if table_row and table_row[0]:
+            # Recreate topics table with nullable is_active column while preserving all data
+            await conn.executescript("""
+                CREATE TABLE IF NOT EXISTS topics_new (
+                    chat_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    name TEXT,
+                    is_active INTEGER,
+                    updated_at TEXT,
+                    PRIMARY KEY(chat_id, thread_id)
+                );
+                INSERT INTO topics_new (chat_id, thread_id, name, is_active, updated_at)
+                SELECT chat_id, thread_id, name, is_active, updated_at FROM topics;
+                DROP TABLE topics;
+                ALTER TABLE topics_new RENAME TO topics;
+            """)
+        await conn.execute("PRAGMA user_version = 1;")
+        await conn.commit()
 
 
 async def init_db(db_path: str = "data/bot.db") -> aiosqlite.Connection:
@@ -72,9 +103,10 @@ async def init_db(db_path: str = "data/bot.db") -> aiosqlite.Connection:
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA foreign_keys=ON;")
 
-    # Apply schema scripts
+    # Apply schema scripts and migrations
     async with _write_lock:
         await conn.executescript(INIT_SCHEMA_SQL)
+        await _apply_migrations(conn)
         await conn.commit()
 
     _db_connection = conn

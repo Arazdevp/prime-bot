@@ -65,16 +65,16 @@ async def upsert_topic(
 
     sql = """
     INSERT INTO topics (chat_id, thread_id, name, is_active, updated_at)
-    VALUES (?, ?, ?, COALESCE(?, 1), ?)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(chat_id, thread_id) DO UPDATE SET
         name = COALESCE(excluded.name, topics.name),
-        is_active = COALESCE(?, topics.is_active),
+        is_active = COALESCE(excluded.is_active, topics.is_active),
         updated_at = excluded.updated_at;
     """
     async with lock:
         await conn.execute(
             sql,
-            (chat_id, thread_id, name, is_active, updated_at, is_active),
+            (chat_id, thread_id, name, is_active, updated_at),
         )
         await conn.commit()
 
@@ -119,8 +119,12 @@ async def get_topic_name(chat_id: int, thread_id: int) -> str | None:
     return None
 
 
-async def ensure_group_settings(chat_id: int, default_min_messages: int = 5) -> dict[str, Any]:
+async def ensure_group_settings(chat_id: int, default_min_messages: int | None = None) -> dict[str, Any]:
     """Retrieve group settings or initialize defaults if missing."""
+    if default_min_messages is None:
+        from bot.config import get_settings
+        default_min_messages = get_settings().MIN_MESSAGES_PER_TOPIC
+
     conn = get_db()
     lock = get_write_lock()
     cursor = await conn.execute(
@@ -199,6 +203,18 @@ async def set_group_enabled(chat_id: int, enabled: int) -> None:
         await conn.execute(
             "UPDATE group_settings SET enabled = ? WHERE chat_id = ?;",
             (enabled, chat_id),
+        )
+        await conn.commit()
+
+
+async def set_group_min_messages(chat_id: int, min_messages: int) -> None:
+    """Set the minimum messages threshold for group summarization."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute(
+            "UPDATE group_settings SET min_messages = ? WHERE chat_id = ?;",
+            (min_messages, chat_id),
         )
         await conn.commit()
 
