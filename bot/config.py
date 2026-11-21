@@ -1,16 +1,20 @@
 """Application configuration using pydantic-settings."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE_PATH = _PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
     """Bot settings loaded from environment variables and .env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(_ENV_FILE_PATH, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

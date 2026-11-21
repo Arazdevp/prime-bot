@@ -143,7 +143,12 @@ async def main() -> None:
             scheduler.shutdown(wait=False)
             logger.info("Scheduler stopped.")
 
-        await dp.stop_polling()
+        try:
+            await dp.stop_polling()
+        except Exception:
+            pass
+        logger.info("Bot polling stopped.")
+
         await bot.session.close()
         logger.info("Bot session closed.")
 
