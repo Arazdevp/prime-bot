@@ -19,30 +19,31 @@ def strip_html_tags(text: str) -> str:
     return html.unescape(clean)
 
 
-async def send_summary(
+async def send_summary_parts(
     bot: Bot,
     chat_id: int,
     thread_id: int,
-    text: str,
-) -> bool:
-    """Send summary text safely to Telegram supergroup topic.
+    parts: list[str],
+    start_index: int = 0,
+    on_part_sent: Any | None = None,
+) -> tuple[bool, int]:
+    """Send pre-split summary parts starting from start_index.
 
-    - Splits into chunks <= 4000 chars while preserving HTML balance.
-    - Sends each part with HTML parse mode.
-    - If Telegram returns parse entity error, automatically resends as plain text.
-    - Handles flood limits (TelegramRetryAfter) with sleep.
-    - If target thread does not exist, falls back to General topic.
-    - Applies delay between parts to avoid Telegram flood limits.
-    - Returns True only if all parts were successfully delivered.
+    Returns (all_delivered: bool, sent_count: int).
+    Invokes on_part_sent(sent_count) after each successfully delivered part.
     """
-    settings = get_settings()
-    parts = smart_split(text, limit=4000)
     if not parts:
-        return False
+        return False, 0
 
+    if start_index >= len(parts):
+        return True, len(parts)
+
+    settings = get_settings()
     current_thread_id: int | None = to_send_thread_id(thread_id)
+    sent_count = start_index
 
-    for i, part in enumerate(parts):
+    for i in range(start_index, len(parts)):
+        part = parts[i]
         delivered = False
         retry_count = 0
         max_retries = 5
@@ -92,7 +93,7 @@ async def send_summary(
                         delivered = True
                     except Exception as fallback_exc:
                         logger.error("Plain text fallback failed: %s", fallback_exc)
-                        return False
+                        return False, sent_count
 
                 # Handle deleted or non-existent thread -> fall back to General topic
                 elif "message thread not found" in error_msg or "thread_not_found" in error_msg:
@@ -107,21 +108,60 @@ async def send_summary(
                         continue
                     else:
                         logger.error("Failed sending to chat %s even in General: %s", chat_id, exc)
-                        return False
+                        return False, sent_count
                 else:
                     logger.error("TelegramBadRequest while sending summary: %s", exc)
-                    return False
+                    return False, sent_count
 
             except Exception as exc:
                 logger.error("Unexpected error delivering summary chunk %s/%s: %s", i + 1, len(parts), exc)
-                return False
+                return False, sent_count
 
         if not delivered:
             logger.error("Failed to deliver chunk %s/%s after %s retries.", i + 1, len(parts), max_retries)
-            return False
+            return False, sent_count
+
+        sent_count = i + 1
+        if on_part_sent:
+            try:
+                res = on_part_sent(sent_count)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as exc:
+                logger.warning("Error in on_part_sent callback: %s", exc)
 
         # Sleep configured delay between parts to avoid flood limits
         if i < len(parts) - 1:
             await asyncio.sleep(settings.SEND_DELAY_SECONDS)
 
-    return True
+    return True, sent_count
+
+
+async def send_summary(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int,
+    text: str,
+) -> bool:
+    """Send summary text safely to Telegram supergroup topic.
+
+    - Splits into chunks <= 4000 chars while preserving HTML balance.
+    - Sends each part with HTML parse mode.
+    - If Telegram returns parse entity error, automatically resends as plain text.
+    - Handles flood limits (TelegramRetryAfter) with sleep.
+    - If target thread does not exist, falls back to General topic.
+    - Applies delay between parts to avoid Telegram flood limits.
+    - Returns True only if all parts were successfully delivered.
+    """
+    parts = smart_split(text, limit=4000)
+    if not parts:
+        return False
+
+    delivered, _ = await send_summary_parts(
+        bot=bot,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        parts=parts,
+        start_index=0,
+    )
+    return delivered

@@ -1,6 +1,6 @@
 """Date and calendar helpers for Jalali and Gregorian dates in Asia/Tehran."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import jdatetime
 
@@ -71,26 +71,37 @@ def format_gregorian_date(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def summary_day_for_run(run_time: datetime, is_nightly: bool = True) -> datetime:
-    """Determine the calendar day being summarized.
+def compute_nightly_cutoff(run_time: datetime | None = None, tz_name: str | None = None) -> datetime:
+    """Compute cutoff = the latest 00:00 (TIMEZONE) at or before run_time, converted to UTC."""
+    if tz_name is None:
+        from bot.config import get_settings
+        tz_name = get_settings().TIMEZONE
 
-    The nightly job runs at 00:01 Asia/Tehran, so it summarizes the PREVIOUS
-    calendar day. For manual runs or daytime triggers, it summarizes the current day.
-    """
-    tz = ZoneInfo("Asia/Tehran")
-    if run_time.tzinfo is None:
+    tz = ZoneInfo(tz_name)
+    if run_time is None:
+        run_time = datetime.now(tz)
+    elif run_time.tzinfo is None:
         run_time = run_time.replace(tzinfo=tz)
     else:
         run_time = run_time.astimezone(tz)
 
-    if is_nightly:
-        # Subtract 1 day because 00:01 summarizes yesterday's discussions
-        return run_time - timedelta(days=1)
-    return run_time
+    midnight = run_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(timezone.utc)
+
+
+def summary_day_for_run(run_time: datetime, is_nightly: bool = True) -> datetime:
+    """Return the calendar day for date formatting."""
+    tz = ZoneInfo("Asia/Tehran")
+    if run_time.tzinfo is None:
+        return run_time.replace(tzinfo=tz)
+    return run_time.astimezone(tz)
 
 
 def format_date_heading(dt: datetime, is_nightly: bool = True) -> str:
-    """Generate date heading for summary messages containing both Jalali and Gregorian dates."""
+    """Generate date heading for summary messages containing both Jalali and Gregorian dates.
+
+    Derives heading directly from dt (the message timestamp), removing the is_nightly date hack.
+    """
     target_date = summary_day_for_run(dt, is_nightly=is_nightly)
     jalali_str = format_persian_date(target_date)
     jalali_short = format_persian_short_date(target_date)

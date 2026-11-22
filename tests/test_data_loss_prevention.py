@@ -1,6 +1,6 @@
 """Unit tests verifying data loss prevention on below-threshold messages."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
 import pytest
@@ -30,8 +30,8 @@ async def test_manual_run_never_deletes_below_threshold_messages(tmp_path: Path)
         await set_group_min_messages(chat_id, 5)
         await upsert_topic(chat_id, thread_id, "تاپیک تست", is_active=1)
 
-        # Insert 2 messages (< min 5)
-        now_str = datetime.now(timezone.utc).isoformat()
+        # Insert 2 messages (< min 5) before midnight cutoff
+        now_str = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         await insert_message(
             chat_id=chat_id,
             thread_id=thread_id,

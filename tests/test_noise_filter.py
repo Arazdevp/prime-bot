@@ -17,6 +17,8 @@ def test_noise_filter_emoji_and_punctuation_only() -> None:
     assert is_noise("👍") is True
     assert is_noise("👍👍👍") is True
     assert is_noise("1234567") is True
+    assert is_noise("۱۲۳۴۵۶۷") is True
+    assert is_noise("١٢٣٤٥٦٧") is True
     assert is_noise("!!!???...") is True
     assert is_noise("🔥❤️👏") is True
 

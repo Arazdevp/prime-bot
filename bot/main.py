@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
 from bot.handlers import admin, listener
-from bot.scheduler.jobs import build_scheduler
+from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed
 from bot.services.llm_client import close_llm_client
 from bot.utils.dates import format_persian_date, get_tehran_now
 from bot.utils.html_utils import escape_html
@@ -131,6 +131,9 @@ async def main() -> None:
     nightly_job = scheduler.get_job("nightly_summary")
     if nightly_job and nightly_job.next_run_time:
         logger.info("Next nightly summarization scheduled at: %s", nightly_job.next_run_time)
+
+    # Check if today's scheduled nightly run was missed and run catch-up
+    asyncio.create_task(run_catchup_if_needed(bot))
 
     # 5. Best-effort startup notification to admins
     await notify_admins_startup(bot)

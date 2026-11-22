@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,9 +14,11 @@ from bot.config import get_settings
 from bot.database import repository
 from bot.database.db import get_db, get_write_lock
 from bot.services.llm_client import BaseLLMClient
-from bot.services.publisher import send_summary
+from bot.services.publisher import send_summary, send_summary_parts
 from bot.services.summarizer import summarize_topic_messages
+from bot.utils.dates import compute_nightly_cutoff
 from bot.utils.html_utils import escape_html
+from bot.utils.text_split import smart_split
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,7 @@ async def run_summary_for_topic(
     thread_id: int,
     mark_summarized: bool = True,
     is_nightly: bool = True,
+    cutoff: datetime | str | None = None,
     llm_client: BaseLLMClient | None = None,
 ) -> tuple[bool, str]:
     """Execute end-to-end summarization pipeline for a single topic.
@@ -120,7 +124,17 @@ async def run_summary_for_topic(
     if not topic_name:
         topic_name = "عمومی" if thread_id == 1 else f"تاپیک {thread_id}"
 
-    messages = await repository.fetch_unsummarized_messages(chat_id, thread_id)
+    # Determine cutoff ISO string
+    cutoff_iso: str | None = None
+    if cutoff is not None:
+        if isinstance(cutoff, datetime):
+            cutoff_iso = cutoff.astimezone(timezone.utc).isoformat()
+        else:
+            cutoff_iso = str(cutoff)
+    elif is_nightly:
+        cutoff_iso = compute_nightly_cutoff().isoformat()
+
+    messages = await repository.fetch_unsummarized_messages(chat_id, thread_id, before=cutoff_iso)
     min_msgs = group_cfg.get("min_messages", settings.MIN_MESSAGES_PER_TOPIC)
 
     # Threshold check
@@ -132,74 +146,130 @@ async def run_summary_for_topic(
             len(messages),
             min_msgs,
         )
-        if is_nightly and mark_summarized and messages:
+        # Delete below-threshold messages only on nightly/cutoff runs, never on manual runs
+        if cutoff_iso is not None and mark_summarized and messages:
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
             logger.info("Deleted %s below-threshold messages for topic '%s' to free storage.", deleted_cnt, topic_name)
         return False, f"تعداد پیام‌ها ({len(messages)}) کمتر از حداقل حد نصاب ({min_msgs}) بود."
 
-    # Generate summary with AI
+    # Derive day from earliest message's Tehran timestamp
+    first_created = messages[0].get("created_at") or ""
     try:
-        summary_text = await summarize_topic_messages(
-            topic_name=topic_name,
-            messages=messages,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            min_messages=min_msgs,
-            is_nightly=is_nightly,
-            llm_client=llm_client,
+        first_dt = datetime.fromisoformat(first_created)
+        tehran_tz = ZoneInfo(settings.TIMEZONE)
+        tehran_dt = (
+            first_dt.astimezone(tehran_tz)
+            if first_dt.tzinfo
+            else first_dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tehran_tz)
         )
-    except Exception as exc:
-        logger.error("Summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
-        try:
-            chat = await bot.get_chat(chat_id)
-            chat_title = chat.title or str(chat_id)
-        except Exception:
-            chat_title = str(chat_id)
-
-        await notify_admins_failure(
-            bot=bot,
-            chat_title=chat_title,
-            topic_name=topic_name,
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-        )
-        return False, f"خطای هوش مصنوعی در تولید خلاصه: {exc}"
-
-    if not summary_text:
-        return False, "خلاصه معتبری توسط مدل تولید نشد."
+    except Exception:
+        tehran_dt = datetime.now(ZoneInfo(settings.TIMEZONE))
+    day = tehran_dt.strftime("%Y-%m-%d")
 
     # Destination handling
     dest_mode = group_cfg.get("destination_mode", "per_topic")
     dest_tid = group_cfg.get("destination_thread_id")
+    target_thread = dest_tid if dest_mode == "aggregate" and dest_tid is not None else thread_id
 
-    if dest_mode == "aggregate" and dest_tid is not None:
-        target_thread = dest_tid
-        content_to_send = f"📂 <b>تاپیک مبدا: {escape_html(topic_name)}</b>\n\n\n{summary_text}"
-    else:
-        target_thread = thread_id
-        content_to_send = summary_text
+    # Check for existing summary in database to handle resumption and prevent duplicate posts
+    existing_summary = await repository.get_summary_record(chat_id, thread_id, day)
+    parts: list[str] = []
+    sent_count = 0
 
-    # Publish to Telegram
+    if existing_summary:
+        try:
+            parts = json.loads(existing_summary["parts_json"])
+            sent_count = int(existing_summary["sent_count"])
+        except Exception as parse_err:
+            logger.warning("Failed parsing existing summary record for topic %s: %s", topic_name, parse_err)
+            parts = []
+            sent_count = 0
+
+    if parts and sent_count >= len(parts):
+        # Already completely delivered! Prevent duplicate posts
+        logger.info("Summary for topic '%s' on %s was already fully delivered.", topic_name, day)
+        if mark_summarized:
+            msg_ids = [m["id"] for m in messages]
+            await repository.delete_messages_by_ids(msg_ids)
+        return True, "خلاصه با موفقیت ارسال شد."
+
+    if not parts:
+        # Generate summary with AI
+        try:
+            summary_text = await summarize_topic_messages(
+                topic_name=topic_name,
+                messages=messages,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                min_messages=min_msgs,
+                is_nightly=is_nightly,
+                llm_client=llm_client,
+            )
+        except Exception as exc:
+            logger.error("Summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
+            try:
+                chat = await bot.get_chat(chat_id)
+                chat_title = chat.title or str(chat_id)
+            except Exception:
+                chat_title = str(chat_id)
+
+            await notify_admins_failure(
+                bot=bot,
+                chat_title=chat_title,
+                topic_name=topic_name,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return False, f"خطای هوش مصنوعی در تولید خلاصه: {exc}"
+
+        if not summary_text:
+            return False, "خلاصه معتبری توسط مدل تولید نشد."
+
+        if dest_mode == "aggregate" and dest_tid is not None:
+            content_to_send = f"📂 <b>تاپیک مبدا: {escape_html(topic_name)}</b>\n\n\n{summary_text}"
+        else:
+            content_to_send = summary_text
+
+        parts = smart_split(content_to_send, limit=4000)
+        if not parts:
+            return False, "خلاصه پس از تقسیم خالی بود."
+
+        sent_count = 0
+        await repository.save_summary_record(chat_id, thread_id, day, parts, sent_count=0)
+
+    # Publish remaining parts to Telegram
+    async def _on_part_sent(new_sent: int) -> None:
+        await repository.update_summary_sent_count(chat_id, thread_id, day, new_sent)
+
     try:
-        delivered = await send_summary(
+        delivered, sent_count = await send_summary_parts(
             bot=bot,
             chat_id=chat_id,
             thread_id=target_thread,
-            text=content_to_send,
+            parts=parts,
+            start_index=sent_count,
+            on_part_sent=_on_part_sent,
         )
     except Exception as exc:
         logger.error("Publishing summary failed: %s", exc, exc_info=True)
         delivered = False
 
-    if delivered:
+    if delivered and sent_count >= len(parts):
+        # Delete source messages only after ALL parts are delivered
         if mark_summarized:
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
             logger.info("Deleted %s summarized messages in topic '%s' to free database space.", deleted_cnt, topic_name)
         return True, "خلاصه با موفقیت ارسال شد."
     else:
-        logger.error("Failed delivering summary for topic '%s' in chat %s.", topic_name, chat_id)
+        logger.error(
+            "Failed delivering summary for topic '%s' in chat %s (sent %s/%s parts).",
+            topic_name,
+            chat_id,
+            sent_count,
+            len(parts),
+        )
         try:
             chat = await bot.get_chat(chat_id)
             chat_title = chat.title or str(chat_id)
@@ -211,7 +281,7 @@ async def run_summary_for_topic(
             chat_title=chat_title,
             topic_name=topic_name,
             error_type="PublishDeliveryError",
-            error_message="عدم موفقیت در ارسال بخش‌های پیام به تلگرام.",
+            error_message=f"عدم موفقیت در ارسال بخش‌های پیام به تلگرام ({sent_count}/{len(parts)} بخش ارسال شد).",
         )
         return False, "خطا در ارسال پیام به تلگرام."
 
@@ -221,11 +291,22 @@ async def run_summary_for_group(
     chat_id: int,
     mark_summarized: bool = True,
     is_nightly: bool = False,
+    cutoff: datetime | str | None = None,
     llm_client: BaseLLMClient | None = None,
 ) -> dict[str, int]:
     """Run summarization sequentially for all monitored topics in a group."""
     settings = get_settings()
-    distinct_threads = await repository.list_distinct_unsummarized_topics(chat_id)
+
+    cutoff_iso: str | None = None
+    if cutoff is not None:
+        if isinstance(cutoff, datetime):
+            cutoff_iso = cutoff.astimezone(timezone.utc).isoformat()
+        else:
+            cutoff_iso = str(cutoff)
+    elif is_nightly:
+        cutoff_iso = compute_nightly_cutoff().isoformat()
+
+    distinct_threads = await repository.list_distinct_unsummarized_topics(chat_id, before=cutoff_iso)
 
     report = {"success": 0, "skipped": 0, "failed": 0}
 
@@ -240,6 +321,7 @@ async def run_summary_for_group(
                 thread_id=tid,
                 mark_summarized=mark_summarized,
                 is_nightly=is_nightly,
+                cutoff=cutoff_iso,
                 llm_client=llm_client,
             )
             if success:
@@ -258,8 +340,12 @@ async def run_summary_for_group(
     return report
 
 
-async def nightly_summary_job(bot: Bot, llm_client: BaseLLMClient | None = None) -> None:
-    """Nightly cron job executing at 00:01 Asia/Tehran."""
+async def nightly_summary_job(
+    bot: Bot,
+    llm_client: BaseLLMClient | None = None,
+    run_time: datetime | None = None,
+) -> None:
+    """Nightly cron job executing at 00:01 Asia/Tehran or catch-up."""
     logger.info("Starting nightly summarization job...")
     lock = get_summary_lock()
 
@@ -268,6 +354,8 @@ async def nightly_summary_job(bot: Bot, llm_client: BaseLLMClient | None = None)
         return
 
     async with lock:
+        settings = get_settings()
+        cutoff = compute_nightly_cutoff(run_time=run_time, tz_name=settings.TIMEZONE).isoformat()
         groups = await repository.list_enabled_groups()
         total_groups = len(groups)
         total_success = 0
@@ -282,11 +370,14 @@ async def nightly_summary_job(bot: Bot, llm_client: BaseLLMClient | None = None)
                 chat_id=chat_id,
                 mark_summarized=True,
                 is_nightly=True,
+                cutoff=cutoff,
                 llm_client=llm_client,
             )
             total_success += group_report["success"]
             total_skipped += group_report["skipped"]
             total_failed += group_report["failed"]
+
+        await repository.set_last_nightly_run(datetime.now(timezone.utc).isoformat())
 
         logger.info(
             "Nightly summary completed: %s groups, %s success, %s skipped, %s failed.",
@@ -302,6 +393,49 @@ async def nightly_summary_job(bot: Bot, llm_client: BaseLLMClient | None = None)
             total_skipped=total_skipped,
             total_failed=total_failed,
         )
+
+
+def is_nightly_run_missed(now: datetime | None = None, last_run_iso: str | None = None) -> bool:
+    """Determine if today's scheduled run time has passed without an execution."""
+    settings = get_settings()
+    tz = ZoneInfo(settings.TIMEZONE)
+    if now is None:
+        now = datetime.now(tz)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    else:
+        now = now.astimezone(tz)
+
+    today_scheduled = now.replace(
+        hour=settings.SUMMARY_TIME_HOUR,
+        minute=settings.SUMMARY_TIME_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if now < today_scheduled:
+        return False
+
+    if not last_run_iso:
+        return True
+
+    try:
+        last_run_dt = datetime.fromisoformat(last_run_iso)
+        if last_run_dt.tzinfo is None:
+            last_run_dt = last_run_dt.replace(tzinfo=timezone.utc)
+        last_run_tz = last_run_dt.astimezone(tz)
+        return last_run_tz < today_scheduled
+    except Exception:
+        return True
+
+
+async def run_catchup_if_needed(bot: Bot, llm_client: BaseLLMClient | None = None) -> bool:
+    """Check if today's scheduled nightly run was missed; if so, execute it once."""
+    last_run_iso = await repository.get_last_nightly_run()
+    if is_nightly_run_missed(last_run_iso=last_run_iso):
+        logger.info("Missed today's scheduled nightly summary run. Executing catch-up run now...")
+        await nightly_summary_job(bot, llm_client=llm_client)
+        return True
+    return False
 
 
 async def cleanup_job() -> None:

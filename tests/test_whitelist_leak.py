@@ -51,7 +51,7 @@ async def test_migration_recreates_table_preserves_data_and_allows_null(tmp_path
         # Check PRAGMA user_version
         cursor = await db.execute("PRAGMA user_version;")
         row = await cursor.fetchone()
-        assert row[0] == 1
+        assert row[0] >= 1
 
         # Check existing data was preserved
         cursor = await db.execute("SELECT thread_id, name, is_active FROM topics ORDER BY thread_id ASC;")

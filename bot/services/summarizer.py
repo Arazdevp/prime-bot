@@ -359,7 +359,24 @@ async def summarize_topic_messages(
     target_thread = thread_id if thread_id is not None else (messages[0].get("thread_id") if messages else None)
 
     transcript = format_messages(messages)
-    date_heading = format_date_heading(get_tehran_now(), is_nightly=is_nightly)
+
+    # Derive heading date from the earliest included message in Asia/Tehran
+    if messages:
+        try:
+            first_created = messages[0].get("created_at") or ""
+            first_dt = datetime.fromisoformat(first_created)
+            tehran_tz = ZoneInfo(settings.TIMEZONE)
+            tehran_dt = (
+                first_dt.astimezone(tehran_tz)
+                if first_dt.tzinfo
+                else first_dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tehran_tz)
+            )
+        except Exception:
+            tehran_dt = get_tehran_now()
+    else:
+        tehran_dt = get_tehran_now()
+
+    date_heading = format_date_heading(tehran_dt)
 
     # Prefix used in system prompts for message hyperlinks
     if target_thread and target_thread != 1:

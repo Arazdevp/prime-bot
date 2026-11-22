@@ -73,8 +73,9 @@ DEFAULT_NOISE_PHRASES = {
     "np",
 }
 
-# Regex to check if text contains any alphabetic characters (Persian/Arabic or Latin)
-ALPHABETIC_PATTERN = re.compile(r"[a-zA-Z\u0600-\u06FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+# Regex to check if text contains any alphabetic characters (Persian/Arabic or Latin).
+# [^\W\d_] matches Unicode letters and excludes decimal digits (including Persian/Arabic-Indic digits), punctuation, and symbols.
+ALPHABETIC_PATTERN = re.compile(r"[^\W\d_]")
 
 
 def normalize_noise_text(text: str) -> str:
@@ -116,6 +117,7 @@ def load_custom_noise_words(custom_path: str = "data/noise_words.txt") -> set[st
 _CUSTOM_NOISE_WORDS = load_custom_noise_words()
 _NORMALIZED_DEFAULT_NOISE: set[str] = {normalize_noise_text(w) for w in DEFAULT_NOISE_PHRASES}
 ALL_NOISE_PHRASES: set[str] = _NORMALIZED_DEFAULT_NOISE | _CUSTOM_NOISE_WORDS
+_ALL_NOISE_NO_SPACE: set[str] = {p.replace(" ", "") for p in ALL_NOISE_PHRASES}
 
 
 def is_noise(text: str | None, min_len: int = 3) -> bool:
@@ -149,7 +151,7 @@ def is_noise(text: str | None, min_len: int = 3) -> bool:
 
     # Also check if text without spaces matches any noise phrase without spaces
     no_space = normalized.replace(" ", "")
-    if no_space in {p.replace(" ", "") for p in ALL_NOISE_PHRASES}:
+    if no_space in _ALL_NOISE_NO_SPACE:
         return True
 
     return False

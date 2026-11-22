@@ -1,6 +1,7 @@
 """Database repository providing parameterized queries for all operations."""
 
 from datetime import datetime, timezone, timedelta
+import json
 from typing import Any
 import aiosqlite
 from bot.database.db import get_db, get_write_lock
@@ -293,30 +294,56 @@ async def list_topics_with_counts_today(
 async def fetch_unsummarized_messages(
     chat_id: int,
     thread_id: int,
+    before: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch unsummarized messages for a topic, ordered chronologically."""
+    """Fetch unsummarized messages for a topic, optionally created before cutoff, ordered chronologically."""
     conn = get_db()
-    sql = """
-    SELECT 
-        id, chat_id, thread_id, message_id, user_id, sender_name,
-        text, media_type, reply_to_message_id, reply_to_name,
-        reply_to_snippet, created_at, is_summarized
-    FROM messages
-    WHERE chat_id = ? AND thread_id = ? AND is_summarized = 0
-    ORDER BY created_at ASC, message_id ASC;
-    """
-    cursor = await conn.execute(sql, (chat_id, thread_id))
+    if before:
+        sql = """
+        SELECT 
+            id, chat_id, thread_id, message_id, user_id, sender_name,
+            text, media_type, reply_to_message_id, reply_to_name,
+            reply_to_snippet, created_at, is_summarized
+        FROM messages
+        WHERE chat_id = ? AND thread_id = ? AND is_summarized = 0 AND created_at < ?
+        ORDER BY created_at ASC, message_id ASC;
+        """
+        cursor = await conn.execute(sql, (chat_id, thread_id, before))
+    else:
+        sql = """
+        SELECT 
+            id, chat_id, thread_id, message_id, user_id, sender_name,
+            text, media_type, reply_to_message_id, reply_to_name,
+            reply_to_snippet, created_at, is_summarized
+        FROM messages
+        WHERE chat_id = ? AND thread_id = ? AND is_summarized = 0
+        ORDER BY created_at ASC, message_id ASC;
+        """
+        cursor = await conn.execute(sql, (chat_id, thread_id))
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-async def list_distinct_unsummarized_topics(chat_id: int) -> list[int]:
-    """List distinct thread IDs having unsummarized messages for a group."""
+async def list_distinct_unsummarized_topics(
+    chat_id: int,
+    before: str | None = None,
+) -> list[int]:
+    """List distinct thread IDs having unsummarized messages for a group, optionally before cutoff."""
     conn = get_db()
-    cursor = await conn.execute(
-        "SELECT DISTINCT thread_id FROM messages WHERE chat_id = ? AND is_summarized = 0 ORDER BY thread_id ASC;",
-        (chat_id,),
-    )
+    if before:
+        sql = (
+            "SELECT DISTINCT thread_id FROM messages "
+            "WHERE chat_id = ? AND is_summarized = 0 AND created_at < ? "
+            "ORDER BY thread_id ASC;"
+        )
+        cursor = await conn.execute(sql, (chat_id, before))
+    else:
+        sql = (
+            "SELECT DISTINCT thread_id FROM messages "
+            "WHERE chat_id = ? AND is_summarized = 0 "
+            "ORDER BY thread_id ASC;"
+        )
+        cursor = await conn.execute(sql, (chat_id,))
     rows = await cursor.fetchall()
     return [r["thread_id"] for r in rows]
 
@@ -333,34 +360,38 @@ async def list_enabled_groups() -> list[dict[str, Any]]:
 
 
 async def mark_messages_summarized(message_ids: list[int]) -> None:
-    """Mark the given message IDs as summarized."""
+    """Mark the given message IDs as summarized in batches of 500."""
     if not message_ids:
         return
 
     conn = get_db()
     lock = get_write_lock()
-    placeholders = ",".join("?" for _ in message_ids)
-    sql = f"UPDATE messages SET is_summarized = 1 WHERE id IN ({placeholders});"
-
     async with lock:
-        await conn.execute(sql, message_ids)
+        for i in range(0, len(message_ids), 500):
+            chunk = message_ids[i : i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"UPDATE messages SET is_summarized = 1 WHERE id IN ({placeholders});"
+            await conn.execute(sql, chunk)
         await conn.commit()
 
 
 async def delete_messages_by_ids(message_ids: list[int]) -> int:
-    """Delete messages permanently by their database primary IDs to reclaim disk space."""
+    """Delete messages permanently by their database primary IDs in batches of 500 to reclaim disk space."""
     if not message_ids:
         return 0
 
     conn = get_db()
     lock = get_write_lock()
-    placeholders = ",".join("?" for _ in message_ids)
-    sql = f"DELETE FROM messages WHERE id IN ({placeholders});"
-
+    total_deleted = 0
     async with lock:
-        cursor = await conn.execute(sql, message_ids)
+        for i in range(0, len(message_ids), 500):
+            chunk = message_ids[i : i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"DELETE FROM messages WHERE id IN ({placeholders});"
+            cursor = await conn.execute(sql, chunk)
+            total_deleted += cursor.rowcount
         await conn.commit()
-        return cursor.rowcount
+    return total_deleted
 
 
 async def delete_old_messages(retention_days: int) -> int:
@@ -396,3 +427,104 @@ async def count_unsummarized_messages(chat_id: int) -> int:
     )
     row = await cursor.fetchone()
     return row["cnt"] if row else 0
+
+
+# ---------------- Meta Table Operations ----------------
+
+
+async def get_meta_value(key: str) -> str | None:
+    """Retrieve string value for a metadata key."""
+    conn = get_db()
+    cursor = await conn.execute("SELECT value FROM meta WHERE key = ?;", (key,))
+    row = await cursor.fetchone()
+    return str(row["value"]) if row and row["value"] is not None else None
+
+
+async def set_meta_value(key: str, value: str) -> None:
+    """Store or update metadata key-value pair."""
+    conn = get_db()
+    lock = get_write_lock()
+    sql = """
+    INSERT INTO meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+    """
+    async with lock:
+        await conn.execute(sql, (key, value))
+        await conn.commit()
+
+
+async def get_last_nightly_run() -> str | None:
+    """Get the ISO timestamp of the last executed nightly summary."""
+    return await get_meta_value("last_nightly_run")
+
+
+async def set_last_nightly_run(timestamp_iso: str) -> None:
+    """Set the ISO timestamp of the last executed nightly summary."""
+    await set_meta_value("last_nightly_run", timestamp_iso)
+
+
+# ---------------- Summaries Table Operations ----------------
+
+
+async def get_summary_record(chat_id: int, thread_id: int, day: str) -> dict[str, Any] | None:
+    """Retrieve existing summary record for a topic and day."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, thread_id, day, parts_json, sent_count, created_at "
+        "FROM summaries WHERE chat_id = ? AND thread_id = ? AND day = ?;",
+        (chat_id, thread_id, day),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def save_summary_record(
+    chat_id: int,
+    thread_id: int,
+    day: str,
+    parts: list[str],
+    sent_count: int = 0,
+) -> None:
+    """Upsert summary record with parts_json and sent_count."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_utc = datetime.now(timezone.utc).isoformat()
+    parts_json = json.dumps(parts, ensure_ascii=False)
+    sql = """
+    INSERT INTO summaries (chat_id, thread_id, day, parts_json, sent_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id, thread_id, day) DO UPDATE SET
+        parts_json = excluded.parts_json,
+        sent_count = excluded.sent_count,
+        created_at = excluded.created_at;
+    """
+    async with lock:
+        await conn.execute(sql, (chat_id, thread_id, day, parts_json, sent_count, now_utc))
+        await conn.commit()
+
+
+async def update_summary_sent_count(
+    chat_id: int,
+    thread_id: int,
+    day: str,
+    sent_count: int,
+) -> None:
+    """Update sent_count progress for a summary record."""
+    conn = get_db()
+    lock = get_write_lock()
+    sql = "UPDATE summaries SET sent_count = ? WHERE chat_id = ? AND thread_id = ? AND day = ?;"
+    async with lock:
+        await conn.execute(sql, (sent_count, chat_id, thread_id, day))
+        await conn.commit()
+
+
+async def delete_summary(chat_id: int, thread_id: int, day: str) -> None:
+    """Delete a summary record by topic and day."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute(
+            "DELETE FROM summaries WHERE chat_id = ? AND thread_id = ? AND day = ?;",
+            (chat_id, thread_id, day),
+        )
+        await conn.commit()
