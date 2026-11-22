@@ -3,7 +3,7 @@
 import time
 from aiogram import Bot
 from aiogram.filters import Filter
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 from bot.config import get_settings
 
 # In-memory TTL cache: (chat_id, user_id) -> (is_admin, expiry_timestamp)
@@ -94,3 +94,14 @@ class AdminFilter(Filter):
         except Exception:
             # If unable to fetch chat member (e.g. network/permissions), default to False without caching
             return False
+
+
+class PrivateChatFilter(Filter):
+    """Filter allowing only updates originating from private chats."""
+
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        chat = getattr(event, "chat", None)
+        if chat is None:
+            msg = getattr(event, "message", None)
+            chat = getattr(msg, "chat", None)
+        return bool(chat and chat.type == "private")

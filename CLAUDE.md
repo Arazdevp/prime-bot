@@ -43,32 +43,42 @@ python -m py_compile (Get-ChildItem -Recurse -Filter *.py).FullName # Windows
 ```
 tg-daily-summarizer/
 ├── bot/
-│   ├── main.py              # Lifecycle entrypoint, session creation with proxy, shutdown
+│   ├── main.py              # Lifecycle entrypoint, MemoryStorage, throttle middleware, proxy session, shutdown
 │   ├── config.py            # Pydantic Settings with multi-path .env resolution
-│   ├── filters.py           # AdminFilter (creator/administrator/anonymous/ADMIN_IDS), ForumGroupFilter
+│   ├── filters.py           # AdminFilter (5-min TTL cache), ForumGroupFilter, PrivateChatFilter
 │   ├── database/
-│   │   ├── db.py            # aiosqlite connection with PRAGMA WAL, foreign keys, write lock
-│   │   └── repository.py    # All parameterized async queries (messages, topics, settings)
+│   │   ├── db.py            # aiosqlite connection with PRAGMA WAL, foreign keys, write lock, user_version migrations
+│   │   └── repository.py    # All parameterized async queries (messages, topics, settings, bot_users, known_groups)
 │   ├── handlers/
-│   │   ├── listener.py      # Captures text, captions, replies, topic creation/rename
-│   │   └── admin.py         # Full Persian admin command suite (/status, /topics, /mode, etc.)
+│   │   ├── listener.py      # Captures text, captions, replies, topic creation/rename, my_chat_member tracking
+│   │   ├── admin.py         # Full Persian group admin command suite (/status, /topics, /mode, etc.)
+│   │   ├── private.py       # Role-aware private commands (/start, /panel, /help, /about, /cancel) & stranger anti-spam
+│   │   └── panel.py         # Inline-keyboard Private Admin Panel (8 screens, FSM min-messages, live run, DM preview)
+│   ├── keyboards/
+│   │   └── panel.py         # Compact PanelCB (prefix="pn", <= 64 bytes) & paginated inline keyboard builders
+│   ├── middlewares/
+│   │   └── throttle.py      # PrivateThrottleMiddleware (1 update/sec per user in private chat)
+│   ├── texts/
+│   │   └── private_texts.py # Casual Persian message pools & non-repeating pick() helper
 │   ├── services/
+│   │   ├── access.py        # Private role resolution & per-group permissions sharing AdminFilter TTL cache
 │   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (for 9Router)
 │   │   ├── summarizer.py    # Transcript formatting, map-reduce chunking, Telegram HTML sanitize
-│   │   └── publisher.py     # Safe sender with smart tag-aware splitting and parse error recovery
+│   │   └── publisher.py     # Safe sender with smart tag-aware splitting, destination override & parse error recovery
 │   ├── scheduler/
-│   │   └── jobs.py          # APScheduler nightly job (00:01 Tehran), daily retention cleanup
+│   │   └── jobs.py          # APScheduler nightly job (00:01 Tehran), catch-up, dry-run preview, daily cleanup
 │   └── utils/
 │       ├── general_topic.py # Normalizes General topic (None/1 -> 1; send target -> None)
+│       ├── html_utils.py    # escape_html helper for dynamic Telegram HTML values
 │       ├── link_parser.py   # Parses Telegram topic/message links and validates group chat IDs
 │       ├── noise_filter.py  # Strips greetings, filler, emojis, punctuation, normalizes ي/ك
 │       ├── text_split.py    # Tag-aware smart message chunker (<= 4000 chars)
 │       ├── dates.py         # Jalali (jdatetime) & Gregorian helpers in Asia/Tehran
 │       ├── retry.py         # Async exponential backoff with jitter on 429/5xx/network errors
 │       └── logging_setup.py # Rotating UTF-8 file handler (5MB x 5) & console handler
-├── tests/                   # Complete offline unit tests (32 passing tests)
+├── tests/                   # Complete offline unit tests (92 passing tests)
 ├── deploy/                  # Linux systemd unit (tg-summarizer.service)
-├── .env.example             # Documented template with all 22 environment keys
+├── .env.example             # Documented template with all 25 environment keys
 └── README.md                # Comprehensive Persian documentation
 ```
 

@@ -137,6 +137,29 @@ class Settings(BaseSettings):
         description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
     )
 
+    # Private Chat & Membership Behavior
+    OWNER_NAMES: str = Field(
+        default="آرش و پیت",
+        description="Display names of bot owners used in private chat responses",
+    )
+    NOTIFY_ON_UNKNOWN_START: bool = Field(
+        default=True,
+        description="Notify ADMIN_IDS on first private contact from an unknown user",
+    )
+    AUTO_LEAVE_UNKNOWN_GROUPS: bool = Field(
+        default=False,
+        description="Automatically leave groups not listed in ALLOWED_CHAT_IDS when added",
+    )
+
+    @field_validator("OWNER_NAMES", mode="before")
+    @classmethod
+    def parse_owner_names(cls, value: Any) -> str:
+        """Fallback to default owner names if empty or whitespace."""
+        if value is None:
+            return "آرش و پیت"
+        stripped = str(value).strip()
+        return stripped if stripped else "آرش و پیت"
+
     @field_validator("ADMIN_IDS", "ALLOWED_CHAT_IDS", mode="after")
     @classmethod
     def parse_int_list(cls, value: Any) -> list[int]:

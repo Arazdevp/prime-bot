@@ -10,10 +10,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
+from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
-from bot.handlers import admin, listener
-from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed
+from bot.handlers import admin, listener, panel, private
+from bot.middlewares.throttle import PrivateThrottleMiddleware
+from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
 from bot.services.llm_client import close_llm_client
 from bot.utils.dates import format_persian_date, get_tehran_now
 from bot.utils.html_utils import escape_html
@@ -117,13 +119,20 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    # 3. Initialize Dispatcher and register routers (Admin first, then Listener)
-    dp = Dispatcher()
+    # 3. Initialize Dispatcher with MemoryStorage, private throttle middleware, and routers
+    dp = Dispatcher(storage=MemoryStorage())
+    private_throttle = PrivateThrottleMiddleware(rate_limit_seconds=1.0)
+    dp.message.outer_middleware(private_throttle)
+    dp.callback_query.outer_middleware(private_throttle)
+
     dp.include_router(admin.router)
     dp.include_router(listener.router)
+    dp.include_router(private.router)
+    dp.include_router(panel.router)
 
     # 4. Initialize and start scheduler
     scheduler = build_scheduler(bot)
+    set_scheduler(scheduler)
     scheduler.start()
     logger.info("Scheduler started successfully in timezone %s.", settings.TIMEZONE)
 
@@ -154,7 +163,7 @@ async def main() -> None:
     polling_task = asyncio.create_task(
         dp.start_polling(
             bot,
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query", "my_chat_member"],
             handle_signals=False,
         )
     )
@@ -196,6 +205,7 @@ async def main() -> None:
         if scheduler.running:
             scheduler.shutdown(wait=False)
             logger.info("Scheduler stopped.")
+        set_scheduler(None)
 
         try:
             await dp.stop_polling()

@@ -2,19 +2,132 @@
 
 from datetime import timezone
 import logging
-from aiogram import Router, F
-from aiogram.types import Message
+import time
+from aiogram import Bot, Router, F
+from aiogram.types import ChatMemberUpdated, Message
 from bot.config import get_settings
 from bot.database import repository
 from bot.filters import ForumGroupFilter
+from bot.texts.private_texts import pick
 from bot.utils.general_topic import resolve_thread_id
 from bot.utils.noise_filter import is_noise
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="listener_router")
-# Apply ForumGroupFilter to ensure messages come from supergroups
+# Apply ForumGroupFilter to message events only (my_chat_member sees all groups for auto-leave/tracking)
 router.message.filter(ForumGroupFilter())
+
+# Throttled in-memory cache for known_groups upserts: chat_id -> (title, is_forum, last_ts)
+_known_group_seen: dict[int, tuple[str | None, bool, float]] = {}
+KNOWN_GROUP_UPSERT_TTL_SECONDS: float = 300.0
+
+
+def clear_known_group_cache() -> None:
+    """Clear the throttled known_groups upsert cache (useful for test isolation)."""
+    _known_group_seen.clear()
+
+
+def _extract_chat_meta(chat: object) -> tuple[str | None, bool]:
+    """Safely extract clean title string and is_forum boolean from a Chat-like object."""
+    raw_title = getattr(chat, "title", None)
+    title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
+    is_forum = bool(getattr(chat, "is_forum", False))
+    return title, is_forum
+
+
+async def _maybe_upsert_known_group(chat: object) -> None:
+    """Upsert group metadata into known_groups on first seen, metadata change, or TTL expiry."""
+    chat_id = getattr(chat, "id", None)
+    if not isinstance(chat_id, int):
+        return
+
+    title, is_forum = _extract_chat_meta(chat)
+    now = time.monotonic()
+    cached = _known_group_seen.get(chat_id)
+    if (
+        cached is not None
+        and cached[0] == title
+        and cached[1] == is_forum
+        and (now - cached[2]) < KNOWN_GROUP_UPSERT_TTL_SECONDS
+    ):
+        return
+
+    await repository.upsert_known_group(chat_id=chat_id, title=title, is_forum=is_forum)
+    _known_group_seen[chat_id] = (title, is_forum, now)
+
+
+@router.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated, bot: Bot) -> None:
+    """Track bot group additions/removals, send welcome, and enforce AUTO_LEAVE_UNKNOWN_GROUPS."""
+    try:
+        chat = event.chat
+        if not chat or chat.type not in ("group", "supergroup"):
+            return
+
+        old_status = event.old_chat_member.status
+        new_status = event.new_chat_member.status
+        title, is_forum = _extract_chat_meta(chat)
+
+        was_outside = old_status in ("left", "kicked")
+        is_inside = new_status in ("member", "administrator")
+        is_outside = new_status in ("left", "kicked")
+
+        if was_outside and is_inside:
+            settings = get_settings()
+            if (
+                settings.AUTO_LEAVE_UNKNOWN_GROUPS
+                and settings.ALLOWED_CHAT_IDS
+                and chat.id not in settings.ALLOWED_CHAT_IDS
+            ):
+                leave_text, _ = pick(
+                    "group_not_allowed",
+                    owners=settings.OWNER_NAMES,
+                    escape=True,
+                )
+                try:
+                    await bot.send_message(
+                        chat_id=chat.id,
+                        text=leave_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed sending group_not_allowed to chat %s: %s", chat.id, exc, exc_info=True)
+                try:
+                    await bot.leave_chat(chat.id)
+                except Exception as exc:
+                    logger.error("Failed leaving unauthorized group %s: %s", chat.id, exc, exc_info=True)
+                await repository.mark_known_group_left(chat.id)
+                _known_group_seen.pop(chat.id, None)
+                return
+
+            await repository.upsert_known_group(chat_id=chat.id, title=title, is_forum=is_forum)
+            _known_group_seen[chat.id] = (title, is_forum, time.monotonic())
+            await repository.ensure_group_settings(chat.id)
+
+            welcome_text, _ = pick("group_added", owners=settings.OWNER_NAMES, escape=True)
+            try:
+                await bot.send_message(
+                    chat_id=chat.id,
+                    text=welcome_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                logger.warning("Failed sending group_added welcome to chat %s: %s", chat.id, exc, exc_info=True)
+            return
+
+        if is_inside:
+            await repository.upsert_known_group(chat_id=chat.id, title=title, is_forum=is_forum)
+            _known_group_seen[chat.id] = (title, is_forum, time.monotonic())
+            return
+
+        if is_outside:
+            await repository.mark_known_group_left(chat.id)
+            _known_group_seen.pop(chat.id, None)
+    except Exception as exc:
+        logger.error("Unexpected error handling my_chat_member: %s", exc, exc_info=True)
 
 
 @router.message(F.forum_topic_created)
@@ -23,6 +136,7 @@ async def on_forum_topic_created(message: Message) -> None:
     try:
         if not message.chat or not message.forum_topic_created:
             return
+        await _maybe_upsert_known_group(message.chat)
         thread_id = resolve_thread_id(message)
         topic_name = message.forum_topic_created.name
         await repository.upsert_topic(
@@ -46,6 +160,7 @@ async def on_forum_topic_edited(message: Message) -> None:
     try:
         if not message.chat or not message.forum_topic_edited:
             return
+        await _maybe_upsert_known_group(message.chat)
         thread_id = resolve_thread_id(message)
         topic_name = message.forum_topic_edited.name
         if topic_name:
@@ -70,6 +185,8 @@ async def capture_message(message: Message) -> None:
     try:
         if not message.chat:
             return
+
+        await _maybe_upsert_known_group(message.chat)
 
         # Check for topic name in reply_to_message.forum_topic_created before noise/monitored checks
         if (

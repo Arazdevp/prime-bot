@@ -23,7 +23,7 @@ def strip_html_tags(text: str) -> str:
 async def send_summary_parts(
     bot: Bot,
     chat_id: int,
-    thread_id: int,
+    thread_id: int | None,
     parts: list[str],
     start_index: int = 0,
     on_part_sent: Any | None = None,
@@ -141,10 +141,12 @@ async def send_summary_parts(
 async def send_summary(
     bot: Bot,
     chat_id: int,
-    thread_id: int,
+    thread_id: int | None,
     text: str,
+    destination_override: tuple[int, int | None] | None = None,
+    dry_run: bool = False,
 ) -> bool:
-    """Send summary text safely to Telegram supergroup topic.
+    """Send summary text safely to Telegram chat/topic or an explicit destination override.
 
     - Splits into chunks <= 4000 chars while preserving HTML balance.
     - Sends each part with HTML parse mode.
@@ -154,14 +156,19 @@ async def send_summary(
     - Applies delay between parts to avoid Telegram flood limits.
     - Returns True only if all parts were successfully delivered.
     """
+    _ = dry_run  # Accepted for caller symmetry; send_summary never writes to the database
     parts = smart_split(text, limit=4000)
     if not parts:
         return False
 
+    target_chat_id, target_thread_id = (
+        destination_override if destination_override is not None else (chat_id, thread_id)
+    )
+
     delivered, _ = await send_summary_parts(
         bot=bot,
-        chat_id=chat_id,
-        thread_id=thread_id,
+        chat_id=target_chat_id,
+        thread_id=target_thread_id,
         parts=parts,
         start_index=0,
     )

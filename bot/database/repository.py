@@ -107,6 +107,42 @@ async def set_topic_active_status(
         await conn.commit()
 
 
+async def set_all_topics_active_status(
+    chat_id: int,
+    is_active: int,
+) -> int:
+    """Set is_active for all known topics in a group (across topics and messages tables)."""
+    conn = get_db()
+    lock = get_write_lock()
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    async with lock:
+        cursor = await conn.execute(
+            """
+            SELECT DISTINCT thread_id FROM topics WHERE chat_id = ?
+            UNION
+            SELECT DISTINCT thread_id FROM messages WHERE chat_id = ?;
+            """,
+            (chat_id, chat_id),
+        )
+        rows = await cursor.fetchall()
+        thread_ids = [int(r["thread_id"]) for r in rows]
+
+        for tid in thread_ids:
+            await conn.execute(
+                """
+                INSERT INTO topics (chat_id, thread_id, name, is_active, updated_at)
+                VALUES (?, ?, NULL, ?, ?)
+                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at;
+                """,
+                (chat_id, tid, is_active, updated_at),
+            )
+        await conn.commit()
+    return len(thread_ids)
+
+
 async def get_topic_name(chat_id: int, thread_id: int) -> str | None:
     """Get the stored name of a topic."""
     conn = get_db()
@@ -118,6 +154,18 @@ async def get_topic_name(chat_id: int, thread_id: int) -> str | None:
     if row and row["name"]:
         return str(row["name"])
     return None
+
+
+async def get_group_settings(chat_id: int) -> dict[str, Any] | None:
+    """Read-only lookup of group settings; returns None if not initialized (never writes to DB)."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, mode, destination_mode, destination_thread_id, enabled, min_messages "
+        "FROM group_settings WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
 
 
 async def ensure_group_settings(chat_id: int, default_min_messages: int | None = None) -> dict[str, Any]:
@@ -253,8 +301,9 @@ async def list_topics_with_counts_today(
     conn = get_db()
     sql = """
     SELECT 
-        COALESCE(t.thread_id, m.thread_id) AS thread_id,
-        COALESCE(t.name, CASE WHEN COALESCE(t.thread_id, m.thread_id) = 1 THEN 'عمومی' ELSE 'تاپیک ' || COALESCE(t.thread_id, m.thread_id) END) AS name,
+        all_threads.thread_id AS thread_id,
+        t.name AS raw_name,
+        COALESCE(NULLIF(t.name, ''), CASE WHEN all_threads.thread_id = 1 THEN 'عمومی' ELSE 'تاپیک ' || all_threads.thread_id END) AS name,
         t.is_active,
         COUNT(m.id) AS today_count
     FROM (
@@ -273,8 +322,10 @@ async def list_topics_with_counts_today(
     results: list[dict[str, Any]] = []
     for r in rows:
         tid = r["thread_id"]
+        raw_name = (r["raw_name"] or "").strip()
         name = r["name"]
         raw_is_active = r["is_active"]
+        has_known_name = (tid == 1) or bool(raw_name and raw_name != f"تاپیک {tid}")
 
         if mode == "whitelist":
             is_monitored = raw_is_active is not None and raw_is_active == 1
@@ -284,6 +335,7 @@ async def list_topics_with_counts_today(
         results.append({
             "thread_id": tid,
             "name": name,
+            "has_known_name": has_known_name,
             "is_active": raw_is_active,
             "is_monitored": is_monitored,
             "today_count": r["today_count"],
@@ -528,3 +580,190 @@ async def delete_summary(chat_id: int, thread_id: int, day: str) -> None:
             (chat_id, thread_id, day),
         )
         await conn.commit()
+
+
+# ---------------- Bot Users Table Operations ----------------
+
+
+async def get_bot_user(user_id: int) -> dict[str, Any] | None:
+    """Fetch a private-chat user record by Telegram user ID."""
+    conn = get_db()
+    cursor = await conn.execute(
+        """
+        SELECT user_id, username, full_name, first_seen, last_seen,
+               last_variant_key, attempts_window_start, attempts_count,
+               ignored_until, notified
+        FROM bot_users WHERE user_id = ?;
+        """,
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def upsert_bot_user_seen(
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    seen_at_iso: str | None = None,
+) -> dict[str, Any]:
+    """Insert or update a user's basic metadata and last_seen timestamp, returning the full row."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = seen_at_iso or datetime.now(timezone.utc).isoformat()
+    sql = """
+    INSERT INTO bot_users (
+        user_id, username, full_name, first_seen, last_seen,
+        last_variant_key, attempts_window_start, attempts_count, ignored_until, notified
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username = excluded.username,
+        full_name = excluded.full_name,
+        last_seen = excluded.last_seen;
+    """
+    async with lock:
+        await conn.execute(sql, (user_id, username, full_name, now_iso, now_iso))
+        await conn.commit()
+        cursor = await conn.execute(
+            """
+            SELECT user_id, username, full_name, first_seen, last_seen,
+                   last_variant_key, attempts_window_start, attempts_count,
+                   ignored_until, notified
+            FROM bot_users WHERE user_id = ?;
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row is not None else {
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
+        "first_seen": now_iso,
+        "last_seen": now_iso,
+        "last_variant_key": None,
+        "attempts_window_start": None,
+        "attempts_count": 0,
+        "ignored_until": None,
+        "notified": 0,
+    }
+
+
+async def update_bot_user_stranger_state(
+    user_id: int,
+    *,
+    last_variant_key: str | None,
+    attempts_window_start: str | None,
+    attempts_count: int,
+    ignored_until: str | None,
+) -> None:
+    """Persist anti-spam attempt window, ignore window, and last variant for a user."""
+    conn = get_db()
+    lock = get_write_lock()
+    sql = """
+    UPDATE bot_users
+    SET last_variant_key = ?,
+        attempts_window_start = ?,
+        attempts_count = ?,
+        ignored_until = ?
+    WHERE user_id = ?;
+    """
+    async with lock:
+        await conn.execute(
+            sql,
+            (last_variant_key, attempts_window_start, attempts_count, ignored_until, user_id),
+        )
+        await conn.commit()
+
+
+async def update_bot_user_last_variant(user_id: int, last_variant_key: str) -> None:
+    """Persist only the last_variant_key for a user (used for admin welcome/hint rotation)."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute(
+            "UPDATE bot_users SET last_variant_key = ? WHERE user_id = ?;",
+            (last_variant_key, user_id),
+        )
+        await conn.commit()
+
+
+async def mark_bot_user_notified(user_id: int) -> None:
+    """Mark a stranger user as already reported to global admins."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute(
+            "UPDATE bot_users SET notified = 1 WHERE user_id = ?;",
+            (user_id,),
+        )
+        await conn.commit()
+
+
+# ---------------- Known Groups Table Operations ----------------
+
+
+async def upsert_known_group(
+    chat_id: int,
+    title: str | None = None,
+    is_forum: bool = True,
+    added_at_iso: str | None = None,
+) -> None:
+    """Register or refresh an active group in known_groups (clears left_at)."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = added_at_iso or datetime.now(timezone.utc).isoformat()
+    clean_title = title.strip() if isinstance(title, str) and title.strip() else None
+    is_forum_int = 1 if is_forum else 0
+    sql = """
+    INSERT INTO known_groups (chat_id, title, is_forum, added_at, left_at)
+    VALUES (?, ?, ?, ?, NULL)
+    ON CONFLICT(chat_id) DO UPDATE SET
+        title = COALESCE(excluded.title, known_groups.title),
+        is_forum = excluded.is_forum,
+        left_at = NULL;
+    """
+    async with lock:
+        await conn.execute(sql, (chat_id, clean_title, is_forum_int, now_iso))
+        await conn.commit()
+
+
+async def mark_known_group_left(
+    chat_id: int,
+    left_at_iso: str | None = None,
+) -> None:
+    """Mark a group as left in known_groups."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = left_at_iso or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        await conn.execute(
+            "UPDATE known_groups SET left_at = ? WHERE chat_id = ?;",
+            (now_iso, chat_id),
+        )
+        await conn.commit()
+
+
+async def get_known_group(chat_id: int) -> dict[str, Any] | None:
+    """Retrieve a known_groups entry by chat_id."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, title, is_forum, added_at, left_at FROM known_groups WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def list_active_known_groups() -> list[dict[str, Any]]:
+    """List all groups where the bot is currently active (left_at IS NULL)."""
+    conn = get_db()
+    cursor = await conn.execute(
+        """
+        SELECT chat_id, title, is_forum, added_at, left_at
+        FROM known_groups
+        WHERE left_at IS NULL
+        ORDER BY added_at ASC, chat_id ASC;
+        """
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]

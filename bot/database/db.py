@@ -1,6 +1,7 @@
 """Database connection management and schema initialization."""
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 import aiosqlite
 
@@ -63,6 +64,27 @@ CREATE TABLE IF NOT EXISTS summaries (
     created_at TEXT NOT NULL,
     PRIMARY KEY(chat_id, thread_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS bot_users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_variant_key TEXT,
+    attempts_window_start TEXT,
+    attempts_count INTEGER NOT NULL DEFAULT 0,
+    ignored_until TEXT,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS known_groups (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT,
+    is_forum INTEGER NOT NULL DEFAULT 1,
+    added_at TEXT NOT NULL,
+    left_at TEXT
+);
 """
 
 
@@ -113,6 +135,39 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
             );
         """)
         await conn.execute("PRAGMA user_version = 2;")
+        await conn.commit()
+
+    if current_version < 3:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                last_variant_key TEXT,
+                attempts_window_start TEXT,
+                attempts_count INTEGER NOT NULL DEFAULT 0,
+                ignored_until TEXT,
+                notified INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS known_groups (
+                chat_id INTEGER PRIMARY KEY,
+                title TEXT,
+                is_forum INTEGER NOT NULL DEFAULT 1,
+                added_at TEXT NOT NULL,
+                left_at TEXT
+            );
+        """)
+        now_utc = datetime.now(timezone.utc).isoformat()
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO known_groups (chat_id, title, is_forum, added_at, left_at)
+            SELECT chat_id, NULL, 1, ?, NULL FROM group_settings;
+            """,
+            (now_utc,),
+        )
+        await conn.execute("PRAGMA user_version = 3;")
         await conn.commit()
 
 

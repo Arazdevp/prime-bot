@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -24,11 +25,31 @@ logger = logging.getLogger(__name__)
 
 # Concurrency lock ensuring nightly and manual runs do not execute concurrently
 _summary_execution_lock = asyncio.Lock()
+_scheduler_ref: AsyncIOScheduler | None = None
 
 
 def get_summary_lock() -> asyncio.Lock:
     """Return shared summarization lock."""
     return _summary_execution_lock
+
+
+def set_scheduler(scheduler: AsyncIOScheduler | None) -> None:
+    """Store active scheduler instance for runtime inspection (e.g. Global Status)."""
+    global _scheduler_ref
+    _scheduler_ref = scheduler
+
+
+def get_next_nightly_run_time() -> datetime | None:
+    """Return the scheduler's next nightly_summary fire time, if active."""
+    if _scheduler_ref is None:
+        return None
+    try:
+        job = _scheduler_ref.get_job("nightly_summary")
+        if job and job.next_run_time:
+            return job.next_run_time
+    except Exception:
+        return None
+    return None
 
 
 async def notify_admins_failure(
@@ -106,19 +127,35 @@ async def run_summary_for_topic(
     is_nightly: bool = True,
     cutoff: datetime | str | None = None,
     llm_client: BaseLLMClient | None = None,
+    destination_override: tuple[int, int | None] | None = None,
+    dry_run: bool = False,
 ) -> tuple[bool, str]:
     """Execute end-to-end summarization pipeline for a single topic.
+
+    When dry_run=True, performs read-only DB queries, generates a fresh summary,
+    sends it (using destination_override if given), and NEVER writes to or deletes from the DB.
 
     Returns (success_bool, details_str).
     """
     settings = get_settings()
-    group_cfg = await repository.ensure_group_settings(chat_id, settings.MIN_MESSAGES_PER_TOPIC)
 
-    if group_cfg.get("enabled", 1) == 0:
-        return False, "سیستم خلاصه‌سازی این گروه غیرفعال است."
+    if dry_run:
+        group_cfg = await repository.get_group_settings(chat_id) or {
+            "chat_id": chat_id,
+            "mode": "blacklist",
+            "destination_mode": "per_topic",
+            "destination_thread_id": None,
+            "enabled": 1,
+            "min_messages": settings.MIN_MESSAGES_PER_TOPIC,
+        }
+    else:
+        group_cfg = await repository.ensure_group_settings(chat_id, settings.MIN_MESSAGES_PER_TOPIC)
 
-    if not await repository.is_topic_monitored(chat_id, thread_id):
-        return False, "این تاپیک در تنظیمات فعلی گروه تحت نظارت نیست."
+        if group_cfg.get("enabled", 1) == 0:
+            return False, "سیستم خلاصه‌سازی این گروه غیرفعال است."
+
+        if not await repository.is_topic_monitored(chat_id, thread_id):
+            return False, "این تاپیک در تنظیمات فعلی گروه تحت نظارت نیست."
 
     topic_name = await repository.get_topic_name(chat_id, thread_id)
     if not topic_name:
@@ -131,7 +168,7 @@ async def run_summary_for_topic(
             cutoff_iso = cutoff.astimezone(timezone.utc).isoformat()
         else:
             cutoff_iso = str(cutoff)
-    elif is_nightly:
+    elif is_nightly and not dry_run:
         cutoff_iso = compute_nightly_cutoff().isoformat()
 
     messages = await repository.fetch_unsummarized_messages(chat_id, thread_id, before=cutoff_iso)
@@ -146,12 +183,57 @@ async def run_summary_for_topic(
             len(messages),
             min_msgs,
         )
-        # Delete below-threshold messages only on nightly/cutoff runs, never on manual runs
-        if cutoff_iso is not None and mark_summarized and messages:
+        # Delete below-threshold messages only on nightly/cutoff runs, never on manual or dry_run
+        if not dry_run and cutoff_iso is not None and mark_summarized and messages:
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
             logger.info("Deleted %s below-threshold messages for topic '%s' to free storage.", deleted_cnt, topic_name)
         return False, f"تعداد پیام‌ها ({len(messages)}) کمتر از حداقل حد نصاب ({min_msgs}) بود."
+
+    # Destination handling
+    dest_mode = group_cfg.get("destination_mode", "per_topic")
+    dest_tid = group_cfg.get("destination_thread_id")
+    target_thread = dest_tid if dest_mode == "aggregate" and dest_tid is not None else thread_id
+
+    if dry_run:
+        try:
+            summary_text = await summarize_topic_messages(
+                topic_name=topic_name,
+                messages=messages,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                min_messages=min_msgs,
+                is_nightly=False,
+                llm_client=llm_client,
+            )
+        except Exception as exc:
+            logger.error("Dry-run summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
+            return False, f"خطای هوش مصنوعی در تولید پیش‌نمایش: {exc}"
+
+        if not summary_text:
+            return False, "خلاصه معتبری توسط مدل تولید نشد."
+
+        preview_text = (
+            f"👁 <b>پیش‌نمایش خلاصه تاپیک «{escape_html(topic_name)}»</b>\n"
+            "<i>(فقط برای شما ارسال شده و هیچ پیامی تغییر یا حذف نشد)</i>\n\n"
+            f"{summary_text}"
+        )
+        try:
+            delivered = await send_summary(
+                bot=bot,
+                chat_id=chat_id,
+                thread_id=target_thread,
+                text=preview_text,
+                destination_override=destination_override,
+                dry_run=True,
+            )
+        except Exception as exc:
+            logger.error("Dry-run publishing failed for topic '%s': %s", topic_name, exc, exc_info=True)
+            delivered = False
+
+        if delivered:
+            return True, "پیش‌نمایش خلاصه با موفقیت برای شما ارسال شد."
+        return False, "خطا در ارسال پیش‌نمایش به تلگرام."
 
     # Derive day from earliest message's Tehran timestamp
     first_created = messages[0].get("created_at") or ""
@@ -166,11 +248,6 @@ async def run_summary_for_topic(
     except Exception:
         tehran_dt = datetime.now(ZoneInfo(settings.TIMEZONE))
     day = tehran_dt.strftime("%Y-%m-%d")
-
-    # Destination handling
-    dest_mode = group_cfg.get("destination_mode", "per_topic")
-    dest_tid = group_cfg.get("destination_thread_id")
-    target_thread = dest_tid if dest_mode == "aggregate" and dest_tid is not None else thread_id
 
     # Check for existing summary in database to handle resumption and prevent duplicate posts
     existing_summary = await repository.get_summary_record(chat_id, thread_id, day)
@@ -242,11 +319,15 @@ async def run_summary_for_topic(
     async def _on_part_sent(new_sent: int) -> None:
         await repository.update_summary_sent_count(chat_id, thread_id, day, new_sent)
 
+    pub_chat_id, pub_thread_id = (
+        destination_override if destination_override is not None else (chat_id, target_thread)
+    )
+
     try:
         delivered, sent_count = await send_summary_parts(
             bot=bot,
-            chat_id=chat_id,
-            thread_id=target_thread,
+            chat_id=pub_chat_id,
+            thread_id=pub_thread_id,
             parts=parts,
             start_index=sent_count,
             on_part_sent=_on_part_sent,
@@ -293,6 +374,7 @@ async def run_summary_for_group(
     is_nightly: bool = False,
     cutoff: datetime | str | None = None,
     llm_client: BaseLLMClient | None = None,
+    progress_callback: Callable[[int, int, str], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     """Run summarization sequentially for all monitored topics in a group."""
     settings = get_settings()
@@ -307,12 +389,23 @@ async def run_summary_for_group(
         cutoff_iso = compute_nightly_cutoff().isoformat()
 
     distinct_threads = await repository.list_distinct_unsummarized_topics(chat_id, before=cutoff_iso)
+    monitored_threads: list[int] = []
+    for tid in distinct_threads:
+        if await repository.is_topic_monitored(chat_id, tid):
+            monitored_threads.append(tid)
 
     report = {"success": 0, "skipped": 0, "failed": 0}
+    total = len(monitored_threads)
 
-    for tid in distinct_threads:
-        if not await repository.is_topic_monitored(chat_id, tid):
-            continue
+    for idx, tid in enumerate(monitored_threads, start=1):
+        if progress_callback is not None:
+            try:
+                t_name = await repository.get_topic_name(chat_id, tid)
+                if not t_name:
+                    t_name = "عمومی" if tid == 1 else f"تاپیک {tid}"
+                await progress_callback(idx, total, t_name)
+            except Exception as exc:
+                logger.debug("Progress callback failed for topic %s: %s", tid, exc)
 
         try:
             success, details = await run_summary_for_topic(
