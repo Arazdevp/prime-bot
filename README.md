@@ -101,6 +101,9 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o-mini
 
+# سقف توکن‌های خروجی هوش مصنوعی (پیش‌فرض 8192)
+AI_MAX_OUTPUT_TOKENS=8192
+
 # آستانه‌ها و محدودیت‌ها
 MIN_MESSAGES_PER_TOPIC=5
 MIN_MESSAGE_LENGTH=3

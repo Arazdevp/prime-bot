@@ -86,3 +86,53 @@ def test_sanitize_preserves_generous_spacing() -> None:
     # Consecutive newlines should normalize to 3 newlines (\n\n\n = two empty lines)
     assert "\n\n\n" in result
     assert "\n\n\n\n" not in result
+
+
+def test_sanitize_href_ampersand_no_double_escape() -> None:
+    """Verify & inside href is unescaped and escaped once (never &amp;amp;)."""
+    # 1. Raw ampersands in query parameters
+    input_text = (
+        '<a href="https://example.com/watch?v=abc&t=10s&lang=fa">ویدیو آموزشی</a>'
+        ' و متن ساده با علامت & برای آزمایش.'
+    )
+    result = sanitize_telegram_html(input_text)
+
+    # href must have single &amp;, never &amp;amp;
+    assert 'href="https://example.com/watch?v=abc&amp;t=10s&amp;lang=fa"' in result
+    assert "&amp;amp;" not in result
+    # Text node must have &amp;
+    assert "متن ساده با علامت &amp; برای آزمایش." in result
+
+    # 2. Already escaped &amp; in raw href from model
+    input_text2 = '<a href="https://example.com/api?a=1&amp;b=2">لینک ای‌پی‌آی</a>'
+    result2 = sanitize_telegram_html(input_text2)
+    assert 'href="https://example.com/api?a=1&amp;b=2"' in result2
+    assert "&amp;amp;" not in result2
+
+
+def test_sanitize_topic_message_links_non_general_and_general() -> None:
+    """Verify 3-part message links for non-General topics and 2-part for General topic."""
+    clean_chat_id = "2458921841"
+
+    # Non-General topic: thread_id = 42
+    input_non_general = (
+        'مبحث اول <a href="#105">لینک پیام نسبی</a> و '
+        '<a href="https://t.me/c/2458921841/200">لینک پیام ۲ تایی</a>'
+    )
+    result_non_general = sanitize_telegram_html(
+        input_non_general,
+        clean_chat_id=clean_chat_id,
+        thread_id=42,
+    )
+    assert f'href="https://t.me/c/{clean_chat_id}/42/105"' in result_non_general
+    assert f'href="https://t.me/c/{clean_chat_id}/42/200"' in result_non_general
+
+    # General topic: thread_id = 1
+    input_general = 'مبحث عمومی <a href="#105">پیام عمومی</a>'
+    result_general = sanitize_telegram_html(
+        input_general,
+        clean_chat_id=clean_chat_id,
+        thread_id=1,
+    )
+    assert f'href="https://t.me/c/{clean_chat_id}/105"' in result_general
+    assert f"/1/105" not in result_general

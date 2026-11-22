@@ -144,6 +144,7 @@ async def run_summary_for_topic(
             topic_name=topic_name,
             messages=messages,
             chat_id=chat_id,
+            thread_id=thread_id,
             min_messages=min_msgs,
             is_nightly=is_nightly,
             llm_client=llm_client,

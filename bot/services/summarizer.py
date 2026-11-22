@@ -6,7 +6,7 @@ import logging
 import re
 from zoneinfo import ZoneInfo
 from bot.config import get_settings
-from bot.services.llm_client import BaseLLMClient, get_llm_client
+from bot.services.llm_client import BaseLLMClient, LLMTruncationError, get_llm_client
 from bot.utils.dates import format_date_heading, get_tehran_now
 from bot.utils.link_parser import get_clean_chat_id
 from bot.utils.retry import async_retry
@@ -178,7 +178,11 @@ def chunk_transcript(transcript: str, max_chars: int = 24000) -> list[str]:
     return chunks
 
 
-def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
+def sanitize_telegram_html(
+    text: str,
+    clean_chat_id: str | None = None,
+    thread_id: int | None = None,
+) -> str:
     """Clean model output, convert HTML/markdown headings, escape stray characters, and balance allowed tags."""
     if not text:
         return ""
@@ -203,24 +207,28 @@ def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
     cleaned = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", cleaned)
     cleaned = re.sub(r"__(.+?)__", r"<u>\1</u>", cleaned)
 
-    # 5. Escape lone ampersands not already part of valid entities
-    cleaned = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", cleaned)
-
-    # 6. Normalize multiple empty lines to at most two empty lines (3 newlines)
+    # 5. Normalize multiple empty lines to at most two empty lines (3 newlines)
     cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
 
-    # 7. Tokenize and sanitize tags
+    # Helper: escape ampersands and angle brackets ONLY in text nodes
+    def _sanitize_text_segment(segment: str) -> str:
+        # Escape lone ampersands not already part of valid entities
+        segment = re.sub(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)", "&amp;", segment)
+        # Escape stray angle brackets
+        segment = segment.replace("<", "&lt;").replace(">", "&gt;")
+        return segment
+
+    # 6. Tokenize and sanitize tags
     tag_pattern = re.compile(r"<(/)?([a-zA-Z0-9_-]+)(?:\s+([^>]*))?>")
     tokens: list[str] = []
     last_idx = 0
     open_stack: list[str] = []
 
     for m in tag_pattern.finditer(cleaned):
-        # Escape stray angle brackets in text before tag
+        # Escape stray angle brackets and lone ampersands in text before tag
         if m.start() > last_idx:
             segment = cleaned[last_idx : m.start()]
-            segment = segment.replace("<", "&lt;").replace(">", "&gt;")
-            tokens.append(segment)
+            tokens.append(_sanitize_text_segment(segment))
 
         is_closing = bool(m.group(1))
         tag_name = m.group(2).lower()
@@ -228,7 +236,7 @@ def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
 
         if tag_name not in ALLOWED_HTML_TAGS:
             # Escape disallowed tag
-            disallowed_tag = m.group(0).replace("<", "&lt;").replace(">", "&gt;")
+            disallowed_tag = _sanitize_text_segment(m.group(0))
             tokens.append(disallowed_tag)
         else:
             if is_closing:
@@ -243,12 +251,28 @@ def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
                 if tag_name == "a":
                     # Extract href attribute safely
                     href_match = re.search(r'href=[\"\']([^\"\']+)[\"\']', attributes)
-                    href = href_match.group(1).strip() if href_match else "#"
+                    raw_href = href_match.group(1).strip() if href_match else "#"
                     # Auto-expand relative message IDs (#123, 123, /123, msg:123)
-                    num_match = re.match(r"^(?:#|/|msg:)?(\d+)$", href)
+                    num_match = re.match(r"^(?:#|/|msg:)?(\d+)$", raw_href)
                     if num_match and clean_chat_id:
-                        href = f"https://t.me/c/{clean_chat_id}/{num_match.group(1)}"
-                    tokens.append(f'<a href="{html.escape(href)}">')
+                        if thread_id and thread_id != 1:
+                            href = f"https://t.me/c/{clean_chat_id}/{thread_id}/{num_match.group(1)}"
+                        else:
+                            href = f"https://t.me/c/{clean_chat_id}/{num_match.group(1)}"
+                    else:
+                        # Check if href is 2-part t.me/c/{clean_chat_id}/{msg_id} when non-General thread_id is set
+                        m2 = (
+                            re.match(rf"^(?:https?://)?(?:www\.)?t\.me/c/{re.escape(clean_chat_id)}/(\d+)$", raw_href)
+                            if clean_chat_id and thread_id and thread_id != 1
+                            else None
+                        )
+                        if m2:
+                            href = f"https://t.me/c/{clean_chat_id}/{thread_id}/{m2.group(1)}"
+                        else:
+                            # In href: unescape first to prevent double-escaping (&amp; -> &), then escape once
+                            href = html.unescape(raw_href)
+
+                    tokens.append(f'<a href="{html.escape(href, quote=True)}">')
                 else:
                     tokens.append(f"<{tag_name}>")
                 open_stack.append(tag_name)
@@ -258,8 +282,7 @@ def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
     # Remainder text after last tag
     if last_idx < len(cleaned):
         segment = cleaned[last_idx:]
-        segment = segment.replace("<", "&lt;").replace(">", "&gt;")
-        tokens.append(segment)
+        tokens.append(_sanitize_text_segment(segment))
 
     # Close any unclosed tags at the end
     while open_stack:
@@ -268,10 +291,47 @@ def sanitize_telegram_html(text: str, clean_chat_id: str | None = None) -> str:
     return "".join(tokens).strip()
 
 
+async def _generate_with_retry(
+    llm_client: BaseLLMClient,
+    system_prompt: str,
+    user_content: str,
+    max_retries: int = 3,
+) -> str:
+    """Execute LLM call with retry on network/server errors, and retry-once on token truncation."""
+    async def _call_once(allow_truncated: bool) -> str:
+        return await llm_client.generate(
+            system_prompt=system_prompt,
+            user_content=user_content,
+            allow_truncated=allow_truncated,
+        )
+
+    try:
+        return await async_retry(
+            lambda: _call_once(allow_truncated=False),
+            retries=max_retries,
+        )
+    except LLMTruncationError as exc:
+        logger.warning(
+            "LLM response was truncated (token limit reached). Retrying generation once with allow_truncated=True..."
+        )
+        try:
+            return await async_retry(
+                lambda: _call_once(allow_truncated=True),
+                retries=max_retries,
+            )
+        except LLMTruncationError as exc_persisted:
+            logger.warning(
+                "LLM response truncation persisted on retry (%d chars). Returning truncated output for sanitization.",
+                len(exc_persisted.truncated_text),
+            )
+            return exc_persisted.truncated_text
+
+
 async def summarize_topic_messages(
     topic_name: str,
     messages: list[dict],
     chat_id: int | None = None,
+    thread_id: int | None = None,
     min_messages: int = 5,
     is_nightly: bool = True,
     llm_client: BaseLLMClient | None = None,
@@ -296,16 +356,23 @@ async def summarize_topic_messages(
 
     target_chat = chat_id or (messages[0].get("chat_id") if messages else None)
     clean_chat_id = get_clean_chat_id(target_chat) if target_chat else ""
+    target_thread = thread_id if thread_id is not None else (messages[0].get("thread_id") if messages else None)
 
     transcript = format_messages(messages)
     date_heading = format_date_heading(get_tehran_now(), is_nightly=is_nightly)
+
+    # Prefix used in system prompts for message hyperlinks
+    if target_thread and target_thread != 1:
+        link_prefix = f"{clean_chat_id}/{target_thread}"
+    else:
+        link_prefix = clean_chat_id or "chat"
 
     # Check if single call or map-reduce
     if len(transcript) <= settings.CHUNK_MAX_CHARS:
         system_prompt = (
             SYSTEM_PROMPT_SINGLE.replace("{topic_name}", topic_name)
             .replace("{date_heading}", date_heading)
-            .replace("{clean_chat_id}", clean_chat_id or "chat")
+            .replace("{clean_chat_id}", link_prefix)
         )
         user_content = (
             f"متن گفتگوهای تاپیک «{topic_name}»:\n\n"
@@ -313,11 +380,13 @@ async def summarize_topic_messages(
             "لطفاً خلاصه جامع و ساختاریافته را به زبان فارسی طبق دستورالعمل با دو خط فاصله بین بخش‌ها و پیوندهای آبی به پیام‌های مهم ارائه دهید."
         )
 
-        async def _call_single() -> str:
-            return await llm_client.generate(system_prompt=system_prompt, user_content=user_content)
-
-        raw_output = await async_retry(_call_single, retries=settings.AI_MAX_RETRIES)
-        return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id)
+        raw_output = await _generate_with_retry(
+            llm_client=llm_client,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            max_retries=settings.AI_MAX_RETRIES,
+        )
+        return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
 
     else:
         # Map-Reduce pipeline
@@ -330,7 +399,7 @@ async def summarize_topic_messages(
             len(chunks),
         )
 
-        chunk_prompt = SYSTEM_PROMPT_CHUNK.replace("{clean_chat_id}", clean_chat_id or "chat")
+        chunk_prompt = SYSTEM_PROMPT_CHUNK.replace("{clean_chat_id}", link_prefix)
         partial_summaries: list[str] = []
         for i, chunk in enumerate(chunks, start=1):
             chunk_user_content = (
@@ -339,20 +408,19 @@ async def summarize_topic_messages(
                 "نکات کلیدی، تصمیمات و مباحث معنادار این بخش را به همراه شناسه‌های پیام استخراج کنید."
             )
 
-            async def _call_chunk(c_content: str = chunk_user_content) -> str:
-                return await llm_client.generate(
-                    system_prompt=chunk_prompt,
-                    user_content=c_content,
-                )
-
-            partial_summary = await async_retry(_call_chunk, retries=settings.AI_MAX_RETRIES)
+            partial_summary = await _generate_with_retry(
+                llm_client=llm_client,
+                system_prompt=chunk_prompt,
+                user_content=chunk_user_content,
+                max_retries=settings.AI_MAX_RETRIES,
+            )
             partial_summaries.append(partial_summary.strip())
 
         # Merge step
         merge_system_prompt = (
             SYSTEM_PROMPT_MERGE.replace("{topic_name}", topic_name)
             .replace("{date_heading}", date_heading)
-            .replace("{clean_chat_id}", clean_chat_id or "chat")
+            .replace("{clean_chat_id}", link_prefix)
         )
         merge_user_content = (
             f"خلاصه‌های استخراج‌شده از {len(partial_summaries)} بخش مختلف تاپیک «{topic_name}»:\n\n"
@@ -360,11 +428,10 @@ async def summarize_topic_messages(
             + "\n\nلطفاً این بخش‌ها را ترکیب کرده و خلاصه نهایی جامع را با دو خط فاصله و لینک‌های آبی به پیام‌ها ارائه دهید."
         )
 
-        async def _call_merge() -> str:
-            return await llm_client.generate(
-                system_prompt=merge_system_prompt,
-                user_content=merge_user_content,
-            )
-
-        merged_output = await async_retry(_call_merge, retries=settings.AI_MAX_RETRIES)
-        return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id)
+        merged_output = await _generate_with_retry(
+            llm_client=llm_client,
+            system_prompt=merge_system_prompt,
+            user_content=merge_user_content,
+            max_retries=settings.AI_MAX_RETRIES,
+        )
+        return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id, thread_id=target_thread)

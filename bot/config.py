@@ -65,6 +65,11 @@ class Settings(BaseSettings):
         default=None,
         description="Model name for OpenAI-compatible endpoint",
     )
+    AI_MAX_OUTPUT_TOKENS: int = Field(
+        default=8192,
+        ge=256,
+        description="Maximum output tokens for AI response generation",
+    )
 
     # Thresholds & Limits
     MIN_MESSAGES_PER_TOPIC: int = Field(
