@@ -9,19 +9,25 @@ from aiogram.types import Message
 from bot.config import get_settings
 from bot.database import repository
 from bot.filters import AdminFilter, ForumGroupFilter
+from bot.scheduler.jobs import (
+    get_summary_lock,
+    run_summary_for_group,
+    run_summary_for_topic,
+)
 from bot.utils.dates import (
     format_persian_date,
     format_persian_short_date,
     get_tehran_now,
 )
 from bot.utils.general_topic import resolve_thread_id, to_send_thread_id
+from bot.utils.html_utils import escape_html
 from bot.utils.link_parser import parse_topic_link
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="admin_router")
-# Apply filters: Must be supergroup and user must be admin
-router.message.filter(ForumGroupFilter(), AdminFilter())
+# Apply ForumGroupFilter at router level so only allowed supergroups evaluate handlers
+router.message.filter(ForumGroupFilter())
 
 
 async def try_delete_command(message: Message) -> None:
@@ -51,7 +57,7 @@ async def send_topic_reply(message: Message, text: str) -> Message | None:
         return None
 
 
-@router.message(Command("add_topic"))
+@router.message(Command("add_topic"), AdminFilter())
 async def cmd_add_topic(message: Message) -> None:
     """Add current topic to active monitoring."""
     if not message.chat:
@@ -68,11 +74,11 @@ async def cmd_add_topic(message: Message) -> None:
     await repository.set_topic_active_status(chat_id, thread_id, is_active=1, name=topic_name)
     await send_topic_reply(
         message,
-        f"✅ تاپیک <b>«{topic_name}»</b> به لیست تاپیک‌های تحت نظارت اضافه و فعال شد.",
+        f"✅ تاپیک <b>«{escape_html(topic_name)}»</b> به لیست تاپیک‌های تحت نظارت اضافه و فعال شد.",
     )
 
 
-@router.message(Command("remove_topic"))
+@router.message(Command("remove_topic"), AdminFilter())
 async def cmd_remove_topic(message: Message) -> None:
     """Remove current topic from active monitoring."""
     if not message.chat:
@@ -89,11 +95,11 @@ async def cmd_remove_topic(message: Message) -> None:
     await repository.set_topic_active_status(chat_id, thread_id, is_active=0, name=topic_name)
     await send_topic_reply(
         message,
-        f"⛔ تاپیک <b>«{topic_name}»</b> از نظارت خارج و غیرفعال شد.",
+        f"⛔ تاپیک <b>«{escape_html(topic_name)}»</b> از نظارت خارج و غیرفعال شد.",
     )
 
 
-@router.message(Command("topics"))
+@router.message(Command("topics"), AdminFilter())
 async def cmd_topics(message: Message) -> None:
     """List all known topics with monitoring status and today's message counts."""
     if not message.chat:
@@ -127,12 +133,12 @@ async def cmd_topics(message: Message) -> None:
         tid = t["thread_id"]
         status_icon = "✅ فعال" if t["is_monitored"] else "⛔ غیرفعال"
         count = t["today_count"]
-        lines.append(f"• <b>{name}</b> (شناسه: <code>{tid}</code>): {status_icon} — <i>{count} پیام امروز</i>")
+        lines.append(f"• <b>{escape_html(name)}</b> (شناسه: <code>{tid}</code>): {status_icon} — <i>{count} پیام امروز</i>")
 
     await send_topic_reply(message, "\n".join(lines))
 
 
-@router.message(Command("status"))
+@router.message(Command("status"), AdminFilter())
 async def cmd_status(message: Message) -> None:
     """Show detailed system status and configurations."""
     if not message.chat:
@@ -153,7 +159,7 @@ async def cmd_status(message: Message) -> None:
     if dest_mode == "aggregate":
         dest_tid = group_cfg.get("destination_thread_id")
         dest_name = (await repository.get_topic_name(chat_id, dest_tid)) if dest_tid else "نامشخص"
-        dest_str = f"تجمیعی در تاپیک «{dest_name}» (<code>{dest_tid}</code>)"
+        dest_str = f"تجمیعی در تاپیک «{escape_html(dest_name)}» (<code>{dest_tid}</code>)"
     else:
         dest_str = "ارسال در همان تاپیک (Per Topic)"
 
@@ -195,7 +201,7 @@ async def cmd_status(message: Message) -> None:
     await send_topic_reply(message, text)
 
 
-@router.message(Command("mode"))
+@router.message(Command("mode"), AdminFilter())
 async def cmd_mode(message: Message) -> None:
     """Switch monitoring mode between whitelist and blacklist."""
     if not message.chat:
@@ -222,7 +228,7 @@ async def cmd_mode(message: Message) -> None:
     )
 
 
-@router.message(Command("set_min"))
+@router.message(Command("set_min"), AdminFilter())
 async def cmd_set_min(message: Message) -> None:
     """Set minimum messages threshold (1-100) to trigger summarization."""
     if not message.chat:
@@ -260,7 +266,7 @@ async def cmd_set_min(message: Message) -> None:
     )
 
 
-@router.message(Command("set_destination"))
+@router.message(Command("set_destination"), AdminFilter())
 async def cmd_set_destination(message: Message) -> None:
     """Set current topic or specified topic link/ID as aggregate summary destination."""
     if not message.chat:
@@ -276,7 +282,7 @@ async def cmd_set_destination(message: Message) -> None:
         if error or thread_id is None:
             await send_topic_reply(
                 message,
-                f"⚠️ <b>خطا در تنظیم مقصد خلاصه:</b>\n\n{error or 'شناسه تاپیک معتبر نیست.'}",
+                f"⚠️ <b>خطا در تنظیم مقصد خلاصه:</b>\n\n{escape_html(error or 'شناسه تاپیک معتبر نیست.')}",
             )
             return
     else:
@@ -289,11 +295,11 @@ async def cmd_set_destination(message: Message) -> None:
     await repository.set_group_destination(chat_id, "aggregate", thread_id)
     await send_topic_reply(
         message,
-        f"📌 مقصد ارسال تمامی خلاصه‌های روزانه روی تاپیک <b>«{topic_name}»</b> (شناسه: <code>{thread_id}</code>) تنظیم شد.",
+        f"📌 مقصد ارسال تمامی خلاصه‌های روزانه روی تاپیک <b>«{escape_html(topic_name)}»</b> (شناسه: <code>{thread_id}</code>) تنظیم شد.",
     )
 
 
-@router.message(Command("reset_destination"))
+@router.message(Command("reset_destination"), AdminFilter())
 async def cmd_reset_destination(message: Message) -> None:
     """Reset summary destination back to per_topic."""
     if not message.chat:
@@ -307,7 +313,7 @@ async def cmd_reset_destination(message: Message) -> None:
     )
 
 
-@router.message(Command("summary_on"))
+@router.message(Command("summary_on"), AdminFilter())
 async def cmd_summary_on(message: Message) -> None:
     """Enable summary system for this group."""
     if not message.chat:
@@ -321,7 +327,7 @@ async def cmd_summary_on(message: Message) -> None:
     )
 
 
-@router.message(Command("summary_off"))
+@router.message(Command("summary_off"), AdminFilter())
 async def cmd_summary_off(message: Message) -> None:
     """Disable summary system for this group."""
     if not message.chat:
@@ -335,7 +341,7 @@ async def cmd_summary_off(message: Message) -> None:
     )
 
 
-@router.message(Command("summarize_now"))
+@router.message(Command("summarize_now"), AdminFilter())
 async def cmd_summarize_now(message: Message) -> None:
     """Manually trigger summarization for the current topic."""
     if not message.chat or not message.bot:
@@ -348,46 +354,51 @@ async def cmd_summarize_now(message: Message) -> None:
     args = (message.text or "").split()[1:]
     keep_mode = any(arg.lower() == "keep" for arg in args)
 
-    progress_msg = await send_topic_reply(
-        message,
-        "⏳ در حال پردازش و استخراج پیام‌ها برای خلاصه‌سازی این تاپیک...",
-    )
+    lock = get_summary_lock()
+    if lock.locked():
+        await send_topic_reply(message, "اجرای دیگری در حال انجام است.")
+        return
 
-    try:
-        from bot.scheduler.jobs import run_summary_for_topic
-        success, details = await run_summary_for_topic(
-            bot=message.bot,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            mark_summarized=not keep_mode,
-            is_nightly=False,
-        )
-        if success:
-            mode_note = " (پیام‌ها بدون علامت‌گذاری باقی ماندند)" if keep_mode else ""
-            await send_topic_reply(
-                message,
-                f"✅ خلاصه تاپیک با موفقیت تولید و ارسال شد.{mode_note}",
-            )
-        else:
-            await send_topic_reply(
-                message,
-                f"ℹ️ خلاصه‌سازی انجام نشد: {details}",
-            )
-    except Exception as exc:
-        logger.error("Error during manual topic summary: %s", exc, exc_info=True)
-        await send_topic_reply(
+    async with lock:
+        progress_msg = await send_topic_reply(
             message,
-            f"❌ بروز خطا در فرآیند خلاصه‌سازی تاپیک: <code>{exc}</code>",
+            "⏳ در حال پردازش و استخراج پیام‌ها برای خلاصه‌سازی این تاپیک...",
         )
-    finally:
-        if progress_msg:
-            try:
-                await progress_msg.delete()
-            except Exception:
-                pass
+
+        try:
+            success, details = await run_summary_for_topic(
+                bot=message.bot,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                mark_summarized=not keep_mode,
+                is_nightly=False,
+            )
+            if success:
+                mode_note = " (پیام‌ها بدون علامت‌گذاری باقی ماندند)" if keep_mode else ""
+                await send_topic_reply(
+                    message,
+                    f"✅ خلاصه تاپیک با موفقیت تولید و ارسال شد.{mode_note}",
+                )
+            else:
+                await send_topic_reply(
+                    message,
+                    f"ℹ️ خلاصه‌سازی انجام نشد: {escape_html(details)}",
+                )
+        except Exception as exc:
+            logger.error("Error during manual topic summary: %s", exc, exc_info=True)
+            await send_topic_reply(
+                message,
+                f"❌ بروز خطا در فرآیند خلاصه‌سازی تاپیک: <code>{escape_html(exc)}</code>",
+            )
+        finally:
+            if progress_msg:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
 
 
-@router.message(Command("summarize_all"))
+@router.message(Command("summarize_all"), AdminFilter())
 async def cmd_summarize_all(message: Message) -> None:
     """Manually trigger summarization for all monitored topics in the group."""
     if not message.chat or not message.bot:
@@ -398,42 +409,47 @@ async def cmd_summarize_all(message: Message) -> None:
     args = (message.text or "").split()[1:]
     keep_mode = any(arg.lower() == "keep" for arg in args)
 
-    progress_msg = await send_topic_reply(
-        message,
-        "⏳ در حال شروع خلاصه‌سازی دستی تمامی تاپیک‌های فعال گروه...",
-    )
+    lock = get_summary_lock()
+    if lock.locked():
+        await send_topic_reply(message, "اجرای دیگری در حال انجام است.")
+        return
 
-    try:
-        from bot.scheduler.jobs import run_summary_for_group
-        report = await run_summary_for_group(
-            bot=message.bot,
-            chat_id=chat_id,
-            mark_summarized=not keep_mode,
-            is_nightly=False,
-        )
-        mode_note = " [حالت آزمایشی keep فعال]" if keep_mode else ""
-        await send_topic_reply(
+    async with lock:
+        progress_msg = await send_topic_reply(
             message,
-            f"🏁 <b>گزارش خلاصه‌سازی گروه{mode_note}:</b>\n\n"
-            f"✅ موفق: {report.get('success', 0)} تاپیک\n"
-            f"⏭ کمتر از حد نصاب: {report.get('skipped', 0)} تاپیک\n"
-            f"❌ ناموفق: {report.get('failed', 0)} تاپیک",
+            "⏳ در حال شروع خلاصه‌سازی دستی تمامی تاپیک‌های فعال گروه...",
         )
-    except Exception as exc:
-        logger.error("Error during manual group summary: %s", exc, exc_info=True)
-        await send_topic_reply(
-            message,
-            f"❌ بروز خطا در اجرای خلاصه‌سازی کل گروه: <code>{exc}</code>",
-        )
-    finally:
-        if progress_msg:
-            try:
-                await progress_msg.delete()
-            except Exception:
-                pass
+
+        try:
+            report = await run_summary_for_group(
+                bot=message.bot,
+                chat_id=chat_id,
+                mark_summarized=not keep_mode,
+                is_nightly=False,
+            )
+            mode_note = " [حالت آزمایشی keep فعال]" if keep_mode else ""
+            await send_topic_reply(
+                message,
+                f"🏁 <b>گزارش خلاصه‌سازی گروه{mode_note}:</b>\n\n"
+                f"✅ موفق: {report.get('success', 0)} تاپیک\n"
+                f"⏭ کمتر از حد نصاب: {report.get('skipped', 0)} تاپیک\n"
+                f"❌ ناموفق: {report.get('failed', 0)} تاپیک",
+            )
+        except Exception as exc:
+            logger.error("Error during manual group summary: %s", exc, exc_info=True)
+            await send_topic_reply(
+                message,
+                f"❌ بروز خطا در اجرای خلاصه‌سازی کل گروه: <code>{escape_html(exc)}</code>",
+            )
+        finally:
+            if progress_msg:
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
 
 
-@router.message(Command("help"))
+@router.message(Command("help"), AdminFilter())
 async def cmd_help(message: Message) -> None:
     """Show Persian help with all available admin commands."""
     if not message.chat:

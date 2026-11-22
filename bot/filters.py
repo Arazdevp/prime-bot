@@ -1,9 +1,38 @@
 """Custom aiogram filters for admin checks and forum supergroups."""
 
+import time
 from aiogram import Bot
 from aiogram.filters import Filter
 from aiogram.types import Message
 from bot.config import get_settings
+
+# In-memory TTL cache: (chat_id, user_id) -> (is_admin, expiry_timestamp)
+_admin_cache: dict[tuple[int, int], tuple[bool, float]] = {}
+ADMIN_CACHE_TTL_SECONDS: float = 300.0  # 5 minutes
+
+
+def clear_admin_cache() -> None:
+    """Clear all entries from the admin lookup TTL cache (useful for test isolation)."""
+    _admin_cache.clear()
+
+
+def get_cached_admin_status(chat_id: int, user_id: int) -> bool | None:
+    """Return cached admin status if present and unexpired; otherwise None."""
+    entry = _admin_cache.get((chat_id, user_id))
+    if entry is None:
+        return None
+    is_admin, expiry = entry
+    if time.monotonic() < expiry:
+        return is_admin
+    _admin_cache.pop((chat_id, user_id), None)
+    return None
+
+
+def set_cached_admin_status(
+    chat_id: int, user_id: int, is_admin: bool, ttl: float = ADMIN_CACHE_TTL_SECONDS
+) -> None:
+    """Store admin status in the TTL cache."""
+    _admin_cache[(chat_id, user_id)] = (is_admin, time.monotonic() + ttl)
 
 
 class ForumGroupFilter(Filter):
@@ -28,6 +57,9 @@ class ForumGroupFilter(Filter):
 class AdminFilter(Filter):
     """Filter allowing bot admins, group creators, chat administrators, or anonymous admins."""
 
+    def __init__(self, ttl: float = ADMIN_CACHE_TTL_SECONDS) -> None:
+        self.ttl = ttl
+
     async def __call__(self, message: Message, bot: Bot) -> bool:
         if not message.chat:
             return False
@@ -48,13 +80,17 @@ class AdminFilter(Filter):
         if user_id in settings.ADMIN_IDS:
             return True
 
-        # 3. Check group administrator / creator status in the current chat
+        # 3. Check TTL cache for (chat_id, user_id)
+        cached = get_cached_admin_status(message.chat.id, user_id)
+        if cached is not None:
+            return cached
+
+        # 4. Check group administrator / creator status in the current chat
         try:
             member = await bot.get_chat_member(chat_id=message.chat.id, user_id=user_id)
-            if member.status in ("creator", "administrator"):
-                return True
+            is_admin = member.status in ("creator", "administrator")
+            set_cached_admin_status(message.chat.id, user_id, is_admin, ttl=self.ttl)
+            return is_admin
         except Exception:
-            # If unable to fetch chat member (e.g. network/permissions), default to False
+            # If unable to fetch chat member (e.g. network/permissions), default to False without caching
             return False
-
-        return False

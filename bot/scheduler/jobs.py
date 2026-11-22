@@ -15,6 +15,7 @@ from bot.database.db import get_db, get_write_lock
 from bot.services.llm_client import BaseLLMClient
 from bot.services.publisher import send_summary
 from bot.services.summarizer import summarize_topic_messages
+from bot.utils.html_utils import escape_html
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +42,10 @@ async def notify_admins_failure(
 
     text = (
         "⚠️ <b>گزارش خطای خلاصه‌سازی تاپیک:</b>\n\n"
-        f"🏢 <b>گروه:</b> {chat_title}\n"
-        f"📌 <b>تاپیک:</b> {topic_name}\n"
-        f"❌ <b>نوع خطا:</b> {error_type}\n"
-        f"📝 <b>پیام خطا:</b> <code>{error_message[:400]}</code>"
+        f"🏢 <b>گروه:</b> {escape_html(chat_title)}\n"
+        f"📌 <b>تاپیک:</b> {escape_html(topic_name)}\n"
+        f"❌ <b>نوع خطا:</b> {escape_html(error_type)}\n"
+        f"📝 <b>پیام خطا:</b> <code>{escape_html(error_message[:400])}</code>"
     )
 
     for admin_id in settings.ADMIN_IDS:
@@ -131,7 +132,7 @@ async def run_summary_for_topic(
             len(messages),
             min_msgs,
         )
-        if mark_summarized and messages:
+        if is_nightly and mark_summarized and messages:
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
             logger.info("Deleted %s below-threshold messages for topic '%s' to free storage.", deleted_cnt, topic_name)
@@ -173,7 +174,7 @@ async def run_summary_for_topic(
 
     if dest_mode == "aggregate" and dest_tid is not None:
         target_thread = dest_tid
-        content_to_send = f"📂 <b>تاپیک مبدا: {topic_name}</b>\n\n\n{summary_text}"
+        content_to_send = f"📂 <b>تاپیک مبدا: {escape_html(topic_name)}</b>\n\n\n{summary_text}"
     else:
         target_thread = thread_id
         content_to_send = summary_text

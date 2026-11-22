@@ -16,6 +16,7 @@ from bot.handlers import admin, listener
 from bot.scheduler.jobs import build_scheduler
 from bot.services.llm_client import close_llm_client
 from bot.utils.dates import format_persian_date, get_tehran_now
+from bot.utils.html_utils import escape_html
 from bot.utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,31 @@ async def notify_admins_startup(bot: Bot) -> None:
             continue
 
 
+async def notify_admins_crash(bot: Bot, exc: BaseException) -> None:
+    """Send Persian crash alert to configured admins before process exit."""
+    settings = get_settings()
+    if not settings.ADMIN_IDS:
+        return
+
+    text = (
+        "🚨 <b>خطای بحرانی در ربات خلاصه‌ساز تلگرام:</b>\n\n"
+        "فرآیند دریافت پیام‌ها (Polling) به دلیل خطای زیر متوقف شد:\n"
+        f"<code>{escape_html(str(exc))}</code>\n\n"
+        "<i>سرویس جهت بازیابی و راه‌اندازی مجدد متوقف می‌شود.</i>"
+    )
+
+    for admin_id in settings.ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as err:
+            logger.warning("Failed sending crash notification to admin %s: %s", admin_id, err)
+
+
 async def main() -> None:
     """Main application lifecycle entrypoint."""
     settings = get_settings()
@@ -121,23 +147,48 @@ async def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _handle_exit_signal)
 
-    try:
-        # Start polling in background task
-        polling_task = asyncio.create_task(
-            dp.start_polling(
-                bot,
-                allowed_updates=["message"],
-                handle_signals=False,
-            )
+    exit_code = 0
+    polling_task = asyncio.create_task(
+        dp.start_polling(
+            bot,
+            allowed_updates=["message"],
+            handle_signals=False,
         )
-        if sys.platform == "win32":
-            # On Windows, keep running until polling_task finishes or KeyboardInterrupt
-            await polling_task
-        else:
-            await stop_event.wait()
+    )
+    stop_task = asyncio.create_task(stop_event.wait())
+
+    try:
+        done, pending = await asyncio.wait(
+            {polling_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if polling_task in done:
+            exc = polling_task.exception()
+            if exc:
+                logger.critical("Bot polling task crashed: %s", exc, exc_info=exc)
+                await notify_admins_crash(bot, exc)
+                exit_code = 1
+            else:
+                logger.info("Bot polling task finished normally.")
+        elif stop_task in done:
+            logger.info("Termination signal received. Shutting down gracefully...")
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                pass
     except (KeyboardInterrupt, SystemExit):
         logger.info("Termination initiated by user.")
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
     finally:
+        if not stop_task.done():
+            stop_task.cancel()
+
         logger.info("Executing cleanup tasks...")
         if scheduler.running:
             scheduler.shutdown(wait=False)
@@ -158,6 +209,9 @@ async def main() -> None:
         await close_db()
         logger.info("Database connection closed.")
         logger.info("Bot shutdown completed cleanly.")
+
+        if exit_code != 0:
+            sys.exit(exit_code)
 
 
 if __name__ == "__main__":
