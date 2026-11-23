@@ -179,6 +179,7 @@ def format_morning_greeting(
     *,
     day_number: int,
     now_tehran: datetime | None = None,
+    is_test: bool = False,
 ) -> str:
     """Render the chosen morning greeting template in Telegram HTML with Jalali date line."""
     dt = now_tehran if now_tehran is not None else get_tehran_now()
@@ -187,4 +188,5 @@ def format_morning_greeting(
     body = MORNING_GREETINGS[safe_idx].format(day=day_fa)
     jalali_full = format_persian_date(dt)
     jalali_short = to_persian_digits(format_persian_short_date(dt))
-    return f"{body}\n\n📅 <i>{jalali_full} ({jalali_short})</i>"
+    prefix = "🧪 <b>تست</b>\n\n" if is_test else ""
+    return f"{prefix}{body}\n\n📅 <i>{jalali_full} ({jalali_short})</i>"

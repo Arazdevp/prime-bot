@@ -142,6 +142,7 @@ async def send_morning_greeting_to_group(
         chosen_idx,
         day_number=day_number,
         now_tehran=local_now,
+        is_test=is_test,
     )
 
     delivered = await _send_greeting_message(bot, chat_id, thread_id, text)

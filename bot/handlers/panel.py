@@ -507,7 +507,7 @@ async def render_morning_settings(chat_id: int) -> tuple[str, InlineKeyboardMark
         f"🗓 <b>امروز:</b> روز <b>{to_persian_digits(hills_day)}</b> هیلز (شروع: <code>{escape_html(cfg.HILLS_START_DATE)}</code>)\n"
         f"🎲 <b>تنوع غیرتکراری:</b> {to_persian_digits(used_in_cycle)} از {to_persian_digits(total_pool)} متن استفاده شده در این دور\n"
         f"📬 <b>آخرین ارسال خودکار:</b> <code>{escape_html(last_sent)}</code>\n\n"
-        "<i>💡 نکته: دکمه تست دقیقاً شکل واقعی پیام را داخل تاپیک مقصد می‌فرستد و مزاحم ارسال خودکار ۰۵:۰۱ نمی‌شود.</i>"
+        "<i>💡 نکته: دکمه تست پیام را با عنوان «🧪 تست» در بالای آن داخل تاپیک مقصد می‌فرستد و مزاحم ارسال خودکار ۰۵:۰۱ نمی‌شود.</i>"
     )
     return text, build_morning_kb(chat_id, enabled=is_enabled, has_topic=has_topic)
 

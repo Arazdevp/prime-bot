@@ -163,13 +163,13 @@ async def test_morning_send_idempotency_rollback_and_test_button_non_blocking(tm
             assert call_kw["chat_id"] == chat_id
             assert call_kw["message_thread_id"] == thread_id
             assert "۸۸" in call_kw["text"]
-            assert "تستی" not in call_kw["text"]  # Exact real format, no test badge
+            assert call_kw["text"].startswith("🧪 <b>تست</b>\n\n")
             test_texts.append(call_kw["text"])
 
         assert len(set(test_texts)) == 3
         assert (await repository.get_morning_config(chat_id))["last_sent_day"] is None
 
-        # 2. Scheduled 05:01 job STILL fires today and sends a 4th distinct message
+        # 2. Scheduled 05:01 job STILL fires today and sends a 4th distinct message (without test prefix)
         mock_cfg = MagicMock()
         mock_cfg.ALLOWED_CHAT_IDS = []
         mock_cfg.TIMEZONE = "Asia/Tehran"
@@ -180,7 +180,8 @@ async def test_morning_send_idempotency_rollback_and_test_button_non_blocking(tm
             report1 = await morning_greeting_job(bot, now_tehran=day_dt)
             assert report1 == {"sent": 1, "skipped": 0, "failed": 0}
             auto_text = bot.send_message.call_args.kwargs["text"]
-            assert auto_text not in test_texts
+            assert not auto_text.startswith("🧪 <b>تست</b>")
+            assert f"🧪 <b>تست</b>\n\n{auto_text}" not in test_texts
             assert (await repository.get_morning_config(chat_id))["last_sent_day"] == "2026-11-23"
 
             # 3. Duplicate run same day is skipped
