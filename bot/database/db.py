@@ -248,6 +248,7 @@ async def init_db(db_path: str = "data/bot.db") -> aiosqlite.Connection:
     await conn.execute("PRAGMA journal_mode=WAL;")
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA foreign_keys=ON;")
+    await conn.execute("PRAGMA busy_timeout=5000;")
 
     # Apply schema scripts and migrations
     async with _write_lock:

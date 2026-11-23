@@ -122,6 +122,11 @@ class Settings(BaseSettings):
         ge=0,
         description="Maximum retry attempts on retryable AI failures",
     )
+    AI_CHUNK_DELAY_SECONDS: float = Field(
+        default=4.0,
+        ge=0.0,
+        description="Delay in seconds between consecutive LLM calls to prevent RPM/TPM bursts",
+    )
 
     # Storage & Paths
     DB_PATH: str = Field(

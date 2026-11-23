@@ -265,7 +265,7 @@ async def _send_group_alarm(
 ) -> bool:
     """Send alarm message into the target forum topic with General-topic fallback and retry."""
     target_thread = to_send_thread_id(thread_id)
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -310,37 +310,45 @@ async def _send_dm_alarm(
     reply_markup: Any,
 ) -> bool:
     """Best-effort send alarm to user's private DM; gracefully handles unstarted/blocked bots."""
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    for attempt in range(2):
         try:
-            await repository.set_bot_user_dm_started(
-                user_id,
-                True,
-                username=username,
-                full_name=full_name,
+            await bot.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
-        except Exception:
-            pass
-        return True
-    except TelegramForbiddenError:
-        logger.debug("User %s has not started or blocked the bot; skipping DM timer alarm.", user_id)
-        try:
-            await repository.set_bot_user_dm_started(user_id, False)
-        except Exception:
-            pass
-        return False
-    except TelegramBadRequest as exc:
-        logger.debug("TelegramBadRequest sending DM timer alarm to user %s: %s", user_id, exc)
-        return False
-    except Exception as exc:
-        logger.warning("Unexpected error sending DM timer alarm to user %s: %s", user_id, exc)
-        return False
+            try:
+                await repository.set_bot_user_dm_started(
+                    user_id,
+                    True,
+                    username=username,
+                    full_name=full_name,
+                )
+            except Exception:
+                pass
+            return True
+        except TelegramRetryAfter as exc:
+            if attempt == 0:
+                await asyncio.sleep(min(exc.retry_after + 1, 15))
+                continue
+            logger.warning("DM timer alarm hit TelegramRetryAfter twice for user %s", user_id)
+            return False
+        except TelegramForbiddenError:
+            logger.debug("User %s has not started or blocked the bot; skipping DM timer alarm.", user_id)
+            try:
+                await repository.set_bot_user_dm_started(user_id, False)
+            except Exception:
+                pass
+            return False
+        except TelegramBadRequest as exc:
+            logger.debug("TelegramBadRequest sending DM timer alarm to user %s: %s", user_id, exc)
+            return False
+        except Exception as exc:
+            logger.warning("Unexpected error sending DM timer alarm to user %s: %s", user_id, exc)
+            return False
+    return False
 
 
 async def fire_timer(

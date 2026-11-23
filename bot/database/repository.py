@@ -216,11 +216,27 @@ async def ensure_group_settings(chat_id: int, default_min_messages: int | None =
     }
 
 
+async def _ensure_group_settings_row_locked(conn: aiosqlite.Connection, chat_id: int) -> None:
+    """Insert default group_settings row if missing (caller MUST hold get_write_lock())."""
+    from bot.config import get_settings
+
+    default_min = get_settings().MIN_MESSAGES_PER_TOPIC
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO group_settings (
+            chat_id, mode, destination_mode, destination_thread_id, enabled, min_messages
+        ) VALUES (?, 'blacklist', 'per_topic', NULL, 1, ?);
+        """,
+        (chat_id, default_min),
+    )
+
+
 async def set_group_mode(chat_id: int, mode: str) -> None:
     """Set topic filtering mode ('blacklist' or 'whitelist')."""
     conn = get_db()
     lock = get_write_lock()
     async with lock:
+        await _ensure_group_settings_row_locked(conn, chat_id)
         await conn.execute(
             "UPDATE group_settings SET mode = ? WHERE chat_id = ?;",
             (mode, chat_id),
@@ -237,6 +253,7 @@ async def set_group_destination(
     conn = get_db()
     lock = get_write_lock()
     async with lock:
+        await _ensure_group_settings_row_locked(conn, chat_id)
         await conn.execute(
             "UPDATE group_settings SET destination_mode = ?, destination_thread_id = ? WHERE chat_id = ?;",
             (destination_mode, destination_thread_id, chat_id),
@@ -249,6 +266,7 @@ async def set_group_enabled(chat_id: int, enabled: int) -> None:
     conn = get_db()
     lock = get_write_lock()
     async with lock:
+        await _ensure_group_settings_row_locked(conn, chat_id)
         await conn.execute(
             "UPDATE group_settings SET enabled = ? WHERE chat_id = ?;",
             (enabled, chat_id),
@@ -261,6 +279,7 @@ async def set_group_min_messages(chat_id: int, min_messages: int) -> None:
     conn = get_db()
     lock = get_write_lock()
     async with lock:
+        await _ensure_group_settings_row_locked(conn, chat_id)
         await conn.execute(
             "UPDATE group_settings SET min_messages = ? WHERE chat_id = ?;",
             (min_messages, chat_id),
@@ -401,11 +420,15 @@ async def list_distinct_unsummarized_topics(
 
 
 async def list_enabled_groups() -> list[dict[str, Any]]:
-    """List all groups with enabled=1 in group_settings."""
+    """List all active groups (not left in known_groups) with enabled=1 in group_settings."""
     conn = get_db()
     cursor = await conn.execute(
-        "SELECT chat_id, mode, destination_mode, destination_thread_id, enabled, min_messages "
-        "FROM group_settings WHERE enabled = 1;"
+        """
+        SELECT gs.chat_id, gs.mode, gs.destination_mode, gs.destination_thread_id, gs.enabled, gs.min_messages
+        FROM group_settings gs
+        LEFT JOIN known_groups kg ON kg.chat_id = gs.chat_id
+        WHERE gs.enabled = 1 AND kg.left_at IS NULL;
+        """
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
@@ -580,6 +603,20 @@ async def delete_summary(chat_id: int, thread_id: int, day: str) -> None:
             (chat_id, thread_id, day),
         )
         await conn.commit()
+
+
+async def delete_old_summaries(retention_days: int) -> int:
+    """Delete persisted summary records older than retention_days (UTC)."""
+    conn = get_db()
+    lock = get_write_lock()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM summaries WHERE created_at < ?;",
+            (cutoff,),
+        )
+        await conn.commit()
+        return cursor.rowcount
 
 
 # ---------------- Bot Users Table Operations ----------------

@@ -30,6 +30,17 @@ _summary_execution_lock = asyncio.Lock()
 _scheduler_ref: AsyncIOScheduler | None = None
 
 
+def _parse_iso_utc(raw: str | None) -> datetime | None:
+    """Parse an ISO8601 timestamp into timezone-aware UTC datetime, or None on error."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def get_summary_lock() -> asyncio.Lock:
     """Return shared summarization lock."""
     return _summary_execution_lock
@@ -271,12 +282,25 @@ async def run_summary_for_topic(
             sent_count = 0
 
     if parts and sent_count >= len(parts):
-        # Already completely delivered! Prevent duplicate posts
-        logger.info("Summary for topic '%s' on %s was already fully delivered.", topic_name, day)
-        if mark_summarized:
-            msg_ids = [m["id"] for m in messages]
-            await repository.delete_messages_by_ids(msg_ids)
-        return True, "خلاصه با موفقیت ارسال شد."
+        latest_msg_dt = _parse_iso_utc(messages[-1].get("created_at"))
+        summary_dt = _parse_iso_utc(existing_summary.get("created_at")) if existing_summary else None
+        if latest_msg_dt is not None and summary_dt is not None and latest_msg_dt > summary_dt:
+            # Newer messages arrived after the previous completed summary (e.g. after a keep run) -> regenerate
+            logger.info(
+                "Newer messages detected for topic '%s' on %s after previous summary; generating fresh summary.",
+                topic_name,
+                day,
+            )
+            parts = []
+            sent_count = 0
+        else:
+            # Same batch already completely delivered! Prevent duplicate posts
+            logger.info("Summary for topic '%s' on %s was already fully delivered.", topic_name, day)
+            if mark_summarized:
+                msg_ids = [m["id"] for m in messages]
+                await repository.delete_messages_by_ids(msg_ids)
+                await repository.delete_summary(chat_id, thread_id, day)
+            return True, "خلاصه با موفقیت ارسال شد."
 
     if not parts:
         # Generate summary with AI
@@ -344,10 +368,11 @@ async def run_summary_for_topic(
         delivered = False
 
     if delivered and sent_count >= len(parts):
-        # Delete source messages only after ALL parts are delivered
+        # Delete source messages and completed summary record only after ALL parts are delivered
         if mark_summarized:
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
+            await repository.delete_summary(chat_id, thread_id, day)
             logger.info("Deleted %s summarized messages in topic '%s' to free database space.", deleted_cnt, topic_name)
         return True, "خلاصه با موفقیت ارسال شد."
     else:
@@ -457,6 +482,9 @@ async def nightly_summary_job(
         settings = get_settings()
         cutoff = compute_nightly_cutoff(run_time=run_time, tz_name=settings.TIMEZONE).isoformat()
         groups = await repository.list_enabled_groups()
+        if settings.ALLOWED_CHAT_IDS:
+            allowed_set = set(settings.ALLOWED_CHAT_IDS)
+            groups = [g for g in groups if g["chat_id"] in allowed_set]
         total_groups = len(groups)
         total_success = 0
         total_skipped = 0
@@ -477,7 +505,13 @@ async def nightly_summary_job(
             total_skipped += group_report["skipped"]
             total_failed += group_report["failed"]
 
-        await repository.set_last_nightly_run(datetime.now(timezone.utc).isoformat())
+        if total_failed == 0:
+            await repository.set_last_nightly_run(datetime.now(timezone.utc).isoformat())
+        else:
+            logger.warning(
+                "Nightly summary finished with %s failed topic(s); leaving last_nightly_run unchanged so catch-up can retry.",
+                total_failed,
+            )
 
         logger.info(
             "Nightly summary completed: %s groups, %s success, %s skipped, %s failed.",
@@ -552,6 +586,11 @@ async def cleanup_job() -> None:
     if deleted_timers:
         logger.info("Deleted %s completed/cancelled timers older than %s days.", deleted_timers, settings.TIMER_RETENTION_DAYS)
 
+    # 1c. Purge stale persisted summary records older than retention days
+    deleted_summaries = await repository.delete_old_summaries(settings.RETENTION_DAYS)
+    if deleted_summaries:
+        logger.info("Deleted %s summary records older than %s days.", deleted_summaries, settings.RETENTION_DAYS)
+
     # 2. SQLite PRAGMA optimize
     conn = get_db()
     lock = get_write_lock()
@@ -569,8 +608,11 @@ async def cleanup_job() -> None:
             if size_mb > 50.0:
                 logger.info("Running weekly VACUUM on DB (current size: %.2f MB)...", size_mb)
                 async with lock:
-                    await conn.execute("VACUUM;")
-                    await conn.commit()
+                    try:
+                        await conn.commit()
+                        await conn.execute("VACUUM;")
+                    except Exception as exc:
+                        logger.warning("Weekly VACUUM skipped due to SQLite error: %s", exc)
 
 
 def build_scheduler(bot: Bot) -> AsyncIOScheduler:

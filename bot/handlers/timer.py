@@ -679,11 +679,17 @@ async def cmd_timer(message: Message, bot: Bot, state: FSMContext) -> None:
         else:
             # Per-user cooldown in group chats to prevent accidental command spam
             now_mono = time.monotonic()
+            _prune_stale_drafts()
             cd_key = (message.chat.id, user.id)
             last_ts = _group_cmd_cooldown.get(cd_key)
             if last_ts is not None and (now_mono - last_ts) < GROUP_CMD_COOLDOWN_SECONDS:
                 return
             _group_cmd_cooldown[cd_key] = now_mono
+            if len(_group_cmd_cooldown) > 5000:
+                cutoff_cd = now_mono - max(60.0, GROUP_CMD_COOLDOWN_SECONDS * 10)
+                stale_cd = [k for k, ts in _group_cmd_cooldown.items() if ts < cutoff_cd]
+                for k in stale_cd:
+                    _group_cmd_cooldown.pop(k, None)
 
         await state.clear()
 

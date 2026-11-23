@@ -6,7 +6,12 @@ import logging
 import re
 from typing import Any
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from bot.config import get_settings
 from bot.utils.general_topic import to_send_thread_id
 from bot.utils.text_split import smart_split
@@ -46,16 +51,19 @@ async def send_summary_parts(
     for i in range(start_index, len(parts)):
         part = parts[i]
         delivered = False
+        use_html = True
         retry_count = 0
         max_retries = 5
 
         while not delivered and retry_count < max_retries:
+            send_text = part if use_html else strip_html_tags(part)
+            send_parse_mode = "HTML" if use_html else None
             try:
                 await bot.send_message(
                     chat_id=chat_id,
                     message_thread_id=current_thread_id,
-                    text=part,
-                    parse_mode="HTML",
+                    text=send_text,
+                    parse_mode=send_parse_mode,
                     disable_web_page_preview=True,
                 )
                 delivered = True
@@ -71,30 +79,45 @@ async def send_summary_parts(
                 )
                 await asyncio.sleep(wait_time)
 
+            except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError) as exc:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(
+                        "Transient Telegram network/server error persisted for chunk %s/%s: %s",
+                        i + 1,
+                        len(parts),
+                        exc,
+                    )
+                    return False, sent_count
+                backoff = min(16.0, 2.0 * (2 ** (retry_count - 1)))
+                logger.warning(
+                    "Transient Telegram error on chunk %s/%s (%s). Retrying %s/%s in %.1fs...",
+                    i + 1,
+                    len(parts),
+                    exc,
+                    retry_count,
+                    max_retries,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+
             except TelegramBadRequest as exc:
                 error_msg = str(exc).lower()
 
-                # Handle entity parsing errors -> resend as plain text
-                if "can't parse entities" in error_msg or "unsupported start tag" in error_msg or "parsing" in error_msg:
+                # Handle entity parsing errors -> retry cleanly as plain text within the same loop
+                if use_html and (
+                    "can't parse entities" in error_msg
+                    or "unsupported start tag" in error_msg
+                    or "parsing" in error_msg
+                ):
                     logger.warning(
                         "HTML parse error from Telegram (%s). Falling back to plain text for chunk %s/%s.",
                         exc,
                         i + 1,
                         len(parts),
                     )
-                    plain_text = strip_html_tags(part)
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            message_thread_id=current_thread_id,
-                            text=plain_text,
-                            parse_mode=None,
-                            disable_web_page_preview=True,
-                        )
-                        delivered = True
-                    except Exception as fallback_exc:
-                        logger.error("Plain text fallback failed: %s", fallback_exc)
-                        return False, sent_count
+                    use_html = False
+                    continue
 
                 # Handle deleted or non-existent thread -> fall back to General topic
                 elif "message thread not found" in error_msg or "thread_not_found" in error_msg:

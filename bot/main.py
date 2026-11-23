@@ -26,24 +26,16 @@ logger = logging.getLogger(__name__)
 
 
 def create_bot_session(proxy_url: str | None) -> AiohttpSession:
-    """Create an AiohttpSession configured with optional SOCKS5 or HTTP proxy."""
+    """Create an AiohttpSession configured with optional SOCKS or HTTP/HTTPS proxy."""
     if not proxy_url:
         return AiohttpSession()
 
-    proxy_lower = proxy_url.lower()
-    if proxy_lower.startswith("socks5://") or proxy_lower.startswith("socks5h://"):
-        try:
-            from aiohttp_socks import ProxyConnector
-            connector = ProxyConnector.from_url(proxy_url)
-            logger.info("Configured SOCKS5 proxy connector for Telegram bot session.")
-            return AiohttpSession(connector=connector)
-        except ImportError:
-            logger.error("aiohttp-socks is required for SOCKS5 proxies. Defaulting to standard session.")
-            return AiohttpSession()
-    else:
-        # Standard HTTP/HTTPS proxy
-        logger.info("Configured HTTP proxy for Telegram bot session.")
+    try:
+        logger.info("Configured proxy for Telegram bot session.")
         return AiohttpSession(proxy=proxy_url)
+    except (ImportError, RuntimeError) as exc:
+        logger.error("Proxy configuration failed (%s). Defaulting to direct session.", exc)
+        return AiohttpSession()
 
 
 async def notify_admins_startup(bot: Bot) -> None:
@@ -56,12 +48,13 @@ async def notify_admins_startup(bot: Bot) -> None:
     persian_now = format_persian_date(tehran_now)
     time_str = tehran_now.strftime("%H:%M")
 
+    model_name = settings.GEMINI_MODEL if settings.AI_PROVIDER == "gemini" else (settings.OPENAI_MODEL or "نامشخص")
     text = (
         "🟢 <b>ربات خلاصه‌ساز روزانه تلگرام روشن شد.</b>\n\n"
         f"📅 تاریخ: {persian_now}\n"
         f"⏰ ساعت شروع به کار: {time_str} (تهران)\n"
         f"🌙 ساعت اجرای شبانه: {settings.SUMMARY_TIME_HOUR:02d}:{settings.SUMMARY_TIME_MINUTE:02d}\n"
-        f"🧠 مدل فعال: <code>{settings.AI_PROVIDER} ({settings.GEMINI_MODEL if settings.AI_PROVIDER == 'gemini' else settings.OPENAI_MODEL})</code>\n"
+        f"🧠 مدل فعال: <code>{escape_html(settings.AI_PROVIDER)} ({escape_html(model_name)})</code>\n"
         f"📊 وضعیت نظارت: آماده دریافت و پردازش پیام‌ها."
     )
 
@@ -145,8 +138,26 @@ async def main() -> None:
     scheduler.start()
     logger.info("Scheduler started successfully in timezone %s.", settings.TIMEZONE)
 
+    # Track startup background tasks so exceptions are logged and shutdown cancels them cleanly
+    background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _spawn_background_task(coro: Any, task_name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro, name=task_name)
+        background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task[Any]) -> None:
+            background_tasks.discard(t)
+            if t.cancelled():
+                return
+            err = t.exception()
+            if err is not None:
+                logger.error("Background task '%s' failed: %s", task_name, err, exc_info=err)
+
+        task.add_done_callback(_on_done)
+        return task
+
     # Restore pending/missed user timers from SQLite
-    asyncio.create_task(rehydrate_active_timers(bot))
+    _spawn_background_task(rehydrate_active_timers(bot), "rehydrate_active_timers")
 
     # Log next run time of nightly job
     nightly_job = scheduler.get_job("nightly_summary")
@@ -154,7 +165,7 @@ async def main() -> None:
         logger.info("Next nightly summarization scheduled at: %s", nightly_job.next_run_time)
 
     # Check if today's scheduled nightly run was missed and run catch-up
-    asyncio.create_task(run_catchup_if_needed(bot))
+    _spawn_background_task(run_catchup_if_needed(bot), "run_catchup_if_needed")
 
     # 5. Best-effort startup notification to admins
     await notify_admins_startup(bot)
@@ -214,6 +225,12 @@ async def main() -> None:
             stop_task.cancel()
 
         logger.info("Executing cleanup tasks...")
+        if background_tasks:
+            for bg_task in list(background_tasks):
+                bg_task.cancel()
+            await asyncio.gather(*list(background_tasks), return_exceptions=True)
+            background_tasks.clear()
+
         if scheduler.running:
             scheduler.shutdown(wait=False)
             logger.info("Scheduler stopped.")

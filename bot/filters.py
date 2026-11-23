@@ -31,8 +31,13 @@ def get_cached_admin_status(chat_id: int, user_id: int) -> bool | None:
 def set_cached_admin_status(
     chat_id: int, user_id: int, is_admin: bool, ttl: float = ADMIN_CACHE_TTL_SECONDS
 ) -> None:
-    """Store admin status in the TTL cache."""
-    _admin_cache[(chat_id, user_id)] = (is_admin, time.monotonic() + ttl)
+    """Store admin status in the TTL cache, pruning expired entries when large."""
+    now = time.monotonic()
+    _admin_cache[(chat_id, user_id)] = (is_admin, now + ttl)
+    if len(_admin_cache) > 5000:
+        expired = [k for k, (_, exp) in _admin_cache.items() if now >= exp]
+        for k in expired:
+            _admin_cache.pop(k, None)
 
 
 class ForumGroupFilter(Filter):

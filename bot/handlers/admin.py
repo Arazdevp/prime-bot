@@ -22,6 +22,7 @@ from bot.utils.dates import (
 from bot.utils.general_topic import resolve_thread_id, to_send_thread_id
 from bot.utils.html_utils import escape_html
 from bot.utils.link_parser import parse_topic_link
+from bot.utils.text_split import smart_split
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,8 @@ async def cmd_topics(message: Message) -> None:
         count = t["today_count"]
         lines.append(f"• <b>{escape_html(name)}</b> (شناسه: <code>{tid}</code>): {status_icon} — <i>{count} پیام امروز</i>")
 
-    await send_topic_reply(message, "\n".join(lines))
+    for part in smart_split("\n".join(lines), limit=4000):
+        await send_topic_reply(message, part)
 
 
 @router.message(Command("status"), AdminFilter())
@@ -158,7 +160,12 @@ async def cmd_status(message: Message) -> None:
     dest_mode = group_cfg.get("destination_mode", "per_topic")
     if dest_mode == "aggregate":
         dest_tid = group_cfg.get("destination_thread_id")
-        dest_name = (await repository.get_topic_name(chat_id, dest_tid)) if dest_tid else "نامشخص"
+        if dest_tid is not None:
+            dest_name = (await repository.get_topic_name(chat_id, dest_tid)) or (
+                "عمومی" if dest_tid == 1 else f"تاپیک {dest_tid}"
+            )
+        else:
+            dest_name = "نامشخص"
         dest_str = f"تجمیعی در تاپیک «{escape_html(dest_name)}» (<code>{dest_tid}</code>)"
     else:
         dest_str = "ارسال در همان تاپیک (Per Topic)"
@@ -183,9 +190,9 @@ async def cmd_status(message: Message) -> None:
     )
 
     ai_info = (
-        f"Google Gemini ({cfg.GEMINI_MODEL})"
+        f"Google Gemini ({escape_html(cfg.GEMINI_MODEL)})"
         if cfg.AI_PROVIDER == "gemini"
-        else f"OpenAI ({cfg.OPENAI_MODEL})"
+        else f"OpenAI ({escape_html(cfg.OPENAI_MODEL or 'نامشخص')})"
     )
 
     text = (

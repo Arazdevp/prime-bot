@@ -207,6 +207,11 @@ async def handle_stranger_contact(
         ignored_until=new_ignored_until,
     )
     _stranger_last_reply[user.id] = now_mono
+    if len(_stranger_last_reply) > 5000:
+        cutoff_mono = now_mono - max(60.0, STRANGER_OTHER_COOLDOWN_SECONDS * 2)
+        stale_uids = [uid for uid, ts in _stranger_last_reply.items() if ts < cutoff_mono]
+        for uid in stale_uids:
+            _stranger_last_reply.pop(uid, None)
 
     await _safe_answer(message, text)
     return text

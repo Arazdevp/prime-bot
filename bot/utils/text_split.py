@@ -3,6 +3,26 @@
 import re
 
 TAG_RE = re.compile(r"<(/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^<>]*)?)>")
+_INCOMPLETE_ENTITY_RE = re.compile(r"&(?:#x?[0-9a-fA-F]*|[a-zA-Z]*)$")
+
+
+def _has_visible_content(chunk: str) -> bool:
+    """Return True if chunk contains non-whitespace visible text outside HTML tags."""
+    return bool(TAG_RE.sub("", chunk).strip())
+
+
+def _adjust_cut_for_html_entity(text_val: str, cut_idx: int) -> int:
+    """Avoid splitting inside an HTML entity like '&amp;' or '&#x27;'."""
+    if cut_idx <= 0 or cut_idx >= len(text_val):
+        return cut_idx
+    window_start = max(0, cut_idx - 12)
+    window = text_val[window_start:cut_idx]
+    match = _INCOMPLETE_ENTITY_RE.search(window)
+    if match:
+        candidate = window_start + match.start()
+        if candidate > 0:
+            return candidate
+    return cut_idx
 
 
 def smart_split(text: str, limit: int = 4000) -> list[str]:
@@ -71,15 +91,21 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
                 open_stack = temp_stack
                 idx += 1
             else:
-                # Flush current part
-                closing = get_closing_tags(open_stack)
-                flush_str = "".join(current_part) + closing
-                if flush_str.strip():
-                    parts.append(flush_str)
                 reopening = get_opening_tags(open_stack)
-                current_part = [reopening] if reopening else []
-                current_len = len(reopening)
-                # Next loop iteration will retry placing this tag on the fresh part
+                if current_len > len(reopening):
+                    # Flush current part and retry placing this tag on a fresh chunk
+                    closing = get_closing_tags(open_stack)
+                    flush_str = "".join(current_part) + closing
+                    if _has_visible_content(flush_str):
+                        parts.append(flush_str)
+                    current_part = [reopening] if reopening else []
+                    current_len = len(reopening)
+                    continue
+
+                # Progress guard: tag + open_stack cannot fit even on an empty chunk -> skip tag safely
+                if is_closing:
+                    open_stack = temp_stack
+                idx += 1
                 continue
 
         elif token[0] == "text":
@@ -93,12 +119,22 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
             else:
                 max_content_len = limit - current_len - len(closing)
                 if max_content_len <= 0:
-                    flush_str = "".join(current_part) + closing
-                    if flush_str.strip():
-                        parts.append(flush_str)
                     reopening = get_opening_tags(open_stack)
-                    current_part = [reopening] if reopening else []
-                    current_len = len(reopening)
+                    if current_len > len(reopening):
+                        flush_str = "".join(current_part) + closing
+                        if _has_visible_content(flush_str):
+                            parts.append(flush_str)
+                        current_part = [reopening] if reopening else []
+                        current_len = len(reopening)
+                        continue
+
+                    # Progress guard: open_stack wrapper alone fills/exceeds limit -> drop wrapper on new chunk
+                    flush_str = "".join(current_part) + closing
+                    if _has_visible_content(flush_str):
+                        parts.append(flush_str)
+                    open_stack = []
+                    current_part = []
+                    current_len = 0
                     continue
 
                 candidate_slice = text_val[:max_content_len]
@@ -125,28 +161,32 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
                         if s_idx != -1:
                             cut_idx = s_idx + 1
                         else:
-                            # 4. Hard character boundary
-                            cut_idx = max_content_len
+                            # 4. Hard character boundary (without splitting an HTML entity)
+                            cut_idx = _adjust_cut_for_html_entity(text_val, max_content_len)
 
+                cut_idx = max(1, min(cut_idx, max_content_len))
                 head = text_val[:cut_idx]
                 tail = text_val[cut_idx:]
 
                 if head:
                     current_part.append(head)
                 flush_str = "".join(current_part) + closing
-                if flush_str.strip():
+                if _has_visible_content(flush_str):
                     parts.append(flush_str)
 
                 reopening = get_opening_tags(open_stack)
                 current_part = [reopening] if reopening else []
                 current_len = len(reopening)
 
-                tokens[idx] = ("text", tail)
+                if tail:
+                    tokens[idx] = ("text", tail)
+                else:
+                    idx += 1
 
     if current_part:
         closing = get_closing_tags(open_stack)
         final_str = "".join(current_part) + closing
-        if final_str.strip():
+        if _has_visible_content(final_str):
             parts.append(final_str)
 
     return parts

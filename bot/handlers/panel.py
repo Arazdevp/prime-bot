@@ -838,10 +838,9 @@ async def handle_panel_callback(
                 )
                 return
 
-            await safe_answer_callback(callback, "🚀 اجرا شروع شد...")
-            title = await _get_group_title(chat_id)
-
             async with lock:
+                await safe_answer_callback(callback, "🚀 اجرا شروع شد...")
+                title = await _get_group_title(chat_id)
                 if target_key == "a":
                     await safe_edit_message(
                         callback,

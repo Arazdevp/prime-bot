@@ -115,6 +115,10 @@ def pick(
     variant_key = f"{pool_key}:{chosen_idx}"
     if user_id is not None:
         _last_picked_memory[(user_id, pool_key)] = variant_key
+        if len(_last_picked_memory) > 5000:
+            # Drop oldest inserted keys to keep memory bounded in long-running processes
+            for old_key in list(_last_picked_memory.keys())[: len(_last_picked_memory) - 4000]:
+                _last_picked_memory.pop(old_key, None)
 
     raw_name = (name or "").strip() or "دوست عزیز"
     raw_owners = (owners or "").strip() if owners is not None else _resolve_default_owners()

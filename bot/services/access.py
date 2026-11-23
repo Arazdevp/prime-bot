@@ -154,6 +154,10 @@ async def is_active_group_member(
             member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
             is_member = member.status in ("creator", "administrator", "member", "restricted")
             _member_cache[(chat_id, user_id)] = (is_member, now + ttl)
+            if len(_member_cache) > 5000:
+                expired = [k for k, (_, exp) in _member_cache.items() if now >= exp]
+                for k in expired:
+                    _member_cache.pop(k, None)
             if is_member:
                 return True
         except Exception as exc:

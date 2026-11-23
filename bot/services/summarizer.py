@@ -1,17 +1,55 @@
 """Summarization service handling message formatting, map-reduce chunking, and HTML sanitization."""
 
+import asyncio
 from datetime import datetime
 import html
 import logging
 import re
+import time
 from zoneinfo import ZoneInfo
 from bot.config import get_settings
-from bot.services.llm_client import BaseLLMClient, LLMTruncationError, get_llm_client
+from bot.services.llm_client import BaseLLMClient, LLMError, LLMTruncationError, get_llm_client
 from bot.utils.dates import format_date_heading, get_tehran_now
 from bot.utils.link_parser import get_clean_chat_id
 from bot.utils.retry import async_retry
 
 logger = logging.getLogger(__name__)
+
+# Shared LLM pacing and rate-limit cooldown state across topics and chunks
+_llm_pace_lock = asyncio.Lock()
+_next_allowed_call_ts: float = 0.0
+_rate_limit_until_ts: float = 0.0
+_MAX_REDUCE_ROUNDS = 5
+
+
+def reset_llm_pacer() -> None:
+    """Reset in-memory LLM pacing and cooldown timestamps (useful for test isolation)."""
+    global _next_allowed_call_ts, _rate_limit_until_ts
+    _next_allowed_call_ts = 0.0
+    _rate_limit_until_ts = 0.0
+
+
+def _record_rate_limit_cooldown(delay_seconds: float) -> None:
+    """Record a shared cooldown deadline when the LLM API returns HTTP 429."""
+    global _rate_limit_until_ts
+    if delay_seconds > 0:
+        deadline = time.monotonic() + float(delay_seconds)
+        if deadline > _rate_limit_until_ts:
+            _rate_limit_until_ts = deadline
+
+
+async def _wait_for_llm_slot(chunk_delay: float) -> None:
+    """Wait for any active rate-limit cooldown or inter-chunk pacing slot before calling LLM."""
+    global _next_allowed_call_ts
+    async with _llm_pace_lock:
+        now = time.monotonic()
+        wait_until = max(_rate_limit_until_ts, _next_allowed_call_ts if chunk_delay > 0 else 0.0)
+        if wait_until > now:
+            sleep_for = wait_until - now
+            logger.debug("Pacing LLM call: sleeping %.2fs before next request.", sleep_for)
+            await asyncio.sleep(sleep_for)
+        if chunk_delay > 0:
+            _next_allowed_call_ts = time.monotonic() + chunk_delay
 
 SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، ساختاریافته، بسیار خوانا، سلیس و بدون حاشیه به زبان فارسی است.
 
@@ -58,7 +96,8 @@ SYSTEM_PROMPT_CHUNK = """شما یک دستیار هوشمند خلاصه‌سا
 ۲. احوالپرسی و پیام‌های فاقد بار اطلاعاتی را کاملاً حذف کنید.
 ۳. برای هر نکته یا تصمیم مهم، شناسه پیام آن را حفظ کنید (یا با تگ <a href="https://t.me/c/{clean_chat_id}/ID"> پیوند دهید).
 ۴. از تگ‌های HTML مجاز تلگرام استفاده کنید.
-۵. بین هر مبحث فاصله مناسب قرار دهید."""
+۵. بین هر مبحث فاصله مناسب قرار دهید.
+۶. خروجی این بخش را فشرده و حداکثر حدود ۱۵۰۰ تا ۲۵۰۰ کاراکتر نگه دارید تا در مرحله ترکیب نهایی قابل ادغام باشد."""
 
 SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد هستید. به شما خلاصه‌های بخش‌های مختلف از گفتگوهای یک تاپیک تلگرام داده می‌شود. وظیفه شما ترکیب، یکپارچه‌سازی و حذف موارد تکراری برای تولید خلاصه نهایی و جامع روزانه به زبان فارسی است.
 
@@ -145,7 +184,7 @@ def format_messages(messages: list[dict]) -> str:
         media_type = msg.get("media_type")
         media_prefix = MEDIA_TYPE_MARKERS.get(media_type, "")
 
-        text = (msg.get("text") or "").strip()
+        text = re.sub(r"\n{3,}", "\n\n", (msg.get("text") or "").strip())
         formatted_lines.append(f"{id_str}[{time_str}] {sender_name}{reply_str}: {media_prefix}{text}")
 
     return "\n".join(formatted_lines)
@@ -178,6 +217,33 @@ def chunk_transcript(transcript: str, max_chars: int = 24000) -> list[str]:
     return chunks
 
 
+def _apply_inline_markdown_outside_tags(text: str) -> str:
+    """Convert **bold** and __underline__ only in plain text outside HTML tags and code blocks."""
+    segments = re.split(r"(<[^>]+>)", text)
+    in_code_depth = 0
+    result: list[str] = []
+
+    for seg in segments:
+        if not seg:
+            continue
+        if seg.startswith("<") and seg.endswith(">"):
+            tag_match = re.match(r"^<\s*(/)?\s*(code|pre)(?:\s|>)", seg, flags=re.IGNORECASE)
+            if tag_match:
+                if tag_match.group(1):
+                    in_code_depth = max(0, in_code_depth - 1)
+                else:
+                    in_code_depth += 1
+            result.append(seg)
+        elif in_code_depth > 0:
+            result.append(seg)
+        else:
+            converted = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", seg)
+            converted = re.sub(r"(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)", r"<u>\1</u>", converted)
+            result.append(converted)
+
+    return "".join(result)
+
+
 def sanitize_telegram_html(
     text: str,
     clean_chat_id: str | None = None,
@@ -197,15 +263,22 @@ def sanitize_telegram_html(
     cleaned = re.sub(r"<h3>(.*?)</h3>", r"\n\n▫️ <b>\1</b>\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"<h[4-6]>(.*?)</h[4-6]>", r"\n\n▪️ <b>\1</b>\n", cleaned, flags=re.IGNORECASE | re.DOTALL)
 
+    # 2b. Convert common non-Telegram structural HTML tags into clean newlines/bullets
+    cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</(?:p|div)>", "\n\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<(?:p|div)(?:\s+[^>]*)?>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?(?:ul|ol)(?:\s+[^>]*)?>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<li(?:\s+[^>]*)?>\s*", "• ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</li>", "\n", cleaned, flags=re.IGNORECASE)
+
     # 3. Convert Markdown headings #..### to styled bold headings with double newlines
     cleaned = re.sub(r"(?m)^#\s+(.+)$", r"\n\n📌 <b>\1</b>\n", cleaned)
     cleaned = re.sub(r"(?m)^##\s+(.+)$", r"\n\n🔹 <b>\1</b>\n", cleaned)
     cleaned = re.sub(r"(?m)^###\s+(.+)$", r"\n\n▫️ <b>\1</b>\n", cleaned)
     cleaned = re.sub(r"(?m)^#{4,6}\s+(.+)$", r"\n\n▪️ <b>\1</b>\n", cleaned)
 
-    # 4. Convert other common markdown patterns
-    cleaned = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", cleaned)
-    cleaned = re.sub(r"__(.+?)__", r"<u>\1</u>", cleaned)
+    # 4. Convert other common markdown patterns ONLY outside HTML tags and code blocks
+    cleaned = _apply_inline_markdown_outside_tags(cleaned)
 
     # 5. Normalize multiple empty lines to at most two empty lines (3 newlines)
     cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
@@ -249,9 +322,13 @@ def sanitize_telegram_html(
                             break
             else:
                 if tag_name == "a":
+                    # Avoid nested <a> tags (rejected by Telegram HTML parser)
+                    if "a" in open_stack:
+                        last_idx = m.end()
+                        continue
                     # Extract href attribute safely
                     href_match = re.search(r'href=[\"\']([^\"\']+)[\"\']', attributes)
-                    raw_href = href_match.group(1).strip() if href_match else "#"
+                    raw_href = href_match.group(1).strip() if href_match else ""
                     # Auto-expand relative message IDs (#123, 123, /123, msg:123)
                     num_match = re.match(r"^(?:#|/|msg:)?(\d+)$", raw_href)
                     if num_match and clean_chat_id:
@@ -271,11 +348,20 @@ def sanitize_telegram_html(
                         else:
                             # In href: unescape first to prevent double-escaping (&amp; -> &), then escape once
                             href = html.unescape(raw_href)
+                            if href.lower().startswith("www."):
+                                href = f"https://{href}"
 
-                    tokens.append(f'<a href="{html.escape(href, quote=True)}">')
+                    # Only emit <a> for valid Telegram-supported URL schemes without whitespace
+                    if (
+                        href
+                        and not any(ch.isspace() for ch in href)
+                        and re.match(r"^(?:https?://|tg://|mailto:)", href, flags=re.IGNORECASE)
+                    ):
+                        tokens.append(f'<a href="{html.escape(href, quote=True)}">')
+                        open_stack.append("a")
                 else:
                     tokens.append(f"<{tag_name}>")
-                open_stack.append(tag_name)
+                    open_stack.append(tag_name)
 
         last_idx = m.end()
 
@@ -291,13 +377,51 @@ def sanitize_telegram_html(
     return "".join(tokens).strip()
 
 
+def _batch_summaries_for_reduce(
+    summaries: list[str],
+    max_chars: int,
+    sep: str = "\n\n---\n\n",
+) -> list[list[str]]:
+    """Group partial summaries into batches whose joined length fits within max_chars."""
+    safe_limit = max(1000, max_chars)
+
+    def _pack(items: list[str]) -> list[list[str]]:
+        batches: list[list[str]] = []
+        current: list[str] = []
+        current_len = 0
+        for item in items:
+            trimmed = item if len(item) <= safe_limit else item[: safe_limit - 1] + "…"
+            add_len = len(trimmed) if not current else len(sep) + len(trimmed)
+            if current and current_len + add_len > safe_limit:
+                batches.append(current)
+                current = [trimmed]
+                current_len = len(trimmed)
+            else:
+                current.append(trimmed)
+                current_len += add_len
+        if current:
+            batches.append(current)
+        return batches
+
+    batches = _pack(summaries)
+    # Ensure hierarchical reduce always shrinks item count even if individual items exceed half max_chars
+    if len(summaries) > 1 and len(batches) >= len(summaries):
+        half_cap = max(500, (safe_limit - len(sep)) // 2)
+        capped = [s if len(s) <= half_cap else s[: half_cap - 1] + "…" for s in summaries]
+        batches = _pack(capped)
+    return batches
+
+
 async def _generate_with_retry(
     llm_client: BaseLLMClient,
     system_prompt: str,
     user_content: str,
     max_retries: int = 3,
+    chunk_delay: float = 0.0,
 ) -> str:
-    """Execute LLM call with retry on network/server errors, and retry-once on token truncation."""
+    """Execute LLM call with pacing, retry on network/rate-limit errors, and retry-once on token truncation."""
+    global _next_allowed_call_ts
+
     async def _call_once(allow_truncated: bool) -> str:
         return await llm_client.generate(
             system_prompt=system_prompt,
@@ -305,26 +429,42 @@ async def _generate_with_retry(
             allow_truncated=allow_truncated,
         )
 
+    await _wait_for_llm_slot(chunk_delay)
     try:
-        return await async_retry(
-            lambda: _call_once(allow_truncated=False),
-            retries=max_retries,
-        )
-    except LLMTruncationError as exc:
-        logger.warning(
-            "LLM response was truncated (token limit reached). Retrying generation once with allow_truncated=True..."
-        )
         try:
             return await async_retry(
-                lambda: _call_once(allow_truncated=True),
+                lambda: _call_once(allow_truncated=False),
                 retries=max_retries,
+                on_rate_limit=_record_rate_limit_cooldown,
             )
-        except LLMTruncationError as exc_persisted:
+        except LLMTruncationError as exc:
             logger.warning(
-                "LLM response truncation persisted on retry (%d chars). Returning truncated output for sanitization.",
-                len(exc_persisted.truncated_text),
+                "LLM response was truncated (token limit reached). Retrying generation once with allow_truncated=True..."
             )
-            return exc_persisted.truncated_text
+            try:
+                return await async_retry(
+                    lambda: _call_once(allow_truncated=True),
+                    retries=max_retries,
+                    on_rate_limit=_record_rate_limit_cooldown,
+                )
+            except LLMTruncationError as exc_persisted:
+                logger.warning(
+                    "LLM response truncation persisted on retry (%d chars). Returning truncated output for sanitization.",
+                    len(exc_persisted.truncated_text),
+                )
+                return exc_persisted.truncated_text
+            except LLMError as retry_exc:
+                if exc.truncated_text:
+                    logger.warning(
+                        "Retry after truncation failed (%s); falling back to initial truncated output (%d chars).",
+                        retry_exc.message,
+                        len(exc.truncated_text),
+                    )
+                    return exc.truncated_text
+                raise
+    finally:
+        if chunk_delay > 0:
+            _next_allowed_call_ts = max(_next_allowed_call_ts, time.monotonic() + chunk_delay)
 
 
 async def summarize_topic_messages(
@@ -384,6 +524,9 @@ async def summarize_topic_messages(
     else:
         link_prefix = clean_chat_id or "chat"
 
+    raw_chunk_delay = getattr(settings, "AI_CHUNK_DELAY_SECONDS", 4.0)
+    chunk_delay = float(raw_chunk_delay) if isinstance(raw_chunk_delay, (int, float)) else 4.0
+
     # Check if single call or map-reduce
     if len(transcript) <= settings.CHUNK_MAX_CHARS:
         system_prompt = (
@@ -402,11 +545,12 @@ async def summarize_topic_messages(
             system_prompt=system_prompt,
             user_content=user_content,
             max_retries=settings.AI_MAX_RETRIES,
+            chunk_delay=chunk_delay,
         )
         return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
 
     else:
-        # Map-Reduce pipeline
+        # Map-Reduce pipeline with pacing, safety-block resilience, and hierarchical reduce
         chunks = chunk_transcript(transcript, max_chars=settings.CHUNK_MAX_CHARS)
         logger.info(
             "Topic '%s' transcript length %s exceeds limit %s. Running Map-Reduce over %s chunks.",
@@ -418,6 +562,7 @@ async def summarize_topic_messages(
 
         chunk_prompt = SYSTEM_PROMPT_CHUNK.replace("{clean_chat_id}", link_prefix)
         partial_summaries: list[str] = []
+        skipped_chunks = 0
         for i, chunk in enumerate(chunks, start=1):
             chunk_user_content = (
                 f"بخش {i} از {len(chunks)} پیام‌های تاپیک «{topic_name}»:\n\n"
@@ -425,15 +570,87 @@ async def summarize_topic_messages(
                 "نکات کلیدی، تصمیمات و مباحث معنادار این بخش را به همراه شناسه‌های پیام استخراج کنید."
             )
 
-            partial_summary = await _generate_with_retry(
-                llm_client=llm_client,
-                system_prompt=chunk_prompt,
-                user_content=chunk_user_content,
-                max_retries=settings.AI_MAX_RETRIES,
-            )
-            partial_summaries.append(partial_summary.strip())
+            try:
+                partial_summary = await _generate_with_retry(
+                    llm_client=llm_client,
+                    system_prompt=chunk_prompt,
+                    user_content=chunk_user_content,
+                    max_retries=settings.AI_MAX_RETRIES,
+                    chunk_delay=chunk_delay,
+                )
+                partial_summaries.append(partial_summary.strip())
+            except LLMError as exc:
+                # Skip individual safety/content-blocked chunks so one edgy message doesn't break the whole topic
+                if len(chunks) > 1 and exc.status_code == 200 and not exc.is_retryable:
+                    skipped_chunks += 1
+                    logger.warning(
+                        "Skipping chunk %s/%s for topic '%s' due to non-retryable content/safety response: %s",
+                        i,
+                        len(chunks),
+                        topic_name,
+                        exc.message,
+                    )
+                    continue
+                raise
 
-        # Merge step
+        if not partial_summaries:
+            raise LLMError(
+                f"All {len(chunks)} chunks failed content/safety checks for topic '{topic_name}'",
+                status_code=200,
+                is_retryable=False,
+            )
+
+        if skipped_chunks:
+            logger.warning(
+                "Completed map phase for topic '%s' with %s/%s chunks skipped due to content filters.",
+                topic_name,
+                skipped_chunks,
+                len(chunks),
+            )
+
+        # Hierarchical reduce if combined partial summaries exceed CHUNK_MAX_CHARS
+        sep = "\n\n---\n\n"
+        reduce_round = 0
+        while len(sep.join(partial_summaries)) > settings.CHUNK_MAX_CHARS and reduce_round < _MAX_REDUCE_ROUNDS:
+            reduce_round += 1
+            batches = _batch_summaries_for_reduce(partial_summaries, max_chars=settings.CHUNK_MAX_CHARS, sep=sep)
+            logger.info(
+                "Topic '%s' partial summaries (%s chars) exceed limit %s. Running hierarchical reduce round %s (%s batches).",
+                topic_name,
+                len(sep.join(partial_summaries)),
+                settings.CHUNK_MAX_CHARS,
+                reduce_round,
+                len(batches),
+            )
+            next_level: list[str] = []
+            for b_idx, batch in enumerate(batches, start=1):
+                batch_user_content = (
+                    f"خلاصه‌های میانی دسته {b_idx} از {len(batches)} برای تاپیک «{topic_name}»:\n\n"
+                    + sep.join(batch)
+                    + "\n\nلطفاً این خلاصه‌ها را به‌صورت فشرده ادغام کنید، موارد تکراری را حذف نمایید و شناسه‌های پیام‌های کلیدی را حفظ کنید."
+                )
+                reduced = await _generate_with_retry(
+                    llm_client=llm_client,
+                    system_prompt=chunk_prompt,
+                    user_content=batch_user_content,
+                    max_retries=settings.AI_MAX_RETRIES,
+                    chunk_delay=chunk_delay,
+                )
+                next_level.append(reduced.strip())
+            partial_summaries = next_level
+
+        combined_partials = sep.join(partial_summaries)
+        if len(combined_partials) > settings.CHUNK_MAX_CHARS:
+            logger.warning(
+                "Topic '%s' merged partials (%s chars) still exceed CHUNK_MAX_CHARS (%s) after %s reduce rounds; trimming.",
+                topic_name,
+                len(combined_partials),
+                settings.CHUNK_MAX_CHARS,
+                reduce_round,
+            )
+            combined_partials = combined_partials[: settings.CHUNK_MAX_CHARS - 1] + "…"
+
+        # Final merge step
         merge_system_prompt = (
             SYSTEM_PROMPT_MERGE.replace("{topic_name}", topic_name)
             .replace("{date_heading}", date_heading)
@@ -441,7 +658,7 @@ async def summarize_topic_messages(
         )
         merge_user_content = (
             f"خلاصه‌های استخراج‌شده از {len(partial_summaries)} بخش مختلف تاپیک «{topic_name}»:\n\n"
-            + "\n\n---\n\n".join(partial_summaries)
+            + combined_partials
             + "\n\nلطفاً این بخش‌ها را ترکیب کرده و خلاصه نهایی جامع را با دو خط فاصله و لینک‌های آبی به پیام‌ها ارائه دهید."
         )
 
@@ -450,5 +667,6 @@ async def summarize_topic_messages(
             system_prompt=merge_system_prompt,
             user_content=merge_user_content,
             max_retries=settings.AI_MAX_RETRIES,
+            chunk_delay=chunk_delay,
         )
         return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id, thread_id=target_thread)

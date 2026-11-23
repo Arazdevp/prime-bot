@@ -1,13 +1,93 @@
 """LLM client abstraction for Google Gemini REST API and OpenAI-compatible endpoints."""
 
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
+import re
+import time
 from typing import Any
 import httpx
 from bot.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_HTTP_TIMEOUT = httpx.Timeout(180.0, connect=30.0)
+_MAX_RETRY_AFTER_SECONDS = 120.0
+_RETRY_DELAY_JSON_RE = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', re.IGNORECASE)
+_RETRY_IN_TEXT_RE = re.compile(r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+
+
+def _clamp_retry_after(seconds: float) -> float | None:
+    """Clamp a positive retry delay into a safe [1.0, 120.0] second window."""
+    if seconds <= 0:
+        return None
+    return min(_MAX_RETRY_AFTER_SECONDS, max(1.0, float(seconds)))
+
+
+def _parse_retry_after(response: Any) -> float | None:
+    """Extract rate-limit retry delay in seconds from HTTP headers or API error body."""
+    headers = getattr(response, "headers", None)
+    if headers is not None and hasattr(headers, "get"):
+        raw_retry = headers.get("retry-after")
+        if isinstance(raw_retry, str) and raw_retry.strip():
+            val = raw_retry.strip()
+            try:
+                return _clamp_retry_after(float(val))
+            except ValueError:
+                try:
+                    dt = parsedate_to_datetime(val)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+                    clamped = _clamp_retry_after(delta)
+                    if clamped is not None:
+                        return clamped
+                except Exception:
+                    pass
+
+        # OpenRouter / OpenAI-compatible reset timestamp header (epoch ms or seconds)
+        raw_reset = headers.get("x-ratelimit-reset")
+        if isinstance(raw_reset, str) and raw_reset.strip():
+            try:
+                reset_val = float(raw_reset.strip())
+                if reset_val > 1e12:
+                    reset_val /= 1000.0
+                delta = reset_val - time.time()
+                if 0 < delta <= 300.0:
+                    return _clamp_retry_after(delta)
+            except ValueError:
+                pass
+
+    raw_text = getattr(response, "text", None)
+    if isinstance(raw_text, str) and raw_text:
+        for pattern in (_RETRY_DELAY_JSON_RE, _RETRY_IN_TEXT_RE):
+            match = pattern.search(raw_text)
+            if match:
+                try:
+                    return _clamp_retry_after(float(match.group(1)))
+                except ValueError:
+                    pass
+
+    return None
+
+
+def _extract_openai_message_text(raw_content: Any) -> str:
+    """Extract text content from OpenAI-compatible message.content (str or list of blocks)."""
+    if isinstance(raw_content, str):
+        return raw_content.strip()
+    if isinstance(raw_content, list):
+        pieces: list[str] = []
+        for item in raw_content:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type in (None, "text", "output_text") and isinstance(item.get("text"), str):
+                    pieces.append(item["text"])
+        return "".join(pieces).strip()
+    return ""
 
 
 class LLMError(Exception):
@@ -19,19 +99,21 @@ class LLMError(Exception):
         status_code: int | None = None,
         body_excerpt: str | None = None,
         is_retryable: bool | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.body_excerpt = body_excerpt
+        self.retry_after = retry_after
 
         if is_retryable is not None:
             self._is_retryable = is_retryable
         else:
-            # Default retry logic: network errors (None), 429, and 5xx are retryable
+            # Default retry logic: network errors (None), 408, 429, and 5xx are retryable
             if status_code is None:
                 self._is_retryable = True
-            elif status_code == 429 or status_code >= 500:
+            elif status_code in (408, 429) or status_code >= 500:
                 self._is_retryable = True
             else:
                 self._is_retryable = False
@@ -87,7 +169,7 @@ class GeminiClient(BaseLLMClient):
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=120.0)
+            self._client = httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
             self._owns_client = True
         return self._client
 
@@ -130,11 +212,13 @@ class GeminiClient(BaseLLMClient):
 
         if response.status_code != 200:
             excerpt = response.text[:200]
+            retry_after = _parse_retry_after(response) if response.status_code in (429, 503) else None
             logger.error("Gemini API non-200 response [%s]: %s", response.status_code, excerpt)
             raise LLMError(
                 f"Gemini API returned status {response.status_code}: {excerpt}",
                 status_code=response.status_code,
                 body_excerpt=excerpt,
+                retry_after=retry_after,
             )
 
         try:
@@ -155,7 +239,15 @@ class GeminiClient(BaseLLMClient):
         finish_reason = candidate.get("finishReason", "UNKNOWN")
         content = candidate.get("content", {})
         parts = content.get("parts", [])
-        text_pieces = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
+        non_thought_pieces = [
+            p.get("text", "")
+            for p in parts
+            if isinstance(p, dict) and "text" in p and not p.get("thought")
+        ]
+        if non_thought_pieces:
+            text_pieces = non_thought_pieces
+        else:
+            text_pieces = [p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p]
         full_text = "".join(text_pieces).strip()
 
         if finish_reason == "MAX_TOKENS":
@@ -222,7 +314,7 @@ class OpenAIClient(BaseLLMClient):
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=120.0)
+            self._client = httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
             self._owns_client = True
         return self._client
 
@@ -258,34 +350,71 @@ class OpenAIClient(BaseLLMClient):
 
         if response.status_code != 200:
             excerpt = response.text[:200]
+            retry_after = _parse_retry_after(response) if response.status_code in (429, 503) else None
             logger.error("OpenAI API non-200 response [%s]: %s", response.status_code, excerpt)
             raise LLMError(
                 f"OpenAI API returned status {response.status_code}: {excerpt}",
                 status_code=response.status_code,
                 body_excerpt=excerpt,
+                retry_after=retry_after,
             )
 
         try:
             data = response.json()
         except Exception:
-            # Fallback: router might have returned SSE streaming lines (data: {...})
+            # Fallback: provider might have returned SSE streaming lines (data: {...})
             accumulated: list[str] = []
+            sse_finish_reason: str | None = None
             for line in response.text.splitlines():
                 line = line.strip()
-                if line.startswith("data: ") and line != "data: [DONE]":
+                if line.startswith("data:"):
+                    payload_str = line[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
                     try:
-                        chunk = json.loads(line[6:])
+                        chunk = json.loads(payload_str)
                         choices_chunk = chunk.get("choices", [])
                         if choices_chunk:
-                            delta = choices_chunk[0].get("delta", {})
-                            chunk_content = delta.get("content") or choices_chunk[0].get("message", {}).get("content")
-                            if chunk_content:
+                            first_choice = choices_chunk[0]
+                            if first_choice.get("finish_reason"):
+                                sse_finish_reason = str(first_choice["finish_reason"])
+                            delta = first_choice.get("delta", {})
+                            chunk_content = delta.get("content") or first_choice.get("message", {}).get("content")
+                            if isinstance(chunk_content, str) and chunk_content:
                                 accumulated.append(chunk_content)
                     except Exception:
                         pass
             if accumulated:
-                return "".join(accumulated).strip()
+                sse_text = "".join(accumulated).strip()
+                if sse_finish_reason == "length" and not allow_truncated:
+                    raise LLMTruncationError(
+                        f"OpenAI SSE output truncated due to length (model: {self.model})",
+                        truncated_text=sse_text,
+                    )
+                return sse_text
             raise LLMError(f"Failed to decode OpenAI JSON response: {response.text[:200]}", status_code=200)
+
+        # OpenRouter / compatible gateways may return HTTP 200 with a JSON error object
+        if isinstance(data, dict) and data.get("error"):
+            err_obj = data["error"]
+            if isinstance(err_obj, dict):
+                err_msg = str(err_obj.get("message") or err_obj)
+                raw_code = err_obj.get("code")
+                try:
+                    err_code = int(raw_code) if raw_code is not None else 502
+                except (TypeError, ValueError):
+                    err_code = 502
+            else:
+                err_msg = str(err_obj)
+                err_code = 502
+            retry_after = _parse_retry_after(response) if err_code in (429, 503) else None
+            logger.error("OpenAI API returned error payload [code=%s]: %s", err_code, err_msg[:200])
+            raise LLMError(
+                f"OpenAI API returned error {err_code}: {err_msg[:200]}",
+                status_code=err_code,
+                body_excerpt=err_msg[:200],
+                retry_after=retry_after,
+            )
 
         choices = data.get("choices")
         if not choices or not isinstance(choices, list) or len(choices) == 0:
@@ -294,7 +423,7 @@ class OpenAIClient(BaseLLMClient):
         choice = choices[0]
         finish_reason = choice.get("finish_reason", "unknown")
         message = choice.get("message", {})
-        content = (message.get("content") or "").strip()
+        content = _extract_openai_message_text(message.get("content"))
 
         if finish_reason == "length":
             if not allow_truncated:
@@ -347,7 +476,7 @@ def get_llm_client(settings: Settings | None = None) -> BaseLLMClient:
         settings = get_settings()
 
     # Configure httpx client with proxy if specified
-    client_kwargs: dict[str, Any] = {"timeout": 120.0}
+    client_kwargs: dict[str, Any] = {"timeout": _DEFAULT_HTTP_TIMEOUT}
     if settings.PROXY_URL:
         client_kwargs["proxy"] = settings.PROXY_URL
 
