@@ -52,33 +52,37 @@ tg-daily-summarizer/
 │   ├── handlers/
 │   │   ├── listener.py      # Captures text, captions, replies, topic creation/rename, my_chat_member tracking
 │   │   ├── admin.py         # Full Persian group admin command suite (/status, /topics, /mode, etc.)
-│   │   ├── private.py       # Role-aware private commands (/start, /panel, /help, /about, /cancel) & stranger anti-spam
+│   │   ├── timer.py         # Interactive /timer panel (countdown, Jalali calendar, quick shorthand, FSM, snooze/ack)
+│   │   ├── private.py       # Role-aware private commands (/start, /panel, /help, /about, /cancel) & DM timer activation
 │   │   └── panel.py         # Inline-keyboard Private Admin Panel (8 screens, FSM min-messages, live run, DM preview)
 │   ├── keyboards/
-│   │   └── panel.py         # Compact PanelCB (prefix="pn", <= 64 bytes) & paginated inline keyboard builders
+│   │   ├── panel.py         # Compact PanelCB (prefix="pn", <= 64 bytes) & paginated inline keyboard builders
+│   │   └── timer.py         # Compact TimerCB (prefix="tm", <= 64 bytes), Jalali calendar grid & timer keyboards
 │   ├── middlewares/
 │   │   └── throttle.py      # PrivateThrottleMiddleware (1 update/sec per user in private chat)
 │   ├── texts/
 │   │   └── private_texts.py # Casual Persian message pools & non-repeating pick() helper
 │   ├── services/
-│   │   ├── access.py        # Private role resolution & per-group permissions sharing AdminFilter TTL cache
+│   │   ├── access.py        # Private role resolution, group membership check & shared AdminFilter TTL cache
+│   │   ├── timer_service.py # APScheduler DateTrigger scheduling, rehydration, atomic claim & group+DM firing
 │   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (for 9Router)
 │   │   ├── summarizer.py    # Transcript formatting, map-reduce chunking, Telegram HTML sanitize
 │   │   └── publisher.py     # Safe sender with smart tag-aware splitting, destination override & parse error recovery
 │   ├── scheduler/
-│   │   └── jobs.py          # APScheduler nightly job (00:01 Tehran), catch-up, dry-run preview, daily cleanup
+│   │   └── jobs.py          # APScheduler nightly job (00:01 Tehran), catch-up, dry-run preview, timer sweep, daily cleanup
 │   └── utils/
 │       ├── general_topic.py # Normalizes General topic (None/1 -> 1; send target -> None)
 │       ├── html_utils.py    # escape_html helper for dynamic Telegram HTML values
 │       ├── link_parser.py   # Parses Telegram topic/message links and validates group chat IDs
 │       ├── noise_filter.py  # Strips greetings, filler, emojis, punctuation, normalizes ي/ك
 │       ├── text_split.py    # Tag-aware smart message chunker (<= 4000 chars)
+│       ├── timer_parser.py  # Persian/Jalali duration, time, date & shorthand /timer command parser
 │       ├── dates.py         # Jalali (jdatetime) & Gregorian helpers in Asia/Tehran
 │       ├── retry.py         # Async exponential backoff with jitter on 429/5xx/network errors
 │       └── logging_setup.py # Rotating UTF-8 file handler (5MB x 5) & console handler
-├── tests/                   # Complete offline unit tests (92 passing tests)
+├── tests/                   # Complete offline unit tests
 ├── deploy/                  # Linux systemd unit (tg-summarizer.service)
-├── .env.example             # Documented template with all 25 environment keys
+├── .env.example             # Documented template with all environment keys
 └── README.md                # Comprehensive Persian documentation
 ```
 

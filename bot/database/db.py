@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS bot_users (
     attempts_window_start TEXT,
     attempts_count INTEGER NOT NULL DEFAULT 0,
     ignored_until TEXT,
-    notified INTEGER NOT NULL DEFAULT 0
+    notified INTEGER NOT NULL DEFAULT 0,
+    dm_started INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS known_groups (
@@ -85,6 +86,29 @@ CREATE TABLE IF NOT EXISTS known_groups (
     added_at TEXT NOT NULL,
     left_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS timers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL DEFAULT 1,
+    chat_type TEXT NOT NULL DEFAULT 'supergroup',
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    full_name TEXT NOT NULL,
+    note TEXT,
+    timer_type TEXT NOT NULL,
+    fire_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    fired_at TEXT,
+    source_message_id INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_timers_status_fire_at
+    ON timers(status, fire_at);
+
+CREATE INDEX IF NOT EXISTS idx_timers_user_status
+    ON timers(user_id, status, fire_at);
 """
 
 
@@ -168,6 +192,39 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
             (now_utc,),
         )
         await conn.execute("PRAGMA user_version = 3;")
+        await conn.commit()
+
+    if current_version < 4:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS timers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL DEFAULT 1,
+                chat_type TEXT NOT NULL DEFAULT 'supergroup',
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT NOT NULL,
+                note TEXT,
+                timer_type TEXT NOT NULL,
+                fire_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                fired_at TEXT,
+                source_message_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_timers_status_fire_at
+                ON timers(status, fire_at);
+            CREATE INDEX IF NOT EXISTS idx_timers_user_status
+                ON timers(user_id, status, fire_at);
+        """)
+        cursor = await conn.execute("PRAGMA table_info(bot_users);")
+        cols = await cursor.fetchall()
+        col_names = {c[1] for c in cols}
+        if "dm_started" not in col_names:
+            await conn.execute(
+                "ALTER TABLE bot_users ADD COLUMN dm_started INTEGER NOT NULL DEFAULT 0;"
+            )
+        await conn.execute("PRAGMA user_version = 4;")
         await conn.commit()
 
 

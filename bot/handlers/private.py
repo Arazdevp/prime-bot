@@ -8,13 +8,14 @@ from aiogram import Bot, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import default_state
-from aiogram.types import Message, User
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 from bot.config import get_settings
 from bot.database import repository
 from bot.filters import PrivateChatFilter
 from bot.handlers.panel import build_admin_help_text, render_home_or_dashboard
-from bot.keyboards.panel import build_open_panel_kb
-from bot.services.access import UserRole, resolve_user_role
+from bot.keyboards.panel import PanelCB, build_open_panel_kb
+from bot.keyboards.timer import TimerCB, build_dm_timer_entry_kb
+from bot.services.access import UserRole, is_active_group_member, resolve_user_role
 from bot.texts.private_texts import pick
 from bot.utils.dates import format_persian_date, format_persian_short_date
 from bot.utils.html_utils import escape_html
@@ -231,6 +232,13 @@ async def cmd_private_cancel(message: Message, bot: Bot, state: FSMContext) -> N
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await is_active_group_member(bot, user.id):
+                await _safe_answer(
+                    message,
+                    "الان هیچ عملیاتی در جریان نیست 😄 برای تایمرهات <code>/timer</code> رو بزن.",
+                    reply_markup=build_dm_timer_entry_kb(user.id),
+                )
+                return
             await handle_stranger_contact(message, bot, is_start=False)
             return
 
@@ -243,18 +251,44 @@ async def cmd_private_cancel(message: Message, bot: Bot, state: FSMContext) -> N
         await _safe_answer(message, "یه خطای کوچیک پیش اومد 😅 دوباره امتحان کن.")
 
 
+def _extract_start_payload(text: str | None) -> str:
+    """Return optional deep-link payload from '/start <payload>'."""
+    parts = (text or "").strip().split(maxsplit=1)
+    return parts[1].strip().lower() if len(parts) > 1 else ""
+
+
 @router.message(Command("start"))
 async def cmd_private_start(message: Message, bot: Bot, state: FSMContext) -> None:
-    """Handle /start in private chat based on user role."""
+    """Handle /start in private chat based on user role and active group membership."""
     try:
         user = message.from_user
         if user is None:
             return
 
         await state.clear()
+        payload = _extract_start_payload(message.text)
         role, _groups = await resolve_user_role(bot, user.id)
 
         if role == UserRole.STRANGER:
+            if await is_active_group_member(bot, user.id):
+                await repository.set_bot_user_dm_started(
+                    user.id,
+                    True,
+                    username=user.username,
+                    full_name=user.full_name,
+                )
+                safe_name = escape_html(_display_name(user))
+                member_text = (
+                    f"سلام <b>{safe_name}</b> جان! 👋\n\n"
+                    "🔔 <b>اعلان‌های تایمر توی پیوی برات فعال شد ✅</b>\n"
+                    "از این به بعد هر تایمری توی تاپیک‌های گروه بذاری، علاوه بر خود تاپیک، "
+                    "همزمان همینجا هم بهت یادآوری می‌کنم!\n\n"
+                    "همچنین می‌تونی با دستور <code>/timer</code> همینجا تایمرهای فعالت رو ببینی، "
+                    "لغو کنی یا یادآور شخصی بذاری ⏱"
+                )
+                await _safe_answer(message, member_text, reply_markup=build_dm_timer_entry_kb(user.id))
+                return
+
             await handle_stranger_contact(message, bot, is_start=True)
             return
 
@@ -264,6 +298,44 @@ async def cmd_private_start(message: Message, bot: Bot, state: FSMContext) -> No
             username=user.username,
             full_name=user.full_name,
         )
+        await repository.set_bot_user_dm_started(
+            user.id,
+            True,
+            username=user.username,
+            full_name=user.full_name,
+        )
+
+        if payload.startswith("timer"):
+            safe_name = escape_html(_display_name(user))
+            timer_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⏱ باز کردن پنل تایمر",
+                            callback_data=TimerCB(action="home", owner_id=user.id).pack(),
+                        ),
+                        InlineKeyboardButton(
+                            text="📋 تایمرهای فعال من",
+                            callback_data=TimerCB(action="list", owner_id=user.id, arg="0").pack(),
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🎛 باز کردن پنل مدیریت",
+                            callback_data=PanelCB(action="open").pack(),
+                        )
+                    ],
+                ]
+            )
+            await _safe_answer(
+                message,
+                f"سلام <b>{safe_name}</b> جان! 👋\n\n"
+                "🔔 <b>اعلان‌های تایمر توی پیوی برات فعال شد ✅</b>\n"
+                "هر تایمری توی گروه بذاری، علاوه بر تاپیک گروه، همزمان همینجا هم بهت پیام میدم ⏱",
+                reply_markup=timer_kb,
+            )
+            return
+
         pool_key = "admin_welcome" if role == UserRole.GLOBAL_ADMIN else "group_admin_welcome"
         text, variant_key = pick(
             pool_key,
@@ -311,6 +383,16 @@ async def cmd_private_help(message: Message, bot: Bot) -> None:
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await is_active_group_member(bot, user.id):
+                member_help = (
+                    "⏱ <b>راهنمای تایمر و یادآور</b>\n\n"
+                    "• در هر تاپیک گروه یا همینجا <code>/timer</code> رو بزن تا پنل شیشه‌ای تایمر باز بشه.\n"
+                    "• می‌تونی <b>تایمر دقیقه‌ای / ساعتی</b> یا <b>تایمر روزی (تقویم شمسی)</b> تنظیم کنی و یادداشت بذاری.\n"
+                    "• میانبر سریع: <code>/timer 30m برم شام</code> یا <code>/timer فردا 09:00 جلسه</code>\n"
+                    "• وقتی تایمر به صدا در بیاد، هم توی همون تاپیک تگ می‌شی و هم همزمان همینجا بهت خبر میدم! 🔔"
+                )
+                await _safe_answer(message, member_help, reply_markup=build_dm_timer_entry_kb(user.id))
+                return
             await handle_stranger_contact(message, bot, is_start=False)
             return
 
@@ -362,6 +444,13 @@ async def handle_private_fallback(message: Message, bot: Bot) -> None:
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await is_active_group_member(bot, user.id):
+                await _safe_answer(
+                    message,
+                    "برای تنظیم یا دیدن تایمرهات دستور <code>/timer</code> رو بزن یا از دکمه‌های زیر استفاده کن ⏱",
+                    reply_markup=build_dm_timer_entry_kb(user.id),
+                )
+                return
             await handle_stranger_contact(message, bot, is_start=False)
             return
 

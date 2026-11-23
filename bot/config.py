@@ -151,6 +151,19 @@ class Settings(BaseSettings):
         description="Automatically leave groups not listed in ALLOWED_CHAT_IDS when added",
     )
 
+    # Interactive Timer & Reminder Limits
+    TIMER_MAX_PER_USER: int = Field(
+        default=15,
+        ge=1,
+        le=100,
+        description="Maximum concurrent active timers allowed per user",
+    )
+    TIMER_RETENTION_DAYS: int = Field(
+        default=30,
+        ge=1,
+        description="Days to retain completed/cancelled timers before purge",
+    )
+
     @field_validator("OWNER_NAMES", mode="before")
     @classmethod
     def parse_owner_names(cls, value: Any) -> str:

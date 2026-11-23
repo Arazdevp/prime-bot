@@ -193,6 +193,7 @@ def build_admin_help_text(is_global: bool) -> str:
         f"{role_note}\n\n"
         "<b>دستورات پیوی:</b>\n"
         "• <code>/panel</code> — باز کردن پنل مدیریتی دکمه‌ای\n"
+        "• <code>/timer</code> — پنل شیشه‌ای تایمر و یادآور (دقیقه‌ای/ساعتی و تقویم شمسی)\n"
         "• <code>/start</code> — خوش‌آمدگویی و دکمه سریع پنل\n"
         "• <code>/help</code> — نمایش همین راهنما\n"
         "• <code>/about</code> — معرفی ربات و مدیرهاش\n"

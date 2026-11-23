@@ -13,10 +13,11 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
-from bot.handlers import admin, listener, panel, private
+from bot.handlers import admin, listener, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
 from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
 from bot.services.llm_client import close_llm_client
+from bot.services.timer_service import rehydrate_active_timers, set_bot_username
 from bot.utils.dates import format_persian_date, get_tehran_now
 from bot.utils.html_utils import escape_html
 from bot.utils.logging_setup import setup_logging
@@ -126,15 +127,26 @@ async def main() -> None:
     dp.callback_query.outer_middleware(private_throttle)
 
     dp.include_router(admin.router)
+    dp.include_router(timer.router)
     dp.include_router(listener.router)
     dp.include_router(private.router)
     dp.include_router(panel.router)
+
+    # Best-effort cache bot username for DM activation deep links
+    try:
+        me = await bot.get_me()
+        set_bot_username(me.username)
+    except Exception as exc:
+        logger.debug("Could not fetch bot username on startup: %s", exc)
 
     # 4. Initialize and start scheduler
     scheduler = build_scheduler(bot)
     set_scheduler(scheduler)
     scheduler.start()
     logger.info("Scheduler started successfully in timezone %s.", settings.TIMEZONE)
+
+    # Restore pending/missed user timers from SQLite
+    asyncio.create_task(rehydrate_active_timers(bot))
 
     # Log next run time of nightly job
     nightly_job = scheduler.get_job("nightly_summary")

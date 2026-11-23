@@ -145,7 +145,7 @@ async def test_migration_v2_to_v3_creates_tables_and_backfills_known_groups(tmp_
         db = get_db()
         cur = await db.execute("PRAGMA user_version;")
         ver = (await cur.fetchone())[0]
-        assert ver == 3
+        assert ver >= 3
 
         groups = await repository.list_active_known_groups()
         assert len(groups) == 1

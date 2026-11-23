@@ -592,7 +592,7 @@ async def get_bot_user(user_id: int) -> dict[str, Any] | None:
         """
         SELECT user_id, username, full_name, first_seen, last_seen,
                last_variant_key, attempts_window_start, attempts_count,
-               ignored_until, notified
+               ignored_until, notified, dm_started
         FROM bot_users WHERE user_id = ?;
         """,
         (user_id,),
@@ -614,8 +614,8 @@ async def upsert_bot_user_seen(
     sql = """
     INSERT INTO bot_users (
         user_id, username, full_name, first_seen, last_seen,
-        last_variant_key, attempts_window_start, attempts_count, ignored_until, notified
-    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0)
+        last_variant_key, attempts_window_start, attempts_count, ignored_until, notified, dm_started
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0, 0)
     ON CONFLICT(user_id) DO UPDATE SET
         username = excluded.username,
         full_name = excluded.full_name,
@@ -628,7 +628,7 @@ async def upsert_bot_user_seen(
             """
             SELECT user_id, username, full_name, first_seen, last_seen,
                    last_variant_key, attempts_window_start, attempts_count,
-                   ignored_until, notified
+                   ignored_until, notified, dm_started
             FROM bot_users WHERE user_id = ?;
             """,
             (user_id,),
@@ -645,7 +645,47 @@ async def upsert_bot_user_seen(
         "attempts_count": 0,
         "ignored_until": None,
         "notified": 0,
+        "dm_started": 0,
     }
+
+
+async def set_bot_user_dm_started(
+    user_id: int,
+    dm_started: bool,
+    *,
+    username: str | None = None,
+    full_name: str | None = None,
+) -> None:
+    """Record whether a user has an active private DM session with the bot."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    flag = 1 if dm_started else 0
+    sql = """
+    INSERT INTO bot_users (
+        user_id, username, full_name, first_seen, last_seen,
+        last_variant_key, attempts_window_start, attempts_count, ignored_until, notified, dm_started
+    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, NULL, 0, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username = COALESCE(excluded.username, bot_users.username),
+        full_name = COALESCE(excluded.full_name, bot_users.full_name),
+        last_seen = excluded.last_seen,
+        dm_started = excluded.dm_started;
+    """
+    async with lock:
+        await conn.execute(sql, (user_id, username, full_name, now_iso, now_iso, flag))
+        await conn.commit()
+
+
+async def is_bot_user_dm_started(user_id: int) -> bool:
+    """Return True if the user is known to have started the bot in private chat."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT dm_started FROM bot_users WHERE user_id = ?;",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return bool(row and row["dm_started"] == 1)
 
 
 async def update_bot_user_stranger_state(
@@ -767,3 +807,234 @@ async def list_active_known_groups() -> list[dict[str, Any]]:
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------- Timers Table Operations ----------------
+
+_TIMER_SELECT_COLS = (
+    "id, chat_id, thread_id, chat_type, user_id, username, full_name, "
+    "note, timer_type, fire_at, created_at, status, fired_at, source_message_id"
+)
+
+
+async def create_timer(
+    *,
+    chat_id: int,
+    thread_id: int,
+    chat_type: str,
+    user_id: int,
+    username: str | None,
+    full_name: str,
+    note: str | None,
+    timer_type: str,
+    fire_at_iso: str,
+    created_at_iso: str | None = None,
+    source_message_id: int | None = None,
+) -> dict[str, Any]:
+    """Insert a new active timer and return the created row."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = created_at_iso or datetime.now(timezone.utc).isoformat()
+    clean_note = note.strip() if isinstance(note, str) and note.strip() else None
+    clean_username = username.strip().lstrip("@") if isinstance(username, str) and username.strip() else None
+    clean_full_name = (full_name or "").strip() or "کاربر"
+
+    sql = """
+    INSERT INTO timers (
+        chat_id, thread_id, chat_type, user_id, username, full_name,
+        note, timer_type, fire_at, created_at, status, fired_at, source_message_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?);
+    """
+    async with lock:
+        cursor = await conn.execute(
+            sql,
+            (
+                chat_id,
+                thread_id,
+                chat_type,
+                user_id,
+                clean_username,
+                clean_full_name,
+                clean_note,
+                timer_type,
+                fire_at_iso,
+                now_iso,
+                source_message_id,
+            ),
+        )
+        timer_id = int(cursor.lastrowid)
+        await conn.commit()
+
+    return {
+        "id": timer_id,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "chat_type": chat_type,
+        "user_id": user_id,
+        "username": clean_username,
+        "full_name": clean_full_name,
+        "note": clean_note,
+        "timer_type": timer_type,
+        "fire_at": fire_at_iso,
+        "created_at": now_iso,
+        "status": "active",
+        "fired_at": None,
+        "source_message_id": source_message_id,
+    }
+
+
+async def get_timer(timer_id: int) -> dict[str, Any] | None:
+    """Fetch a single timer record by primary ID."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_TIMER_SELECT_COLS} FROM timers WHERE id = ?;",
+        (timer_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def count_active_timers_for_user(user_id: int) -> int:
+    """Return total active timers owned by user_id across all chats."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM timers WHERE user_id = ? AND status = 'active';",
+        (user_id,),
+    )
+    row = await cursor.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def list_active_timers_for_user(
+    user_id: int,
+    chat_id: int | None = None,
+) -> list[dict[str, Any]]:
+    """List active timers for a user ordered chronologically by fire_at."""
+    conn = get_db()
+    if chat_id is not None:
+        cursor = await conn.execute(
+            f"SELECT {_TIMER_SELECT_COLS} FROM timers "
+            "WHERE user_id = ? AND chat_id = ? AND status = 'active' "
+            "ORDER BY fire_at ASC, id ASC;",
+            (user_id, chat_id),
+        )
+    else:
+        cursor = await conn.execute(
+            f"SELECT {_TIMER_SELECT_COLS} FROM timers "
+            "WHERE user_id = ? AND status = 'active' "
+            "ORDER BY fire_at ASC, id ASC;",
+            (user_id,),
+        )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_all_active_timers() -> list[dict[str, Any]]:
+    """Return all currently active timers across all users (used for startup rehydration)."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_TIMER_SELECT_COLS} FROM timers "
+        "WHERE status = 'active' ORDER BY fire_at ASC, id ASC;"
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_due_active_timers(now_utc_iso: str) -> list[dict[str, Any]]:
+    """Return active timers whose fire_at timestamp is at or before now_utc_iso."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_TIMER_SELECT_COLS} FROM timers "
+        "WHERE status = 'active' AND fire_at <= ? ORDER BY fire_at ASC, id ASC;",
+        (now_utc_iso,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def claim_timer_for_firing(
+    timer_id: int,
+    fired_at_iso: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically transition an active timer to 'fired' and return it, or None if already claimed."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = fired_at_iso or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "UPDATE timers SET status = 'fired', fired_at = ? WHERE id = ? AND status = 'active';",
+            (ts, timer_id),
+        )
+        if cursor.rowcount != 1:
+            await conn.commit()
+            return None
+        fetch = await conn.execute(
+            f"SELECT {_TIMER_SELECT_COLS} FROM timers WHERE id = ?;",
+            (timer_id,),
+        )
+        row = await fetch.fetchone()
+        await conn.commit()
+    return dict(row) if row is not None else None
+
+
+async def cancel_timer(timer_id: int, user_id: int) -> bool:
+    """Cancel an active timer owned by user_id. Returns True if cancelled."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cursor = await conn.execute(
+            "UPDATE timers SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active';",
+            (timer_id, user_id),
+        )
+        await conn.commit()
+        return cursor.rowcount == 1
+
+
+async def cancel_all_user_timers(
+    user_id: int,
+    chat_id: int | None = None,
+) -> list[int]:
+    """Cancel all active timers for user_id (optionally scoped to chat_id) and return their IDs."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        if chat_id is not None:
+            cur = await conn.execute(
+                "SELECT id FROM timers WHERE user_id = ? AND chat_id = ? AND status = 'active';",
+                (user_id, chat_id),
+            )
+            ids = [int(r["id"]) for r in await cur.fetchall()]
+            if ids:
+                await conn.execute(
+                    "UPDATE timers SET status = 'cancelled' "
+                    "WHERE user_id = ? AND chat_id = ? AND status = 'active';",
+                    (user_id, chat_id),
+                )
+        else:
+            cur = await conn.execute(
+                "SELECT id FROM timers WHERE user_id = ? AND status = 'active';",
+                (user_id,),
+            )
+            ids = [int(r["id"]) for r in await cur.fetchall()]
+            if ids:
+                await conn.execute(
+                    "UPDATE timers SET status = 'cancelled' WHERE user_id = ? AND status = 'active';",
+                    (user_id,),
+                )
+        await conn.commit()
+    return ids
+
+
+async def delete_old_completed_timers(retention_days: int = 30) -> int:
+    """Delete fired or cancelled timers older than retention_days."""
+    conn = get_db()
+    lock = get_write_lock()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM timers WHERE status IN ('fired', 'cancelled') "
+            "AND COALESCE(fired_at, fire_at, created_at) < ?;",
+            (cutoff,),
+        )
+        await conn.commit()
+        return cursor.rowcount

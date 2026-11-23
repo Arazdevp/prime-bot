@@ -11,12 +11,14 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from bot.config import get_settings
 from bot.database import repository
 from bot.database.db import get_db, get_write_lock
 from bot.services.llm_client import BaseLLMClient
 from bot.services.publisher import send_summary, send_summary_parts
 from bot.services.summarizer import summarize_topic_messages
+from bot.services.timer_service import sweep_due_timers
 from bot.utils.dates import compute_nightly_cutoff
 from bot.utils.html_utils import escape_html
 from bot.utils.text_split import smart_split
@@ -37,6 +39,11 @@ def set_scheduler(scheduler: AsyncIOScheduler | None) -> None:
     """Store active scheduler instance for runtime inspection (e.g. Global Status)."""
     global _scheduler_ref
     _scheduler_ref = scheduler
+
+
+def get_scheduler() -> AsyncIOScheduler | None:
+    """Return active scheduler instance, if initialized."""
+    return _scheduler_ref
 
 
 def get_next_nightly_run_time() -> datetime | None:
@@ -540,6 +547,11 @@ async def cleanup_job() -> None:
     deleted_count = await repository.delete_old_messages(settings.RETENTION_DAYS)
     logger.info("Deleted %s messages older than %s days.", deleted_count, settings.RETENTION_DAYS)
 
+    # 1b. Purge completed/cancelled timers older than timer retention days
+    deleted_timers = await repository.delete_old_completed_timers(settings.TIMER_RETENTION_DAYS)
+    if deleted_timers:
+        logger.info("Deleted %s completed/cancelled timers older than %s days.", deleted_timers, settings.TIMER_RETENTION_DAYS)
+
     # 2. SQLite PRAGMA optimize
     conn = get_db()
     lock = get_write_lock()
@@ -595,6 +607,18 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="daily_cleanup",
         name="Daily Database Retention Cleanup",
         misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 3. Periodic safety-net timer sweep every 60 seconds
+    scheduler.add_job(
+        sweep_due_timers,
+        trigger=IntervalTrigger(seconds=60, timezone=tz),
+        args=[bot],
+        id="timer_sweep",
+        name="User Timers Due Sweep",
+        misfire_grace_time=60,
         coalesce=True,
         max_instances=1,
     )
