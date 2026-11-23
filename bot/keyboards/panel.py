@@ -177,9 +177,15 @@ def build_dashboard_kb(chat_id: int, enabled: bool, mode: str) -> InlineKeyboard
             ],
             [
                 InlineKeyboardButton(
+                    text="☀️ صبح‌بخیر روزانه",
+                    callback_data=PanelCB(action="mrg", chat_id=chat_id).pack(),
+                ),
+                InlineKeyboardButton(
                     text="👁 پیش‌نمایش",
                     callback_data=PanelCB(action="prv", chat_id=chat_id, page=0).pack(),
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text="🔙 بازگشت",
                     callback_data=PanelCB(action="home").pack(),
@@ -520,6 +526,86 @@ def build_global_status_kb() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def build_morning_kb(
+    chat_id: int,
+    *,
+    enabled: bool,
+    has_topic: bool,
+) -> InlineKeyboardMarkup:
+    """Morning greeting management screen keyboard with toggle, topic picker, and admin test button."""
+    toggle_label = "🔴 غیرفعال کردن ارسال صبحانه" if enabled else "🟢 فعال کردن ارسال صبحانه"
+    topic_label = "📌 تغییر تاپیک مقصد" if has_topic else "📌 انتخاب تاپیک مقصد"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=toggle_label,
+                    callback_data=PanelCB(action="mrgt", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=topic_label,
+                    callback_data=PanelCB(action="mrgl", chat_id=chat_id, page=0).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧪 ارسال تستی در تاپیک مقصد",
+                    callback_data=PanelCB(action="mrgtst", chat_id=chat_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت به داشبورد",
+                    callback_data=PanelCB(action="grp", chat_id=chat_id).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def build_morning_topics_kb(
+    chat_id: int,
+    topics: list[dict[str, Any]],
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """Paginated topic picker for the daily morning greeting target topic."""
+    rows: list[list[InlineKeyboardButton]] = []
+    page_topics, safe_page, total_pages = paginate(topics, page, PAGE_SIZE)
+
+    for t in page_topics:
+        tid = int(t["thread_id"])
+        label = f"☀️ {_truncate(str(t.get('name', tid)), 28)}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=PanelCB(
+                        action="mrgs",
+                        chat_id=chat_id,
+                        arg=str(tid),
+                        page=safe_page,
+                    ).pack(),
+                )
+            ]
+        )
+
+    nav = _pagination_row("mrgl", chat_id, safe_page, total_pages)
+    if nav:
+        rows.append(nav)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت",
+                callback_data=PanelCB(action="mrg", chat_id=chat_id).pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_back_to_group_kb(chat_id: int) -> InlineKeyboardMarkup:

@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ from bot.keyboards.panel import (
     build_manual_run_confirm_kb,
     build_manual_run_kb,
     build_min_messages_kb,
+    build_morning_kb,
+    build_morning_topics_kb,
     build_preview_topics_kb,
     build_topics_kb,
 )
@@ -43,6 +46,8 @@ from bot.services.access import (
     is_global_admin,
     resolve_user_role,
 )
+from bot.services.morning_service import send_morning_greeting_to_group
+from bot.texts.morning_texts import MORNING_GREETINGS, compute_hills_day
 from bot.texts.private_texts import pick
 from bot.utils.dates import (
     format_persian_date,
@@ -50,6 +55,7 @@ from bot.utils.dates import (
     get_tehran_now,
 )
 from bot.utils.html_utils import escape_html
+from bot.utils.timer_parser import to_persian_digits
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,11 @@ _GROUP_ACTIONS = {
     "rune",
     "prv",
     "prvr",
+    "mrg",
+    "mrgt",
+    "mrgl",
+    "mrgs",
+    "mrgtst",
 }
 _GENERAL_ACTIONS = {"open", "home", "help", "noop"}
 
@@ -205,7 +216,8 @@ def build_admin_help_text(is_global: bool) -> str:
         "• تعیین مقصد خلاصه‌ها (هر تاپیک جدا یا تجمیعی)\n"
         "• تنظیم حداقل پیام (با دکمه یا وارد کردن عدد ۱ تا ۱۰۰)\n"
         "• اجرای دستی خلاصه (تک‌تاپیک یا کل گروه، با قابلیت keep)\n"
-        "• 👁 پیش‌نمایش خلاصه فقط توی پیوی خودت بدون دست زدن به دیتابیس\n\n"
+        "• 👁 پیش‌نمایش خلاصه فقط توی پیوی خودت بدون دست زدن به دیتابیس\n"
+        "• ☀️ مدیریت پیام صبح‌بخیر روزانه هیلز (انتخاب تاپیک مقصد، فعال/غیرفعال و ارسال تستی)\n\n"
         "<i>راستی، تمام دستورات قدیمی توی خود گروه‌ها هم هنوز سر جاشونن و کار می‌کنن!</i>"
     )
 
@@ -450,6 +462,69 @@ async def render_preview_topics(chat_id: int, page: int = 0) -> tuple[str, Inlin
             "(توی گروه چیزی ارسال نمی‌شه و هیچ پیامی هم پاک نمی‌شه) 👇"
         )
     return text, build_preview_topics_kb(chat_id, topics, page=page)
+
+
+async def render_morning_settings(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Render Morning Greeting settings screen (status, topic, Hills day, cycle progress, test button)."""
+    cfg = get_settings()
+    title = await _get_group_title(chat_id)
+    morning_cfg = await repository.ensure_morning_config(chat_id)
+
+    is_enabled = int(morning_cfg.get("enabled", 0)) == 1
+    status_str = "🟢 فعال" if is_enabled else "🔴 غیرفعال"
+
+    raw_tid = morning_cfg.get("thread_id")
+    has_topic = raw_tid is not None
+    if has_topic:
+        tid = int(raw_tid)
+        t_name = await _get_topic_display_name(chat_id, tid)
+        topic_str = f"<b>«{escape_html(t_name)}»</b> (<code>{tid}</code>)"
+    else:
+        topic_str = "⚠️ <i>هنوز انتخاب نشده</i>"
+
+    now_tehran = get_tehran_now()
+    hills_day = compute_hills_day(now_tehran, cfg.HILLS_START_DATE, cfg.TIMEZONE)
+
+    total_pool = len(MORNING_GREETINGS)
+    used_in_cycle = 0
+    raw_deck = morning_cfg.get("deck_json")
+    if raw_deck:
+        try:
+            parsed_deck = json.loads(raw_deck)
+            if isinstance(parsed_deck, list):
+                used_in_cycle = max(0, total_pool - len(parsed_deck))
+        except Exception:
+            used_in_cycle = 0
+
+    last_sent = morning_cfg.get("last_sent_day") or "هنوز ارسال نشده"
+    send_time_str = f"{cfg.MORNING_GREETING_HOUR:02d}:{cfg.MORNING_GREETING_MINUTE:02d}"
+
+    text = (
+        f"☀️ <b>پیام صبح‌بخیر روزانه هیلز — «{escape_html(title)}»</b>\n\n"
+        f"🔹 <b>وضعیت:</b> {status_str}\n"
+        f"📌 <b>تاپیک مقصد:</b> {topic_str}\n"
+        f"⏰ <b>ساعت ارسال روزانه:</b> <code>{send_time_str}</code> (تهران)\n"
+        f"🗓 <b>امروز:</b> روز <b>{to_persian_digits(hills_day)}</b> هیلز (شروع: <code>{escape_html(cfg.HILLS_START_DATE)}</code>)\n"
+        f"🎲 <b>تنوع غیرتکراری:</b> {to_persian_digits(used_in_cycle)} از {to_persian_digits(total_pool)} متن استفاده شده در این دور\n"
+        f"📬 <b>آخرین ارسال خودکار:</b> <code>{escape_html(last_sent)}</code>\n\n"
+        "<i>💡 نکته: دکمه تست دقیقاً شکل واقعی پیام را داخل تاپیک مقصد می‌فرستد و مزاحم ارسال خودکار ۰۵:۰۱ نمی‌شود.</i>"
+    )
+    return text, build_morning_kb(chat_id, enabled=is_enabled, has_topic=has_topic)
+
+
+async def render_morning_topics(chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Render paginated topic picker for choosing the morning greeting target topic."""
+    title = await _get_group_title(chat_id)
+    topics = await repository.list_topics_with_counts_today(chat_id, _get_today_start_utc_iso())
+    if not topics:
+        topics = [{"thread_id": 1, "name": "عمومی", "today_count": 0}]
+
+    text = (
+        f"☀️ <b>انتخاب تاپیک مقصد صبح‌بخیر — «{escape_html(title)}»</b>\n\n"
+        "تاپیکی که می‌خوای هر صبح ساعت ۰۵:۰۱ پیام صبح‌بخیر هیلز توش ارسال بشه رو انتخاب کن:\n"
+        "<i>(همچنین می‌تونی مستقیم داخل خود تاپیک دستور <code>/set_morning_topic</code> رو بزنی)</i>"
+    )
+    return text, build_morning_topics_kb(chat_id, topics, page=page)
 
 
 async def render_global_status() -> tuple[str, InlineKeyboardMarkup]:
@@ -963,6 +1038,64 @@ async def handle_panel_callback(
                 )
 
             await safe_edit_message(callback, result_text, build_back_to_group_kb(chat_id))
+            return
+
+        if action == "mrg":
+            text, kb = await render_morning_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback)
+            return
+
+        if action == "mrgt":
+            morning_cfg = await repository.ensure_morning_config(chat_id)
+            currently_enabled = int(morning_cfg.get("enabled", 0)) == 1
+            if not currently_enabled and morning_cfg.get("thread_id") is None:
+                await safe_answer_callback(
+                    callback,
+                    "⚠️ اول تاپیک مقصد پیام صبح‌بخیر رو انتخاب کن!",
+                    show_alert=True,
+                )
+                return
+            new_enabled = 0 if currently_enabled else 1
+            await repository.set_morning_enabled(chat_id, new_enabled)
+            text, kb = await render_morning_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            toast = "🟢 ارسال صبح‌بخیر روزانه فعال شد!" if new_enabled == 1 else "🔴 ارسال صبح‌بخیر روزانه غیرفعال شد!"
+            await safe_answer_callback(callback, toast)
+            return
+
+        if action == "mrgl":
+            text, kb = await render_morning_topics(chat_id, page=page)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback)
+            return
+
+        if action == "mrgs":
+            try:
+                tid = int(arg)
+            except ValueError:
+                await safe_answer_callback(callback, "شناسه تاپیک معتبر نیست 😅", show_alert=True)
+                return
+            await repository.set_morning_topic(chat_id, tid, auto_enable_if_unset=True)
+            text, kb = await render_morning_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback, "📌 تاپیک مقصد صبح‌بخیر ذخیره شد! ✅")
+            return
+
+        if action == "mrgtst":
+            morning_cfg = await repository.ensure_morning_config(chat_id)
+            if morning_cfg.get("thread_id") is None:
+                await safe_answer_callback(
+                    callback,
+                    "⚠️ اول از «📌 انتخاب تاپیک مقصد» تاپیک مورد نظرت رو انتخاب کن!",
+                    show_alert=True,
+                )
+                return
+            ok, details = await send_morning_greeting_to_group(bot, chat_id, is_test=True)
+            text, kb = await render_morning_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            prefix = "✅ " if ok else "❌ "
+            await safe_answer_callback(callback, f"{prefix}{details}", show_alert=True)
             return
 
     except Exception as exc:

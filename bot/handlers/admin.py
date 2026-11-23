@@ -14,6 +14,7 @@ from bot.scheduler.jobs import (
     run_summary_for_group,
     run_summary_for_topic,
 )
+from bot.services.morning_service import send_morning_greeting_to_group
 from bot.utils.dates import (
     format_persian_date,
     format_persian_short_date,
@@ -456,6 +457,92 @@ async def cmd_summarize_all(message: Message) -> None:
                     pass
 
 
+@router.message(Command("set_morning_topic"), AdminFilter())
+async def cmd_set_morning_topic(message: Message) -> None:
+    """Set current topic or given topic link/ID as destination for daily 05:01 morning greeting."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    chat_id = message.chat.id
+    args = (message.text or "").split()[1:]
+
+    if args:
+        raw_arg = args[0].strip()
+        _, thread_id, error = parse_topic_link(raw_arg, current_chat_id=chat_id)
+        if error or thread_id is None:
+            await send_topic_reply(
+                message,
+                f"⚠️ <b>خطا در تنظیم تاپیک صبح‌بخیر:</b>\n\n{escape_html(error or 'شناسه تاپیک معتبر نیست.')}",
+            )
+            return
+    else:
+        thread_id = resolve_thread_id(message)
+
+    topic_name = await repository.get_topic_name(chat_id, thread_id)
+    if not topic_name:
+        topic_name = "عمومی" if thread_id == 1 else f"تاپیک {thread_id}"
+
+    cfg = await repository.set_morning_topic(chat_id, thread_id, auto_enable_if_unset=True)
+    status_note = "فعال ✅" if int(cfg.get("enabled", 0)) == 1 else "غیرفعال 🔴"
+    settings = get_settings()
+    await send_topic_reply(
+        message,
+        f"☀️ تاپیک مقصد پیام صبح‌بخیر روزانه هیلز (ساعت <code>{settings.MORNING_GREETING_HOUR:02d}:{settings.MORNING_GREETING_MINUTE:02d}</code> تهران) "
+        f"روی <b>«{escape_html(topic_name)}»</b> (شناسه: <code>{thread_id}</code>) تنظیم شد.\n"
+        f"وضعیت فعلی: <b>{status_note}</b>\n\n"
+        "برای ارسال تستی فوری می‌توانید دستور <code>/morning_test</code> یا دکمه تست در <code>/panel</code> را بزنید.",
+    )
+
+
+@router.message(Command("morning_on"), AdminFilter())
+async def cmd_morning_on(message: Message) -> None:
+    """Enable daily 05:01 morning greeting for this group."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    chat_id = message.chat.id
+    cfg = await repository.ensure_morning_config(chat_id)
+    if cfg.get("thread_id") is None:
+        await send_topic_reply(
+            message,
+            "⚠️ هنوز تاپیک مقصد برای پیام صبح‌بخیر مشخص نشده است.\n"
+            "ابتدا داخل تاپیک دلخواه دستور <code>/set_morning_topic</code> را بزنید یا از <code>/panel</code> انتخاب کنید.",
+        )
+        return
+
+    await repository.set_morning_enabled(chat_id, 1)
+    await send_topic_reply(message, "🟢 ارسال روزانه پیام صبح‌بخیر هیلز برای این گروه <b>فعال</b> شد.")
+
+
+@router.message(Command("morning_off"), AdminFilter())
+async def cmd_morning_off(message: Message) -> None:
+    """Disable daily 05:01 morning greeting for this group."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    await repository.set_morning_enabled(message.chat.id, 0)
+    await send_topic_reply(message, "🔴 ارسال روزانه پیام صبح‌بخیر هیلز برای این گروه <b>غیرفعال</b> شد.")
+
+
+@router.message(Command("morning_test"), AdminFilter())
+async def cmd_morning_test(message: Message) -> None:
+    """Admin-only test trigger sending a real morning greeting into the configured topic."""
+    if not message.chat or not message.bot:
+        return
+    await try_delete_command(message)
+
+    ok, details = await send_morning_greeting_to_group(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        is_test=True,
+    )
+    if not ok:
+        await send_topic_reply(message, f"⚠️ {escape_html(details)}")
+
+
 @router.message(Command("help"), AdminFilter())
 async def cmd_help(message: Message) -> None:
     """Show Persian help with all available admin commands."""
@@ -477,6 +564,9 @@ async def cmd_help(message: Message) -> None:
         "🔹 <code>/summary_off</code> — غیرفعال‌سازی سیستم خلاصه‌سازی برای گروه\n"
         "🔹 <code>/summarize_now [keep]</code> — اجرای دستی خلاصه‌سازی برای تاپیک فعلی\n"
         "🔹 <code>/summarize_all [keep]</code> — اجرای دستی خلاصه‌سازی برای همه تاپیک‌های گروه\n"
+        "🔹 <code>/set_morning_topic [لینک|شناسه]</code> — تعیین تاپیک مقصد پیام صبح‌بخیر روزانه هیلز (۰۵:۰۱)\n"
+        "🔹 <code>/morning_on</code> / <code>/morning_off</code> — فعال یا غیرفعال کردن پیام صبح‌بخیر روزانه\n"
+        "🔹 <code>/morning_test</code> — ارسال تستی پیام صبح‌بخیر در تاپیک مقصد (مخصوص ادمین)\n"
         "🔹 <code>/help</code> — نمایش همین پیام راهنما\n\n"
         "⏱ <b>تایمر و یادآور (برای همه اعضا):</b> هر عضو گروه می‌تواند با دستور <code>/timer</code> (یا میانبر <code>/timer 30m متن</code>) تایمر دقیقه‌ای/ساعتی یا تاریخی تنظیم کند تا رأس زمان مقرر در همان تاپیک و پیوی ربات به او یادآوری شود.\n\n"
         "🎛 <b>پنل مدیریتی در پیوی:</b> مدیران می‌توانند در پیوی ربات با دستور <code>/panel</code> تمام تنظیمات، تاپیک‌ها، پیش‌نمایش و اجرای دستی را به صورت دکمه‌ای مدیریت کنند.\n\n"

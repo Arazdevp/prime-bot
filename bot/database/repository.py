@@ -1075,3 +1075,225 @@ async def delete_old_completed_timers(retention_days: int = 30) -> int:
         )
         await conn.commit()
         return cursor.rowcount
+
+
+# ---------------- Morning Greetings Table Operations ----------------
+
+_MORNING_SELECT_COLS = (
+    "chat_id, enabled, thread_id, last_sent_day, deck_json, last_index, updated_at"
+)
+
+
+async def get_morning_config(chat_id: int) -> dict[str, Any] | None:
+    """Read-only lookup of morning greeting configuration for a group."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_MORNING_SELECT_COLS} FROM morning_greetings WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def ensure_morning_config(chat_id: int) -> dict[str, Any]:
+    """Retrieve morning greeting configuration for chat_id, inserting disabled defaults if absent."""
+    existing = await get_morning_config(chat_id)
+    if existing is not None:
+        return existing
+
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            f"SELECT {_MORNING_SELECT_COLS} FROM morning_greetings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return dict(row)
+
+        await conn.execute(
+            """
+            INSERT INTO morning_greetings (
+                chat_id, enabled, thread_id, last_sent_day, deck_json, last_index, updated_at
+            ) VALUES (?, 0, NULL, NULL, NULL, NULL, ?);
+            """,
+            (chat_id, now_iso),
+        )
+        await conn.commit()
+
+    return {
+        "chat_id": chat_id,
+        "enabled": 0,
+        "thread_id": None,
+        "last_sent_day": None,
+        "deck_json": None,
+        "last_index": None,
+        "updated_at": now_iso,
+    }
+
+
+async def set_morning_topic(
+    chat_id: int,
+    thread_id: int,
+    *,
+    auto_enable_if_unset: bool = True,
+) -> dict[str, Any]:
+    """Set target forum topic thread_id for daily morning greetings (auto-enables on first setup if requested)."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    safe_tid = int(thread_id) if thread_id and int(thread_id) > 0 else 1
+
+    async with lock:
+        cursor = await conn.execute(
+            f"SELECT {_MORNING_SELECT_COLS} FROM morning_greetings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            new_enabled = 1 if auto_enable_if_unset else 0
+            await conn.execute(
+                """
+                INSERT INTO morning_greetings (
+                    chat_id, enabled, thread_id, last_sent_day, deck_json, last_index, updated_at
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, ?);
+                """,
+                (chat_id, new_enabled, safe_tid, now_iso),
+            )
+        else:
+            prev_tid = row["thread_id"]
+            prev_enabled = int(row["enabled"])
+            new_enabled = 1 if (auto_enable_if_unset and prev_tid is None) else prev_enabled
+            await conn.execute(
+                """
+                UPDATE morning_greetings
+                SET thread_id = ?, enabled = ?, updated_at = ?
+                WHERE chat_id = ?;
+                """,
+                (safe_tid, new_enabled, now_iso, chat_id),
+            )
+        await conn.commit()
+
+        fetch = await conn.execute(
+            f"SELECT {_MORNING_SELECT_COLS} FROM morning_greetings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        updated = await fetch.fetchone()
+    return dict(updated)
+
+
+async def set_morning_enabled(chat_id: int, enabled: int) -> None:
+    """Enable or disable daily morning greeting for chat_id."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    flag = 1 if enabled else 0
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO morning_greetings (
+                chat_id, enabled, thread_id, last_sent_day, deck_json, last_index, updated_at
+            ) VALUES (?, ?, NULL, NULL, NULL, NULL, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at;
+            """,
+            (chat_id, flag, now_iso),
+        )
+        await conn.commit()
+
+
+async def list_enabled_morning_groups() -> list[dict[str, Any]]:
+    """List all active groups with morning greetings enabled and a target topic configured."""
+    conn = get_db()
+    cursor = await conn.execute(
+        """
+        SELECT mg.chat_id, mg.enabled, mg.thread_id, mg.last_sent_day,
+               mg.deck_json, mg.last_index, mg.updated_at
+        FROM morning_greetings mg
+        LEFT JOIN known_groups kg ON kg.chat_id = mg.chat_id
+        WHERE mg.enabled = 1 AND mg.thread_id IS NOT NULL AND kg.left_at IS NULL
+        ORDER BY mg.chat_id ASC;
+        """
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def claim_morning_greeting_draw(
+    chat_id: int,
+    *,
+    today_day_str: str,
+    is_test: bool = False,
+) -> tuple[int, str | None, int] | None:
+    """Atomically draw the next non-repeating template index from SQLite shuffle-bag.
+
+    For automatic runs (is_test=False), enforces at-most-once delivery per today_day_str by
+    checking and updating last_sent_day inside the write lock. Returns None if already sent today.
+    For test runs (is_test=True), draws a fresh index from the deck without modifying last_sent_day.
+
+    Returns (chosen_index, previous_last_sent_day, remaining_in_deck).
+    """
+    from bot.texts.morning_texts import draw_next_greeting_index
+
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    async with lock:
+        cursor = await conn.execute(
+            f"SELECT {_MORNING_SELECT_COLS} FROM morning_greetings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        prev_last_day = row["last_sent_day"]
+        if not is_test and prev_last_day == today_day_str:
+            return None
+
+        raw_deck = row["deck_json"]
+        deck: list[int] | None = None
+        if raw_deck:
+            try:
+                parsed = json.loads(raw_deck)
+                if isinstance(parsed, list):
+                    deck = parsed
+            except Exception:
+                deck = None
+
+        last_idx = row["last_index"]
+        chosen_idx, remaining_deck = draw_next_greeting_index(
+            deck,
+            int(last_idx) if last_idx is not None else None,
+        )
+        new_deck_json = json.dumps(remaining_deck)
+        new_last_day = prev_last_day if is_test else today_day_str
+
+        await conn.execute(
+            """
+            UPDATE morning_greetings
+            SET last_sent_day = ?, deck_json = ?, last_index = ?, updated_at = ?
+            WHERE chat_id = ?;
+            """,
+            (new_last_day, new_deck_json, chosen_idx, now_iso, chat_id),
+        )
+        await conn.commit()
+
+    return chosen_idx, prev_last_day, len(remaining_deck)
+
+
+async def rollback_morning_last_sent_day(chat_id: int, previous_day: str | None) -> None:
+    """Restore last_sent_day if an automatic morning greeting delivery failed."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with lock:
+        await conn.execute(
+            "UPDATE morning_greetings SET last_sent_day = ?, updated_at = ? WHERE chat_id = ?;",
+            (previous_day, now_iso, chat_id),
+        )
+        await conn.commit()

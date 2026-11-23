@@ -17,6 +17,7 @@ from bot.handlers import admin, listener, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
 from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
 from bot.services.llm_client import close_llm_client
+from bot.services.morning_service import run_morning_catchup_if_needed
 from bot.services.timer_service import rehydrate_active_timers, set_bot_username
 from bot.utils.dates import format_persian_date, get_tehran_now
 from bot.utils.html_utils import escape_html
@@ -166,6 +167,9 @@ async def main() -> None:
 
     # Check if today's scheduled nightly run was missed and run catch-up
     _spawn_background_task(run_catchup_if_needed(bot), "run_catchup_if_needed")
+
+    # Check if today's morning greeting was missed (only within morning window)
+    _spawn_background_task(run_morning_catchup_if_needed(bot), "run_morning_catchup_if_needed")
 
     # 5. Best-effort startup notification to admins
     await notify_admins_startup(bot)

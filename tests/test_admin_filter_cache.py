@@ -46,8 +46,8 @@ def test_router_level_filter_isolation():
     assert ForumGroupFilter in observer_filter_types
     assert AdminFilter not in observer_filter_types
 
-    # And verify all 13 command handlers on admin_router have AdminFilter
-    assert len(admin_router.message.handlers) == 13
+    # And verify all 17 command handlers on admin_router have AdminFilter
+    assert len(admin_router.message.handlers) == 17
     for handler in admin_router.message.handlers:
         handler_filter_types = [
             type(f.callback if hasattr(f, "callback") else f)

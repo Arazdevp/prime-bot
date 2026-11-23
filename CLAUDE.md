@@ -61,9 +61,11 @@ tg-daily-summarizer/
 │   ├── middlewares/
 │   │   └── throttle.py      # PrivateThrottleMiddleware (1 update/sec per user in private chat)
 │   ├── texts/
-│   │   └── private_texts.py # Casual Persian message pools & non-repeating pick() helper
+│   │   ├── private_texts.py # Casual Persian message pools & non-repeating pick() helper
+│   │   └── morning_texts.py # 100 unique Hills/Prime morning greetings, day counter & shuffle-bag draw
 │   ├── services/
 │   │   ├── access.py        # Private role resolution, group membership check & shared AdminFilter TTL cache
+│   │   ├── morning_service.py # Daily 05:01 Hills morning greeting job, catch-up & admin test sender
 │   │   ├── timer_service.py # APScheduler DateTrigger scheduling, rehydration, atomic claim & group+DM firing
 │   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (OpenRouter / OpenAI-compatible)
 │   │   ├── summarizer.py    # Transcript formatting, map-reduce chunking, Telegram HTML sanitize

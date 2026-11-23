@@ -16,6 +16,7 @@ from bot.config import get_settings
 from bot.database import repository
 from bot.database.db import get_db, get_write_lock
 from bot.services.llm_client import BaseLLMClient
+from bot.services.morning_service import morning_greeting_job
 from bot.services.publisher import send_summary, send_summary_parts
 from bot.services.summarizer import summarize_topic_messages
 from bot.services.timer_service import sweep_due_timers
@@ -661,6 +662,22 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="timer_sweep",
         name="User Timers Due Sweep",
         misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 4. Daily Hills/Prime morning greeting at 05:01 Tehran
+    scheduler.add_job(
+        morning_greeting_job,
+        trigger=CronTrigger(
+            hour=settings.MORNING_GREETING_HOUR,
+            minute=settings.MORNING_GREETING_MINUTE,
+            timezone=tz,
+        ),
+        args=[bot],
+        id="daily_morning_greeting",
+        name="Daily Hills Morning Greeting",
+        misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )

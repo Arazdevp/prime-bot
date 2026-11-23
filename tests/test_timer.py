@@ -329,7 +329,7 @@ async def test_migration_v3_to_v4_creates_timers_and_dm_started_column(tmp_path:
         await init_db(str(db_file))
         db = get_db()
         cur = await db.execute("PRAGMA user_version;")
-        assert (await cur.fetchone())[0] == 4
+        assert (await cur.fetchone())[0] >= 4
 
         user = await repository.get_bot_user(7001)
         assert user is not None

@@ -109,6 +109,16 @@ CREATE INDEX IF NOT EXISTS idx_timers_status_fire_at
 
 CREATE INDEX IF NOT EXISTS idx_timers_user_status
     ON timers(user_id, status, fire_at);
+
+CREATE TABLE IF NOT EXISTS morning_greetings (
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    thread_id INTEGER,
+    last_sent_day TEXT,
+    deck_json TEXT,
+    last_index INTEGER,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -225,6 +235,21 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
                 "ALTER TABLE bot_users ADD COLUMN dm_started INTEGER NOT NULL DEFAULT 0;"
             )
         await conn.execute("PRAGMA user_version = 4;")
+        await conn.commit()
+
+    if current_version < 5:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS morning_greetings (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                thread_id INTEGER,
+                last_sent_day TEXT,
+                deck_json TEXT,
+                last_index INTEGER,
+                updated_at TEXT NOT NULL
+            );
+        """)
+        await conn.execute("PRAGMA user_version = 5;")
         await conn.commit()
 
 

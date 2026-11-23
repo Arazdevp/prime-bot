@@ -1,5 +1,6 @@
 """Application configuration using pydantic-settings."""
 
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -168,6 +169,40 @@ class Settings(BaseSettings):
         ge=1,
         description="Days to retain completed/cancelled timers before purge",
     )
+
+    # Daily Morning Greeting (Hills / Prime)
+    MORNING_GREETING_HOUR: int = Field(
+        default=5,
+        ge=0,
+        le=23,
+        description="Hour (0-23) in TIMEZONE to send daily morning greeting",
+    )
+    MORNING_GREETING_MINUTE: int = Field(
+        default=1,
+        ge=0,
+        le=59,
+        description="Minute (0-59) in TIMEZONE to send daily morning greeting",
+    )
+    HILLS_START_DATE: str = Field(
+        default="2026-08-28",
+        description="ISO YYYY-MM-DD start date for Hills day counter (Day 1)",
+    )
+    MORNING_CATCHUP_END_HOUR: int = Field(
+        default=11,
+        ge=1,
+        le=23,
+        description="Latest local hour to send a missed morning greeting catch-up on startup",
+    )
+
+    @field_validator("HILLS_START_DATE", mode="before")
+    @classmethod
+    def validate_hills_start_date(cls, value: Any) -> str:
+        """Ensure HILLS_START_DATE is a valid ISO YYYY-MM-DD date string."""
+        raw = str(value).strip() if value is not None else "2026-08-28"
+        if not raw:
+            return "2026-08-28"
+        date.fromisoformat(raw)
+        return raw
 
     @field_validator("OWNER_NAMES", mode="before")
     @classmethod
