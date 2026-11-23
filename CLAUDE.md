@@ -137,3 +137,35 @@ tg-daily-summarizer/
   Telegram is filtered in your network. Set `PROXY_URL=socks5://127.0.0.1:PORT` (v2ray / clash / sing-box) in `.env`.
 - **`RuntimeError: Polling is not started` on shutdown**
   Handled gracefully in `bot/main.py` inside the `finally` block.
+
+---
+
+## 7. Hills & Prime Community Context
+
+This bot powers the **Hills Prime network** community Telegram supergroup (part of the **Hills Project / پروژه هیلز**, founded by **Vitto & Parsa**, also known as «مدرسه تولید محتوای ایران» at `vittoparsa.com` and `panel.vittoparsa.com`).
+
+### Platform & Brand Baseline
+- **Domain Focus:** Content creation (YouTube, Instagram, LinkedIn), personal branding, content marketing, structured learning roadmaps, online monetization, and peer accountability.
+- **Bot Identity & Defaults:**
+  - `OWNER_NAMES` defaults to `آرش و پیت` (`bot/config.py`, `bot/texts/private_texts.py`).
+  - `HILLS_START_DATE` defaults to `2026-08-28` (Day 1 of Hills), used by `compute_hills_day` (`bot/texts/morning_texts.py`) for the automated `05:01` Asia/Tehran morning greeting (`bot/services/morning_service.py`) across 100 shuffle-bag templates.
+
+### Hills Prime Network Topic Map (~199 members)
+Observed forum supergroup structure and member behavior:
+1. **`Announcements | اطلاع رسانی`** (locked) — Official announcements from Hills/Prime management.
+2. **`Need to know | نقشه راه`** (locked) — Onboarding rules, pinned references, and roadmap navigation.
+3. **`The Hub | گفتگوی آزاد`** — High-volume daily general chat (hundreds of messages/day); primary driver for `CHUNK_MAX_CHARS` map-reduce summarization.
+4. **`Muzik | موزیک`** — Members share music tracks and listening recommendations. *(Note: `bot/handlers/listener.py` currently skips media/audio without captions.)*
+5. **`Wins | بُردها`** — Members share daily progress and milestone wins.
+6. **`General`** (locked) — General/system thread.
+7. **`Deep Work | دیپ‌ورک`** — Live co-working / focus session coordination (e.g., members posting session start times).
+8. **`خلاصه اخبار`** (closed/locked) — Dedicated read-only aggregate destination for automated bot summaries.
+9. **`Q&A | پرسش و پاسخ`** — Member questions and peer solutions.
+10. **`Daily dose | آموزش روزانه`** — Daily educational clips and bite-sized lessons.
+11. **`Goals & Challenges | چالش‌ها و اهداف`** — Multi-day personal accountability and streak challenges (e.g., `"روزه ۹ از چالش 37 روزه"`).
+12. **`Ideaz | ایده ها`** — Member suggestions for improving the Hills platform (e.g., adding personal notes beneath course videos).
+
+### Current Integration Boundaries & Next-Step Context
+- **Ephemeral Message Lifecycle:** `run_summary_for_topic` (`bot/scheduler/jobs.py`) deletes source messages and the completed `summaries` row immediately after all summary parts are delivered (`mark_summarized=True`), so the bot currently has no persistent multi-day summary/Q&A/Wins archive.
+- **Regular Member Surface:** Non-admin group members currently only access `/timer` in private chat (`bot/handlers/private.py`).
+- **Portal (`panel.vittoparsa.com`) Pending Live Inspection:** Detailed course catalog, roadmap structure, and internal web panel features from `panel.vittoparsa.com` have **not** yet been inspected directly (awaiting live Chrome DevTools MCP connection) and should be documented here once reviewed.
