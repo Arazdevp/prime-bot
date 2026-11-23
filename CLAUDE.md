@@ -168,4 +168,34 @@ Observed forum supergroup structure and member behavior:
 ### Current Integration Boundaries & Next-Step Context
 - **Ephemeral Message Lifecycle:** `run_summary_for_topic` (`bot/scheduler/jobs.py`) deletes source messages and the completed `summaries` row immediately after all summary parts are delivered (`mark_summarized=True`), so the bot currently has no persistent multi-day summary/Q&A/Wins archive.
 - **Regular Member Surface:** Non-admin group members currently only access `/timer` in private chat (`bot/handlers/private.py`).
-- **Portal (`panel.vittoparsa.com`) Pending Live Inspection:** Detailed course catalog, roadmap structure, and internal web panel features from `panel.vittoparsa.com` have **not** yet been inspected directly (awaiting live Chrome DevTools MCP connection) and should be documented here once reviewed.
+
+### Web Panel Architecture (`panel.vittoparsa.com`, inspected 2026-11-23)
+The web platform is a Next.js Persian SaaS portal (`پنل هیلز`) tightly integrated with Telegram community houses and gamified progression:
+
+- **Navigation & Core Sections:**
+  - **`اطلس` (`/members`)**: Searchable member & team directory categorized by role/profession (`سرمایه‌گذار`, `مدیریت`, `کرو`, `استف`, `مادریتورها`, `دستیارها`, `کاپیتان‌ها`, `کوچ‌ها`, `اعضا`) for creator/editor/designer networking.
+  - **`داشبورد` (`/dashboard`)**: Daily Quests (`ماموریت‌های امروز`, 3 tasks resetting at `00:00` Tehran for `+30` Clout: 10m course watch, 1 quiz, 1 template), Season Rank progress, Leaderboard position, Weekly Streak with Streak Freeze (`فریز`), closest achievement, and an upcoming **`همراهِ هیلز`** (`به‌زودی`) widget.
+  - **`پروژه هیلز` (`/course`)**: Structured curriculum with 3 shelves (per `v1.1.1` release notes):
+    1. *Mentorship (10 Chapters):* `Ch.1 Introduction`, `Ch.2 Foundation`, `Ch.3 Mentality`, `Ch.4 YouTube basics`, `Ch.5 Algorithm`, `Ch.6 Discover a niche`, `Ch.7 Branding`, `Ch.8 Making Video`, `Ch.9 Title and Thumbnail`, `Ch.10 مدیریت تیم`.
+    2. *Masterclasses (7 active + 5 coming soon):* Active: `فریلنسینگ ۱۰۱`, `ضبط و production`, `فروش و مذاکره`, `ورود به دنیای ادیت`, `پروداکشن مستری و ضبط`, `پرسونال برندینگ`, `اینستاگرام`. Coming soon: `نبوغ و الهام`, `سناریونویسی`, `freelancing content`, `Biohacking`, `روایت و قصه گویی`.
+    3. *Mentorship live sessions shelf.*
+    - Uses Video.js v10 player with moving security watermark, resume playback, >=70% genuine watch verification, and optional/mandatory **end-of-episode quizzes**.
+  - **`وبینارها` (`/webinars`)**: Live Q&A/mentorship webinars and archived recordings.
+  - **`کوییز‌ها` (`/quiz`)**: Monthly **Season Rank Quiz** (`رنک‌کوییزِ سیزن`, 20 questions / 15 min, once per season) plus 3 difficulty tiers (`آسون`, `متوسط`, `سخت`) per chapter and masterclass (wrong answers deduct Season Clout).
+  - **`تمپلیت‌ها` (`/articles`) & Prompts Library**: 15 downloadable/previewable PDF templates mapped to chapters/masterclasses, plus a categorized AI prompts library (`بخش پرامپت‌ها`, `v1.1.1`) for Claude/GPT workflows.
+  - **`نظرسنجی` (`/surveys`) & `اعلان‌ها` (`/notifications`)**: Platform polls (`+15` Clout) and announcement popups.
+  - **`با ما کار کن` (`/collaborate`)**: Job/volunteer application posts & form (`ادمین`, `تدوین`, `طراحی`, `تولیدِ محتوا`, `برنامه‌نویسی`, `سایر`), including Captain and Moderator roles.
+  - **`اشتراک` (`/membership`)**: Tiers: `دمو` (free, Atlas + Ch.1), `ادونسد` (6,900,000 Toman/year, full access), `پروفشنال` (`به‌زودی`).
+
+- **8 Community House Squads (`/community` & `/leaderboard`):**
+  - Hills splits community members across **8 competing Telegram Houses**, each led by a Captain and Moderator: **`Prime`** (~199 TG / ~301 leaderboard members), **`Legacy`**, **`Vanguard`** (`Vangaurd` on leaderboard), **`Davinci`**, **`Vision`**, **`Aventra`**, **`Infinity`**, **`Dynasty`**.
+  - Enrollment runs via `/community` after completing personal & Atlas profiles; `/community` explicitly notes Telegram bot presence (*«ربات توی همین گروه می‌بینتت»*).
+
+- **Gamification Mechanics (`کلاوت` / Clout, Ranks, Streaks, Group Scoring):**
+  - **Dual Clout System (`/guide/clout-level-rank`):**
+    - *Total Clout (permanent Level):* Never resets; Level `L` requires `50 × L × (L − 1)` total Clout.
+    - *Season Clout (`SC`, resets every 1st of Jalali month):* Drives monthly Season Ranks — `روکی` (0), `کریتور` (300), `وایرال` (1,200), `آیکون` (2,700), `لجند` (5,000), `گوت` (8,500) — unlocking permanent profile banners/borders. Wrong quiz answers deduct only `SC`.
+  - **Clout Sources:** Daily Quests (`30`), Quiz answers (`6`/`10`/`16`), Episode >=70% watch (`20`), Full chapter (`100`), Optional Weekly Challenge (`100`), Webinar registration (`10`), Survey (`15`), Template download (`5`), **Telegram community participation (`3` Clout per interaction, max `5`/day = `15`/day)**, Accepted collaboration (`150`), Streak milestones (`7d: 50`, `30d: 200`, `100d: 600`, `365d: 2000`).
+  - **Group Leaderboard Formula (`/guide/leaderboards`):**
+    `Group Score = (Sum of Members' Season Clout ÷ Member Count) × Participation`, where `Participation` = fraction of members active >=5 days in the season (`>=2` days during days 1–5). Inactive members directly dilute their House's score (e.g., Prime held Rank #1 at `214` per-capita SC with only `13%` participation on 2026-11-23).
+  - **Achievements (`/achievements`):** 29 badges across 6 categories (`یادگیری`, `دقت`, `استمرار`, `مشارکت`, `سیزن`, `داخلِ هیلز` — including `Insider`, `Hired`, `Shipped`, `Captain`, `Mic Drop`).
