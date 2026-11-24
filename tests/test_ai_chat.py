@@ -13,10 +13,12 @@ from bot.database.db import close_db, init_db
 from bot.handlers.ai_chat import (
     AiChatStates,
     AiChatTriggerFilter,
+    _format_safe_llm_error,
     cmd_manage_ai,
     handle_ai_chat_message,
     on_custom_prompt_input,
     on_manage_ai_callback,
+    render_manage_ai_panel,
 )
 from bot.keyboards.ai_chat import AiChatCB
 from bot.services.ai_chat_service import (
@@ -388,7 +390,9 @@ async def test_generate_ai_chat_reply_history_prompt_override_and_handler(tmp_pa
 
         with patch("bot.services.ai_chat_service.get_settings", return_value=cfg), patch(
             "bot.services.ai_chat_service.get_ai_chat_client", return_value=mock_client
-        ), patch("bot.handlers.ai_chat.get_settings", return_value=cfg):
+        ), patch("bot.handlers.ai_chat.get_settings", return_value=cfg), patch(
+            "bot.services.access.get_settings", return_value=cfg
+        ):
             # Turn 1 in group topic 3
             r1 = await generate_ai_chat_reply(
                 chat_id=-100555,
@@ -447,14 +451,33 @@ async def test_generate_ai_chat_reply_history_prompt_override_and_handler(tmp_pa
             assert "@PrimeTestBot" not in recorded_calls[-1][1][-1]["text"]
             assert "یه سر بزن اینجا" in recorded_calls[-1][1][-1]["text"]
 
-            # LLMError handled gracefully without crashing
-            mock_client.generate_chat = AsyncMock(side_effect=LLMError("API down", status_code=503, is_retryable=False))
+            # LLMError handled gracefully without crashing, shows safe owner diagnostics, and keeps count clean
+            clear_conversation_history()
+            mock_client.generate_chat = AsyncMock(
+                side_effect=LLMError(
+                    'Gemini API returned status 400: {"error":{"message":"API key AQ.Secret123456 not valid"}}',
+                    status_code=400,
+                    body_excerpt='{"error":{"message":"API key AQ.Secret123456 not valid"}}',
+                    is_retryable=False,
+                )
+            )
             pv_msg = _make_message(user_id=11111, text="سلام", chat_type="private")
             await handle_ai_chat_message(pv_msg, bot)
-            assert "وصل نشدم" in pv_msg.answer.call_args.kwargs["text"]
-
-            assert clear_conversation_history() >= 1
+            err_reply = pv_msg.answer.call_args.kwargs["text"]
+            assert "وصل نشدم" in err_reply
+            assert "[HTTP 400]" in err_reply
+            assert "AQ.Secret123456" not in err_reply
+            assert "***" in err_reply
             assert count_active_conversations() == 0
+
+            # Panel shows masked last-4 key suffix only
+            panel_text, _ = await render_manage_ai_panel(owner_id=11111, bot_username="PrimeTestBot")
+            assert "AI_CHAT_API_KEY: ...ests" in panel_text
+            assert "AQ.TestKeyForUnitTests" not in panel_text
+
+            # Helper handles network errors cleanly
+            net_msg = _format_safe_llm_error(LLMError("Network error connecting to Gemini API: timed out"))
+            assert net_msg.startswith("[Network] ")
     finally:
         await close_db()
         reset_ai_chat_state()

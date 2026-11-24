@@ -1,6 +1,8 @@
 """Interactive AI chat handlers and /manage_ai owner-only control panel."""
 
+import json
 import logging
+import re
 import time
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -93,6 +95,52 @@ async def _send_in_context(
     )
 
 
+_SECRET_REDACT_RE = re.compile(r"(?:AQ\.[A-Za-z0-9._-]+|AIza[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)")
+
+
+def _format_key_status(settings: object) -> str:
+    """Format masked API key source label (last 4 chars only, never exposing secret)."""
+    chat_key = (getattr(settings, "AI_CHAT_API_KEY", None) or "").strip()
+    if chat_key:
+        suffix = chat_key[-4:] if len(chat_key) >= 4 else "****"
+        return f"✅ متصل (<code>AI_CHAT_API_KEY: ...{escape_html(suffix)}</code>)"
+
+    gem_key = (getattr(settings, "GEMINI_API_KEY", None) or "").strip()
+    if gem_key:
+        suffix = gem_key[-4:] if len(gem_key) >= 4 else "****"
+        return f"⚠️ از کلید پیش‌فرض (<code>GEMINI_API_KEY: ...{escape_html(suffix)}</code>)"
+
+    return "❌ کلید API تنظیم نشده"
+
+
+def _format_safe_llm_error(exc: LLMError) -> str:
+    """Extract concise, secret-redacted diagnostic summary for the bot owner."""
+    detail = ""
+    for candidate in (getattr(exc, "body_excerpt", None), getattr(exc, "message", None)):
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        raw = candidate.strip()
+        json_start = raw.find("{")
+        if json_start != -1:
+            try:
+                parsed = json.loads(raw[json_start:])
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict) and isinstance(err.get("message"), str):
+                        detail = err["message"].strip()
+                        break
+            except Exception:
+                pass
+        if not detail:
+            detail = raw
+
+    detail = _SECRET_REDACT_RE.sub("***", detail)
+    detail = re.sub(r"\s+", " ", detail).strip()
+    prefix = f"[HTTP {exc.status_code}] " if exc.status_code is not None else "[Network] "
+    combined = f"{prefix}{detail}" if detail else f"{prefix}Unknown error"
+    return combined[:240]
+
+
 async def render_manage_ai_panel(
     owner_id: int,
     bot_username: str | None = None,
@@ -101,11 +149,10 @@ async def render_manage_ai_panel(
     settings = get_settings()
     enabled = is_ai_chat_enabled_cached()
     custom_prompt = await repository.get_ai_chat_custom_prompt()
-    has_key = bool((settings.AI_CHAT_API_KEY or settings.GEMINI_API_KEY or "").strip())
     conv_count = count_active_conversations()
 
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
-    key_badge = "✅ متصل" if has_key else "⚠️ کلید API تنظیم نشده"
+    key_badge = _format_key_status(settings)
     prompt_badge = "✏️ سفارشی" if custom_prompt else "🇮🇷 پیش‌فرض (لحن طبیعی ایرانی)"
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
 
@@ -391,10 +438,13 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         )
         return
     except LLMError as exc:
-        logger.warning("AI chat LLMError for chat %s: %s", chat.id, exc)
+        logger.warning("AI chat LLMError for chat %s [status=%s]: %s", chat.id, exc.status_code, exc)
+        err_text = "الان به سرویس Gemini وصل نشدم 😅 یه چند لحظه دیگه دوباره پیام بده."
+        if is_global_admin(user.id):
+            err_text += f"\n\n🔍 <b>علت خطا:</b> <code>{escape_html(_format_safe_llm_error(exc))}</code>"
         await _send_in_context(
             message,
-            "الان به سرویس Gemini وصل نشدم 😅 یه چند لحظه دیگه دوباره پیام بده.",
+            err_text,
             bot=bot,
         )
         return

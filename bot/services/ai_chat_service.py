@@ -203,9 +203,7 @@ async def generate_ai_chat_reply(
         now = time.monotonic()
         _prune_stale_conversations(now)
         state = _conversations.get(key)
-        if state is None:
-            state = _ConversationState(messages=[], updated_at=now)
-            _conversations[key] = state
+        existing_messages = state.messages if state is not None else []
 
         prompt_input = user_text.strip()
         if reply_context and reply_context.strip():
@@ -213,7 +211,7 @@ async def generate_ai_chat_reply(
 
         history_limit = max(2, int(settings.AI_CHAT_HISTORY_LIMIT))
         pending_turns = _normalize_turns(
-            [*state.messages, {"role": "user", "text": prompt_input}],
+            [*existing_messages, {"role": "user", "text": prompt_input}],
             max_turns=history_limit,
         )
 
@@ -267,9 +265,13 @@ async def generate_ai_chat_reply(
         if not sanitized:
             sanitized = escape_html(raw_reply.strip())
 
+        if state is None:
+            state = _ConversationState(messages=[], updated_at=now)
+            _conversations[key] = state
+
         state.messages = _normalize_turns(
             [
-                *state.messages,
+                *existing_messages,
                 {"role": "user", "text": prompt_input},
                 {"role": "model", "text": sanitized},
             ],
