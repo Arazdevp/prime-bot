@@ -14,7 +14,7 @@ from aiogram.exceptions import (
 )
 from bot.config import get_settings
 from bot.utils.general_topic import to_send_thread_id
-from bot.utils.text_split import smart_split
+from bot.utils.text_split import TELEGRAM_MESSAGE_MAX_CHARS, smart_split
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +171,7 @@ async def send_summary(
 ) -> bool:
     """Send summary text safely to Telegram chat/topic or an explicit destination override.
 
-    - Splits into chunks <= 4000 chars while preserving HTML balance.
+    - Splits into chunks <= 4096 rendered Telegram characters while preserving HTML balance.
     - Sends each part with HTML parse mode.
     - If Telegram returns parse entity error, automatically resends as plain text.
     - Handles flood limits (TelegramRetryAfter) with sleep.
@@ -180,7 +180,7 @@ async def send_summary(
     - Returns True only if all parts were successfully delivered.
     """
     _ = dry_run  # Accepted for caller symmetry; send_summary never writes to the database
-    parts = smart_split(text, limit=4000)
+    parts = smart_split(text, limit=TELEGRAM_MESSAGE_MAX_CHARS, count_rendered=True)
     if not parts:
         return False
 

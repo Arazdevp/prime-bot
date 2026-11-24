@@ -2,7 +2,7 @@
 
 import re
 import pytest
-from bot.utils.text_split import smart_split
+from bot.utils.text_split import TELEGRAM_MESSAGE_MAX_CHARS, smart_split, telegram_text_length
 
 
 def is_tags_balanced(text: str) -> bool:
@@ -74,3 +74,42 @@ def test_smart_split_very_long_single_line() -> None:
     assert len(parts) > 1
     for p in parts:
         assert len(p) <= limit
+
+
+def test_telegram_text_length_rendered_utf16_and_entities() -> None:
+    """Verify telegram_text_length ignores HTML tags, unescapes entities, and counts astral emoji as 2 UTF-16 units."""
+    # '📌' is U+1F4CC -> 2 UTF-16 code units; '<b>' and '<a href=...>' are excluded; '&amp;' -> '&' (1 unit)
+    sample = '📌 <b>عنوان &amp; نکته</b>: <a href="https://t.me/c/2458921841/2/132479">لینک</a>'
+    # Visible rendered text: "📌 عنوان & نکته: لینک" -> 2 + 1 + 5 + 1 + 1 + 1 + 4 + 1 + 1 + 4 = 21 UTF-16 units
+    assert telegram_text_length(sample) == 21
+    assert telegram_text_length("") == 0
+
+
+def test_smart_split_rendered_keeps_rich_html_links_in_single_message() -> None:
+    """Verify a summary with 40 blue links (raw HTML > 5000 chars, rendered <= 4096) stays 1 single message."""
+    lines = [
+        f'• نکته مهم شماره {i}: <a href="https://t.me/c/2458921841/2/{132400 + i}">توضیح تصمیم گرفته شده درباره بخش {i} در جلسه امروز</a>'
+        for i in range(1, 41)
+    ]
+    rich_summary = "\n".join(lines)
+    assert len(rich_summary) > TELEGRAM_MESSAGE_MAX_CHARS
+    assert telegram_text_length(rich_summary) <= TELEGRAM_MESSAGE_MAX_CHARS
+
+    parts = smart_split(rich_summary, limit=TELEGRAM_MESSAGE_MAX_CHARS, count_rendered=True)
+    assert len(parts) == 1
+    assert parts[0] == rich_summary
+
+
+def test_smart_split_rendered_exceeding_limit_balances_tags_and_entities() -> None:
+    """Verify count_rendered=True splits oversized HTML cleanly within rendered limit and balances tags."""
+    inner = 'متن تست &amp; نکته با لینک <a href="https://t.me/c/2458921841/2/999">پیام کلیدی</a> و توضیح 📌. ' * 12
+    text = f"<b>{inner}</b>"
+    limit = 200
+    parts = smart_split(text, limit=limit, count_rendered=True)
+
+    assert len(parts) > 1
+    for idx, p in enumerate(parts):
+        assert telegram_text_length(p) <= limit, f"Part {idx+1} exceeded rendered limit: {telegram_text_length(p)}"
+        assert is_tags_balanced(p), f"Part {idx+1} has unbalanced tags: {p}"
+        assert not p.endswith("&a") and not p.endswith("&am") and not p.endswith("&amp")
+        assert p.strip() not in ("<b></b>", "<b>   </b>")

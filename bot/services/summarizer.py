@@ -15,6 +15,7 @@ from bot.services.llm_client import BaseLLMClient, LLMError, LLMTruncationError,
 from bot.utils.dates import format_date_heading, get_tehran_now
 from bot.utils.link_parser import get_clean_chat_id
 from bot.utils.retry import async_retry
+from bot.utils.text_split import TELEGRAM_MESSAGE_MAX_CHARS, telegram_text_length
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ _ADAPTIVE_DELAY_STEP_SECONDS = 10.0
 _ADAPTIVE_DELAY_MAX_SECONDS = 30.0
 _ADAPTIVE_DELAY_TTL_SECONDS = 900.0
 _MAX_REDUCE_ROUNDS = 5
+SUMMARY_PROMPT_TARGET_CHARS = 3500
+_MAX_CONDENSE_ATTEMPTS = 2
 
 
 def reset_llm_pacer() -> None:
@@ -106,18 +109,18 @@ def _compute_chunk_hash(chat_id: int, thread_id: int, link_prefix: str, chunk_te
     payload = f"{chat_id}:{thread_id}:{link_prefix}\n{chunk_text}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
-SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، ساختاریافته، بسیار خوانا، سلیس و بدون حاشیه به زبان فارسی است.
+SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، گزینشی، ساختاریافته، بسیار خوانا و سلیس به زبان فارسی است که فقط مهم‌ترین و ارزشمندترین صحبت‌ها را پوشش دهد.
 
 قوانین حیاتی:
 ۱. فقط و فقط از اطلاعات موجود در پیام‌ها استفاده کنید. هرگز از خود چیزی حدس نزنید یا اضافه نکنید.
-۲. خوش‌وبش، احوالپرسی، تعارفات و پیام‌های بی‌محتوا را کاملاً نادیده بگیرید.
+۲. اولویت‌بندی سخت‌گیرانه: فقط صحبت‌های خیلی مهم، تصمیم‌های جدی، پرسش‌ها و پاسخ‌های کلیدی، راه‌حل‌های کاربردی و اخبار مهم را انتخاب کنید. خوش‌وبش، احوالپرسی، شوخی، تعارفات، حاشیه‌ها، بحث‌های فرعی کم‌اهمیت و پیام‌های تکراری را کاملاً حذف کنید.
 ۳. اسامی افراد، پیوندها (لینک‌ها) و اعداد/مبالغ مهم را با نهایت دقت و بدون تحریف حفظ کنید.
 ۴. قانون پیوند آبی به پیام‌های کلیدی:
-در متن ورودی، هر پیام با شناسه مانند [#پیام ۱۲۳] مشخص شده است. هر زمان که یک تصمیم نهایی، خبر مهم، پاسخ کلیدی، راه‌حل، یا سؤال بی‌پاسخ مطرح شد، عبارت خلاصه آن نکته را حتماً به پیام اصلی پیوند دهید تا در تلگرام به رنگ آبی و قابل کلیک باشد:
-<a href="https://t.me/c/{clean_chat_id}/MESSAGE_ID">متن نکته مهم یا تصمیم</a>
-(فقط عبارت کلیدی مرتبط را لینک کنید و از لینک کردن کل پاراگراف خودداری نمایید).
+در متن ورودی، هر پیام با شناسه مانند [#پیام ۱۲۳] مشخص شده است. هر زمان که یک تصمیم نهایی، خبر مهم، پاسخ کلیدی، راه‌حل یا سؤال بی‌پاسخ مطرح شد، یک عبارت کوتاه و معنادار را به پیام اصلی پیوند دهید تا در تلگرام به رنگ آبی و قابل کلیک باشد:
+<a href="https://t.me/c/{clean_chat_id}/MESSAGE_ID">عبارت کلیدی نکته مهم</a>
+(فقط عبارت کلیدی مرتبط را لینک کنید؛ از چسباندن زنجیره‌ای شماره‌های خام پیام مثل (۱۲۳، ۱۲۴، ۱۲۵) یا لینک کردن کل پاراگراف خودداری کنید).
 ۵. قانون فاصله‌گذاری و خوانایی:
-بین هر سرفصل و مبحث، حتماً دو خط خالی (فاصله باز) قرار دهید تا متن به هیچ عنوان فشرده نباشد و کاملاً خوانا، تفکیک‌شده و چشم‌نواز باشد.
+بین هر سرفصل و مبحث، حتماً دو خط خالی (فاصله باز) قرار دهید تا متن کاملاً خوانا، تفکیک‌شده و چشم‌نواز باشد.
 ۶. صرفاً از تگ‌های مجاز HTML تلگرام استفاده کنید: <b>, <i>, <code>, <blockquote>, <a href="...">. هیچ‌گونه مارک‌داون (مانند ** یا #) استفاده نکنید. کاراکترهای < و > و & در متن ساده را حتماً Escape کنید.
 ۷. ساختار خروجی شما باید دقیقاً به شکل زیر با هدینگ‌های مشخص و دو خط خالی بین بخش‌ها باشد (بخش‌های بدون محتوا را حذف کنید):
 
@@ -127,7 +130,7 @@ SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌
 
 🔹 <b>محورهای اصلی بحث</b>
 ▫️ <b>عنوان مبحث اول:</b>
-• شرح گفتگو و <a href="https://t.me/c/{clean_chat_id}/ID">نکته کلیدی به رنگ آبی</a>...
+• شرح موجز گفتگو و <a href="https://t.me/c/{clean_chat_id}/ID">نکته کلیدی به رنگ آبی</a>...
 
 
 ✅ <b>تصمیم‌ها و جمع‌بندی‌ها</b>
@@ -141,20 +144,22 @@ SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌
 ❓ <b>سؤالات بی‌پاسخ</b>
 • <a href="https://t.me/c/{clean_chat_id}/ID">سؤال مهم بی‌پاسخ</a> (در صورت عدم وجود حذف شود)
 
-۸. طول کل خروجی معمولاً باید زیر ۳۵۰۰ کاراکتر باشد مگر اینکه حجم محتوای معنادار واقعاً زیاد باشد.
+۸. قانون قطعی یک‌پیامی (حداکثر {max_chars} کاراکتر):
+کل خروجی شما باید **حتماً در یک پیام تلگرامی واحد** جا بگیرد؛ طول متن قابل مشاهده (بدون احتساب آدرس تگ‌های HTML) باید **حداکثر {max_chars} کاراکتر** باشد (هدف‌گذاری ایده‌آل حدود {target_chars} کاراکتر است و به هیچ وجه از {max_chars} کاراکتر عبور نکنید).
+متن به هیچ عنوان نباید نصفه‌نیمه یا ناتمام بماند؛ اگر حجم گفتگوها زیاد است، به‌جای زیاد کردن متن، فقط مهم‌ترین مباحث را گزینش کنید و بسیار موجز و کامل بنویسید تا همه جملات و بخش‌ها در همین یک پیام به پایان برسند.
 ۹. هیچ‌گونه مقدمه، نتیجه‌گیری، سلام، خداحافظی یا اشاره به این‌که شما هوش مصنوعی هستید اضافه نکنید."""
 
-SYSTEM_PROMPT_CHUNK = """شما یک دستیار هوشمند خلاصه‌سازی هستید. یک بخش از پیام‌های روزانه یک تاپیک تلگرام به همراه شناسه پیام‌ها به شما داده می‌شود. وظیفه شما استخراج نکات کلیدی، مباحث معنادار، اسامی مهم، تصمیمات، لینک‌ها و سؤالات مطرح‌شده در این بخش است.
+SYSTEM_PROMPT_CHUNK = """شما یک دستیار هوشمند خلاصه‌سازی هستید. یک بخش از پیام‌های روزانه یک تاپیک تلگرام به همراه شناسه پیام‌ها به شما داده می‌شود. وظیفه شما استخراج فقط صحبت‌های خیلی مهم، مباحث کلیدی، اسامی مهم، تصمیمات، لینک‌ها و سؤالات اصلی مطرح‌شده در این بخش است.
 
 قوانین:
-۱. متن خلاصه را موجز، دقیق و به زبان فارسی سلیس بنویسید.
-۲. احوالپرسی و پیام‌های فاقد بار اطلاعاتی را کاملاً حذف کنید.
-۳. برای هر نکته یا تصمیم مهم، شناسه پیام آن را حفظ کنید (یا با تگ <a href="https://t.me/c/{clean_chat_id}/ID"> پیوند دهید).
+۱. متن خلاصه را بسیار موجز، دقیق و به زبان فارسی سلیس بنویسید.
+۲. احوالپرسی، شوخی، پیام‌های تکراری، حاشیه‌های کم‌اهمیت و گفتگوهای فاقد بار اطلاعاتی را کاملاً حذف کنید.
+۳. برای هر نکته یا تصمیم مهم، یک عبارت کوتاه را با شناسه پیام آن پیوند دهید (<a href="https://t.me/c/{clean_chat_id}/ID">عبارت کلیدی</a>) و از نوشتن لیست شماره‌های خام پیام خودداری کنید.
 ۴. از تگ‌های HTML مجاز تلگرام استفاده کنید.
 ۵. بین هر مبحث فاصله مناسب قرار دهید.
-۶. خروجی این بخش را فشرده و حداکثر حدود ۱۵۰۰ تا ۲۵۰۰ کاراکتر نگه دارید تا در مرحله ترکیب نهایی قابل ادغام باشد."""
+۶. خروجی این بخش را فشرده و حدود ۱۰۰۰ تا ۲۰۰۰ کاراکتر نگه دارید تا در مرحله ترکیب نهایی به‌راحتی در یک پیام تلگرامی جا بگیرد."""
 
-SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد هستید. به شما خلاصه‌های بخش‌های مختلف از گفتگوهای یک تاپیک تلگرام داده می‌شود. وظیفه شما ترکیب، یکپارچه‌سازی و حذف موارد تکراری برای تولید خلاصه نهایی و جامع روزانه به زبان فارسی است.
+SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد هستید. به شما خلاصه‌های بخش‌های مختلف از گفتگوهای یک تاپیک تلگرام داده می‌شود. وظیفه شما ترکیب، گزینش، یکپارچه‌سازی و حذف موارد تکراری و کم‌اهمیت برای تولید یک خلاصه نهایی جامع و موجز در قالب یک پیام تلگرامی واحد به زبان فارسی است.
 
 قوانین حیاتی:
 ۱. ساختار نهایی باید دقیقاً و الزاماً مطابق این الگو با هدینگ‌های مشخص و دو خط خالی بین هر بخش باشد:
@@ -165,7 +170,7 @@ SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد ه�
 
 🔹 <b>محورهای اصلی بحث</b>
 ▫️ <b>مبحث:</b>
-• نکات اصلی گفتگو...
+• نکات اصلی و خیلی مهم گفتگو...
 
 
 ✅ <b>تصمیم‌ها و جمع‌بندی‌ها</b>
@@ -179,11 +184,26 @@ SYSTEM_PROMPT_MERGE = """شما یک دستیار تحلیل‌گر ارشد ه�
 ❓ <b>سؤالات بی‌پاسخ</b>
 • سؤالات بی‌جواب... (در صورت عدم وجود حذف شود)
 
-۲. قانون لینک آبی: هر تصمیم مهم، نکته اساسی یا راه‌حل را با تگ <a href="https://t.me/c/{clean_chat_id}/ID">متن مهم</a> پیوند دهید تا به رنگ آبی و قابل کلیک نمایش داده شود.
+۲. گزینش صحبت‌های خیلی مهم و پیوند آبی: فقط مهم‌ترین موضوعات، تصمیم‌ها و پاسخ‌های کلیدی را نگه دارید، موارد جزئی یا تکراری را حذف کنید و هر نکته اساسی را با تگ <a href="https://t.me/c/{clean_chat_id}/ID">عبارت کلیدی</a> پیوند دهید تا به رنگ آبی نمایش داده شود (از فهرست‌کردن شماره‌های خام پیام پرهیز کنید).
 ۳. فاصله‌گذاری: حتماً بین هر بخش دو خط خالی قرار دهید تا متن بسیار خوانا و باز باشد.
 ۴. فقط از تگ‌های مجاز تلگرام (<b>, <i>, <code>, <blockquote>, <a href="...">) استفاده کنید و هیچ مارک‌داونی به کار نبرید.
-۵. طول خروجی ترجیحاً زیر ۳۵۰۰ کاراکتر باشد.
+۵. قانون قطعی یک‌پیامی (حداکثر {max_chars} کاراکتر):
+کل خروجی باید **حتماً در یک پیام تلگرامی واحد** جا بگیرد؛ طول متن قابل مشاهده (بدون احتساب آدرس تگ‌های HTML) باید **حداکثر {max_chars} کاراکتر** باشد (هدف‌گذاری ایده‌آل حدود {target_chars} کاراکتر است و هرگز از {max_chars} کاراکتر فراتر نروید).
+هرگز متن را نصفه‌نیمه رها نکنید؛ با حذف جزئیات کم‌اهمیت و ادغام موارد مشابه، خلاصه‌ای کامل، تمام‌شده و دقیق بنویسید.
 ۶. هیچ مقدمه، مؤخره یا توضیحی فراتر از قالب ساختاریافته فوق اضافه نکنید."""
+
+SYSTEM_PROMPT_CONDENSE = """شما یک ویراستار ارشد خلاصه‌سازی تلگرام هستید. پیش‌نویس خلاصه زیر {current_chars} کاراکتر است و از سقف یک پیام تلگرام ({max_chars} کاراکتر) بیشتر شده است.
+
+وظیفه شما بازنویسی و فشرده‌سازی این خلاصه است به‌طوری‌که **حتماً در یک پیام تلگرامی واحد** (حدود {target_chars} کاراکتر و اکیداً حداکثر {max_chars} کاراکتر متن قابل مشاهده، بدون احتساب آدرس تگ‌های HTML) جا بگیرد و هیچ جمله‌ای نصفه‌نیمه نماند.
+
+قوانین بازنویسی:
+۱. فقط مهم‌ترین صحبت‌ها، تصمیم‌های کلیدی، لینک‌های ضروری و سؤالات مهم بی‌پاسخ را نگه دارید و نکات کم‌اهمیت، جزئیات تکراری و حاشیه‌ها را حذف یا ادغام کنید.
+۲. قالب استاندارد زیر را حفظ کنید (بخش‌های خالی را حذف کنید):
+📌 <b>خلاصه تاپیک: {topic_name}</b>
+{date_heading}
+(به همراه 🔹 محورهای اصلی بحث، ✅ تصمیم‌ها و جمع‌بندی‌ها، 🔗 لینک‌ها و منابع مهم، ❓ سؤالات بی‌پاسخ در صورت وجود)
+۳. تگ‌های مجاز HTML تلگرام (<b>, <i>, <code>, <blockquote>, <a href="...">) و لینک‌های آبی <a href="https://t.me/c/{clean_chat_id}/ID">...</a> مهم را سالم نگه دارید و بدون مارک‌داون بنویسید.
+۴. هرگز هیچ اطلاعاتی از خود اضافه نکنید و هیچ مقدمه یا توضیح اضافه‌ای درباره کوتاه‌سازی ننویسید."""
 
 ALLOWED_HTML_TAGS = {
     "b",
@@ -538,6 +558,103 @@ async def _generate_with_retry(
                 _next_allowed_call_ts = max(_next_allowed_call_ts, time.monotonic() + effective_delay)
 
 
+async def _condense_to_single_message(
+    summary_html: str,
+    topic_name: str,
+    date_heading: str,
+    link_prefix: str,
+    clean_chat_id: str,
+    target_thread: int | None,
+    max_rendered_chars: int,
+    llm_client: BaseLLMClient,
+    max_retries: int,
+    throttle_retries: int,
+    chunk_delay: float,
+) -> str:
+    """Ensure sanitized summary fits in a single Telegram message via AI condensation when needed."""
+    best = summary_html
+    best_len = telegram_text_length(best)
+    if best_len <= max_rendered_chars:
+        return best
+
+    logger.warning(
+        "Summary for topic '%s' rendered length (%d) exceeds single-message limit (%d). "
+        "Running AI condensation pass.",
+        topic_name,
+        best_len,
+        max_rendered_chars,
+    )
+
+    attempt_targets = [
+        min(max(400, int(max_rendered_chars * 0.85)), max(350, max_rendered_chars - 250)),
+        min(max(350, int(max_rendered_chars * 0.72)), max(300, max_rendered_chars - 450)),
+    ]
+
+    for attempt in range(1, _MAX_CONDENSE_ATTEMPTS + 1):
+        target_chars = attempt_targets[min(attempt - 1, len(attempt_targets) - 1)]
+        system_prompt = (
+            SYSTEM_PROMPT_CONDENSE.replace("{topic_name}", topic_name)
+            .replace("{date_heading}", date_heading)
+            .replace("{clean_chat_id}", link_prefix)
+            .replace("{current_chars}", str(best_len))
+            .replace("{max_chars}", str(max_rendered_chars))
+            .replace("{target_chars}", str(target_chars))
+        )
+        user_content = (
+            f"پیش‌نویس خلاصه تاپیک «{topic_name}» ({best_len} کاراکتر):\n\n"
+            f"{best}\n\n"
+            f"لطفاً با حفظ مهم‌ترین صحبت‌ها و حذف موارد فرعی، این خلاصه را کامل و بدون جمله‌های ناتمام در حدود {target_chars} کاراکتر (اکیداً حداکثر {max_rendered_chars} کاراکتر) بازنویسی کنید."
+        )
+
+        try:
+            raw_condensed = await _generate_with_retry(
+                llm_client=llm_client,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                max_retries=max_retries,
+                throttle_retries=throttle_retries,
+                chunk_delay=chunk_delay,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "AI condensation attempt %d/%d failed for topic '%s': %s. Using best candidate (%d chars).",
+                attempt,
+                _MAX_CONDENSE_ATTEMPTS,
+                topic_name,
+                exc,
+                best_len,
+            )
+            return best
+
+        sanitized = sanitize_telegram_html(raw_condensed, clean_chat_id=clean_chat_id, thread_id=target_thread)
+        if not sanitized:
+            continue
+
+        cand_len = telegram_text_length(sanitized)
+        if cand_len < best_len:
+            best = sanitized
+            best_len = cand_len
+
+        if best_len <= max_rendered_chars:
+            logger.info(
+                "AI condensation for topic '%s' succeeded on attempt %d (%d chars <= %d).",
+                topic_name,
+                attempt,
+                best_len,
+                max_rendered_chars,
+            )
+            return best
+
+    logger.warning(
+        "Summary for topic '%s' remained %d chars (> %d) after %d condensation attempts; returning shortest candidate.",
+        topic_name,
+        best_len,
+        max_rendered_chars,
+        _MAX_CONDENSE_ATTEMPTS,
+    )
+    return best
+
+
 async def summarize_topic_messages(
     topic_name: str,
     messages: list[dict],
@@ -547,6 +664,7 @@ async def summarize_topic_messages(
     is_nightly: bool = True,
     llm_client: BaseLLMClient | None = None,
     use_chunk_cache: bool = False,
+    max_rendered_chars: int = TELEGRAM_MESSAGE_MAX_CHARS,
 ) -> str | None:
     """Summarize a list of messages for a topic.
 
@@ -554,6 +672,7 @@ async def summarize_topic_messages(
     Performs Map-Reduce chunking if transcript length exceeds CHUNK_MAX_CHARS.
     When use_chunk_cache=True and SQLite is initialized, completed Map chunks are persisted
     so interrupted runs resume without re-paying for already summarized chunks.
+    Enforces single-message rendered character budget via prompt limits and automatic AI condensation.
     """
     if len(messages) < min_messages:
         logger.info(
@@ -609,17 +728,22 @@ async def summarize_topic_messages(
     )
     throttle_retries = max(settings.AI_MAX_RETRIES, cfg_throttle_retries) if settings.AI_MAX_RETRIES > 0 else 0
 
+    effective_max = max(500, int(max_rendered_chars))
+    prompt_target = min(SUMMARY_PROMPT_TARGET_CHARS, max(400, effective_max - 400))
+
     # Check if single call or map-reduce
     if len(transcript) <= settings.CHUNK_MAX_CHARS:
         system_prompt = (
             SYSTEM_PROMPT_SINGLE.replace("{topic_name}", topic_name)
             .replace("{date_heading}", date_heading)
             .replace("{clean_chat_id}", link_prefix)
+            .replace("{max_chars}", str(effective_max))
+            .replace("{target_chars}", str(prompt_target))
         )
         user_content = (
             f"متن گفتگوهای تاپیک «{topic_name}»:\n\n"
             f"{transcript}\n\n"
-            "لطفاً خلاصه جامع و ساختاریافته را به زبان فارسی طبق دستورالعمل با دو خط فاصله بین بخش‌ها و پیوندهای آبی به پیام‌های مهم ارائه دهید."
+            f"لطفاً فقط مهم‌ترین صحبت‌ها را با دو خط فاصله و پیوندهای آبی خلاصه کنید؛ خروجی باید کامل و حداکثر {effective_max} کاراکتر باشد تا در یک پیام تلگرامی جا بگیرد."
         )
 
         raw_output = await _generate_with_retry(
@@ -630,7 +754,20 @@ async def summarize_topic_messages(
             throttle_retries=throttle_retries,
             chunk_delay=chunk_delay,
         )
-        return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
+        sanitized = sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
+        return await _condense_to_single_message(
+            summary_html=sanitized,
+            topic_name=topic_name,
+            date_heading=date_heading,
+            link_prefix=link_prefix,
+            clean_chat_id=clean_chat_id,
+            target_thread=target_thread,
+            max_rendered_chars=effective_max,
+            llm_client=llm_client,
+            max_retries=settings.AI_MAX_RETRIES,
+            throttle_retries=throttle_retries,
+            chunk_delay=chunk_delay,
+        )
 
     else:
         # Map-Reduce pipeline with pacing, chunk checkpointing, safety-block resilience, and hierarchical reduce
@@ -677,7 +814,7 @@ async def summarize_topic_messages(
             chunk_user_content = (
                 f"بخش {i} از {len(chunks)} پیام‌های تاپیک «{topic_name}»:\n\n"
                 f"{chunk}\n\n"
-                "نکات کلیدی، تصمیمات و مباحث معنادار این بخش را به همراه شناسه‌های پیام استخراج کنید."
+                "فقط مهم‌ترین صحبت‌ها، تصمیمات و مباحث کلیدی این بخش را با شناسه‌های پیام استخراج کنید."
             )
 
             try:
@@ -778,11 +915,13 @@ async def summarize_topic_messages(
             SYSTEM_PROMPT_MERGE.replace("{topic_name}", topic_name)
             .replace("{date_heading}", date_heading)
             .replace("{clean_chat_id}", link_prefix)
+            .replace("{max_chars}", str(effective_max))
+            .replace("{target_chars}", str(prompt_target))
         )
         merge_user_content = (
-            f"خلاصه‌های استخراج‌شده از {len(partial_summaries)} بخش مختلف تاپیک «{topic_name}»:\n\n"
+            f"خلاصه‌های {len(partial_summaries)} بخش تاپیک «{topic_name}»:\n\n"
             + combined_partials
-            + "\n\nلطفاً این بخش‌ها را ترکیب کرده و خلاصه نهایی جامع را با دو خط فاصله و لینک‌های آبی به پیام‌ها ارائه دهید."
+            + f"\n\nاین بخش‌ها را ترکیب کرده و خلاصه نهایی کامل و یک‌پیامی (حداکثر {effective_max} کاراکتر) را با دو خط فاصله و لینک آبی ارائه دهید."
         )
 
         merged_output = await _generate_with_retry(
@@ -793,4 +932,17 @@ async def summarize_topic_messages(
             throttle_retries=throttle_retries,
             chunk_delay=chunk_delay,
         )
-        return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
+        sanitized = sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
+        return await _condense_to_single_message(
+            summary_html=sanitized,
+            topic_name=topic_name,
+            date_heading=date_heading,
+            link_prefix=link_prefix,
+            clean_chat_id=clean_chat_id,
+            target_thread=target_thread,
+            max_rendered_chars=effective_max,
+            llm_client=llm_client,
+            max_retries=settings.AI_MAX_RETRIES,
+            throttle_retries=throttle_retries,
+            chunk_delay=chunk_delay,
+        )

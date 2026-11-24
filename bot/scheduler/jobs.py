@@ -23,7 +23,7 @@ from bot.services.deeptalk_service import sweep_due_deeptalks
 from bot.services.timer_service import sweep_due_timers
 from bot.utils.dates import compute_nightly_cutoff
 from bot.utils.html_utils import escape_html
-from bot.utils.text_split import smart_split
+from bot.utils.text_split import TELEGRAM_MESSAGE_MAX_CHARS, smart_split, telegram_text_length
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,11 @@ async def run_summary_for_topic(
     target_thread = dest_tid if dest_mode == "aggregate" and dest_tid is not None else thread_id
 
     if dry_run:
+        preview_prefix = (
+            f"👁 <b>پیش‌نمایش خلاصه تاپیک «{escape_html(topic_name)}»</b>\n"
+            "<i>(فقط برای شما ارسال شده و هیچ پیامی تغییر یا حذف نشد)</i>\n\n"
+        )
+        summary_budget = max(500, TELEGRAM_MESSAGE_MAX_CHARS - telegram_text_length(preview_prefix))
         try:
             summary_text = await summarize_topic_messages(
                 topic_name=topic_name,
@@ -225,6 +230,7 @@ async def run_summary_for_topic(
                 min_messages=min_msgs,
                 is_nightly=False,
                 llm_client=llm_client,
+                max_rendered_chars=summary_budget,
             )
         except Exception as exc:
             logger.error("Dry-run summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
@@ -233,11 +239,7 @@ async def run_summary_for_topic(
         if not summary_text:
             return False, "خلاصه معتبری توسط مدل تولید نشد."
 
-        preview_text = (
-            f"👁 <b>پیش‌نمایش خلاصه تاپیک «{escape_html(topic_name)}»</b>\n"
-            "<i>(فقط برای شما ارسال شده و هیچ پیامی تغییر یا حذف نشد)</i>\n\n"
-            f"{summary_text}"
-        )
+        preview_text = f"{preview_prefix}{summary_text}"
         try:
             delivered = await send_summary(
                 bot=bot,
@@ -305,6 +307,12 @@ async def run_summary_for_topic(
             return True, "خلاصه با موفقیت ارسال شد."
 
     if not parts:
+        aggregate_prefix = (
+            f"📂 <b>تاپیک مبدا: {escape_html(topic_name)}</b>\n\n\n"
+            if dest_mode == "aggregate" and dest_tid is not None
+            else ""
+        )
+        summary_budget = max(500, TELEGRAM_MESSAGE_MAX_CHARS - telegram_text_length(aggregate_prefix))
         # Generate summary with AI
         try:
             summary_text = await summarize_topic_messages(
@@ -316,6 +324,7 @@ async def run_summary_for_topic(
                 is_nightly=is_nightly,
                 llm_client=llm_client,
                 use_chunk_cache=True,
+                max_rendered_chars=summary_budget,
             )
         except Exception as exc:
             logger.error("Summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
@@ -337,12 +346,8 @@ async def run_summary_for_topic(
         if not summary_text:
             return False, "خلاصه معتبری توسط مدل تولید نشد."
 
-        if dest_mode == "aggregate" and dest_tid is not None:
-            content_to_send = f"📂 <b>تاپیک مبدا: {escape_html(topic_name)}</b>\n\n\n{summary_text}"
-        else:
-            content_to_send = summary_text
-
-        parts = smart_split(content_to_send, limit=4000)
+        content_to_send = f"{aggregate_prefix}{summary_text}"
+        parts = smart_split(content_to_send, limit=TELEGRAM_MESSAGE_MAX_CHARS, count_rendered=True)
         if not parts:
             return False, "خلاصه پس از تقسیم خالی بود."
 

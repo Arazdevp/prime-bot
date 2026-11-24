@@ -1,9 +1,69 @@
 """Smart message splitting with HTML tag awareness and balance preservation."""
 
+import html
 import re
+
+TELEGRAM_MESSAGE_MAX_CHARS = 4096
 
 TAG_RE = re.compile(r"<(/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^<>]*)?)>")
 _INCOMPLETE_ENTITY_RE = re.compile(r"&(?:#x?[0-9a-fA-F]*|[a-zA-Z]*)$")
+_ENTITY_OR_CHAR_RE = re.compile(
+    r"&(?:#\d{1,7}|#x[0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});|.",
+    re.DOTALL,
+)
+
+
+def _rendered_utf16_len(text: str) -> int:
+    """Return length in UTF-16 code units after HTML entity unescaping (Telegram's text limit unit)."""
+    if not text:
+        return 0
+    return len(html.unescape(text).encode("utf-16-le")) // 2
+
+
+def telegram_text_length(text: str) -> int:
+    """Return rendered Telegram message length in UTF-16 code units (excluding HTML tags)."""
+    if not text:
+        return 0
+    return _rendered_utf16_len(TAG_RE.sub("", text))
+
+
+def _prefix_end_for_utf16_limit(text_val: str, max_units: int) -> int:
+    """Find largest raw index in text_val whose rendered UTF-16 length <= max_units without tearing entities."""
+    if max_units <= 0 or not text_val:
+        return 0
+
+    total_units = 0
+    end_idx = 0
+    for match in _ENTITY_OR_CHAR_RE.finditer(text_val):
+        tok = match.group(0)
+        if len(tok) > 1 and html.unescape(tok) == tok:
+            # Not a recognized HTML entity; count character by character
+            for idx, ch in enumerate(tok):
+                ch_units = len(ch.encode("utf-16-le")) // 2
+                if total_units + ch_units > max_units:
+                    return match.start() + idx
+                total_units += ch_units
+                end_idx = match.start() + idx + 1
+        else:
+            tok_units = _rendered_utf16_len(tok)
+            if total_units + tok_units > max_units:
+                return end_idx
+            total_units += tok_units
+            end_idx = match.end()
+    return end_idx
+
+
+def _first_atomic_unit_end(text_val: str) -> int:
+    """Return end index of the first atomic character or HTML entity for forward progress."""
+    if not text_val:
+        return 0
+    match = _ENTITY_OR_CHAR_RE.match(text_val)
+    if not match:
+        return 1
+    tok = match.group(0)
+    if len(tok) > 1 and html.unescape(tok) == tok:
+        return 1
+    return match.end()
 
 
 def _has_visible_content(chunk: str) -> bool:
@@ -25,8 +85,36 @@ def _adjust_cut_for_html_entity(text_val: str, cut_idx: int) -> int:
     return cut_idx
 
 
-def smart_split(text: str, limit: int = 4000) -> list[str]:
+def _find_natural_cut(candidate_slice: str) -> int | None:
+    """Return a clean split index at paragraph, line, or word/sentence boundary, or None."""
+    p_idx = candidate_slice.rfind("\n\n")
+    if p_idx != -1:
+        return p_idx + 2
+
+    l_idx = candidate_slice.rfind("\n")
+    if l_idx != -1:
+        return l_idx + 1
+
+    s_idx = max(
+        candidate_slice.rfind(". "),
+        candidate_slice.rfind("! "),
+        candidate_slice.rfind("؟ "),
+        candidate_slice.rfind("; "),
+        candidate_slice.rfind(" "),
+    )
+    if s_idx != -1:
+        return s_idx + 1
+
+    return None
+
+
+def smart_split(text: str, limit: int = 4000, count_rendered: bool = False) -> list[str]:
     """Split text into chunks of length <= limit, preserving HTML tag balance.
+
+    When count_rendered=False (default), measures raw string length.
+    When count_rendered=True, measures Telegram rendered UTF-16 length (excluding
+    HTML tags and after entity unescaping) so rich <a href="..."> links never
+    trigger premature message splits.
 
     Splits progressively at paragraph (\\n\\n), newline (\\n), sentence/space,
     or hard character boundary as a last resort, never inside an HTML tag.
@@ -36,7 +124,10 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
     if not text or not text.strip():
         return []
 
-    if len(text) <= limit:
+    if count_rendered:
+        if telegram_text_length(text) <= limit:
+            return [text]
+    elif len(text) <= limit:
         return [text]
 
     # Tokenize into tags and text segments
@@ -73,7 +164,6 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
         token = tokens[idx]
         if token[0] == "tag":
             _, raw_tag, is_closing, tag_name = token
-            tag_len = len(raw_tag)
 
             temp_stack = list(open_stack)
             if is_closing:
@@ -84,6 +174,24 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
             else:
                 temp_stack.append((tag_name, raw_tag))
 
+            if count_rendered:
+                # Avoid dangling empty opening tags at the exact end of a full chunk
+                if not is_closing and current_len >= limit and current_part:
+                    closing = get_closing_tags(open_stack)
+                    flush_str = "".join(current_part) + closing
+                    if _has_visible_content(flush_str):
+                        parts.append(flush_str)
+                    reopening = get_opening_tags(open_stack)
+                    current_part = [reopening] if reopening else []
+                    current_len = 0
+                    continue
+
+                current_part.append(raw_tag)
+                open_stack = temp_stack
+                idx += 1
+                continue
+
+            tag_len = len(raw_tag)
             needed_closing = get_closing_tags(temp_stack)
             if current_len + tag_len + len(needed_closing) <= limit:
                 current_part.append(raw_tag)
@@ -112,6 +220,60 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
             _, text_val = token
             closing = get_closing_tags(open_stack)
 
+            if count_rendered:
+                text_units = _rendered_utf16_len(text_val)
+                if current_len + text_units <= limit:
+                    current_part.append(text_val)
+                    current_len += text_units
+                    idx += 1
+                    continue
+
+                remaining = limit - current_len
+                if remaining <= 0:
+                    flush_str = "".join(current_part) + closing
+                    if _has_visible_content(flush_str):
+                        parts.append(flush_str)
+                    reopening = get_opening_tags(open_stack)
+                    current_part = [reopening] if reopening else []
+                    current_len = 0
+                    continue
+
+                max_raw_end = _prefix_end_for_utf16_limit(text_val, remaining)
+                if max_raw_end <= 0:
+                    if current_len > 0:
+                        flush_str = "".join(current_part) + closing
+                        if _has_visible_content(flush_str):
+                            parts.append(flush_str)
+                        reopening = get_opening_tags(open_stack)
+                        current_part = [reopening] if reopening else []
+                        current_len = 0
+                        continue
+                    cut_idx = _first_atomic_unit_end(text_val)
+                else:
+                    candidate_slice = text_val[:max_raw_end]
+                    natural_cut = _find_natural_cut(candidate_slice)
+                    cut_idx = natural_cut if natural_cut is not None else max_raw_end
+                    cut_idx = max(1, min(cut_idx, max_raw_end))
+
+                head = text_val[:cut_idx]
+                tail = text_val[cut_idx:]
+
+                if head:
+                    current_part.append(head)
+                flush_str = "".join(current_part) + closing
+                if _has_visible_content(flush_str):
+                    parts.append(flush_str)
+
+                reopening = get_opening_tags(open_stack)
+                current_part = [reopening] if reopening else []
+                current_len = 0
+
+                if tail:
+                    tokens[idx] = ("text", tail)
+                else:
+                    idx += 1
+                continue
+
             if current_len + len(text_val) + len(closing) <= limit:
                 current_part.append(text_val)
                 current_len += len(text_val)
@@ -138,31 +300,12 @@ def smart_split(text: str, limit: int = 4000) -> list[str]:
                     continue
 
                 candidate_slice = text_val[:max_content_len]
-                cut_idx = -1
-
-                # 1. Paragraph break (\n\n)
-                p_idx = candidate_slice.rfind("\n\n")
-                if p_idx != -1:
-                    cut_idx = p_idx + 2
+                natural_cut = _find_natural_cut(candidate_slice)
+                if natural_cut is not None:
+                    cut_idx = natural_cut
                 else:
-                    # 2. Line break (\n)
-                    l_idx = candidate_slice.rfind("\n")
-                    if l_idx != -1:
-                        cut_idx = l_idx + 1
-                    else:
-                        # 3. Sentence or word boundary
-                        s_idx = max(
-                            candidate_slice.rfind(". "),
-                            candidate_slice.rfind("! "),
-                            candidate_slice.rfind("؟ "),
-                            candidate_slice.rfind("; "),
-                            candidate_slice.rfind(" "),
-                        )
-                        if s_idx != -1:
-                            cut_idx = s_idx + 1
-                        else:
-                            # 4. Hard character boundary (without splitting an HTML entity)
-                            cut_idx = _adjust_cut_for_html_entity(text_val, max_content_len)
+                    # Hard character boundary (without splitting an HTML entity)
+                    cut_idx = _adjust_cut_for_html_entity(text_val, max_content_len)
 
                 cut_idx = max(1, min(cut_idx, max_content_len))
                 head = text_val[:cut_idx]
