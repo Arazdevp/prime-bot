@@ -1363,3 +1363,826 @@ async def rollback_morning_last_sent_day(chat_id: int, previous_day: str | None)
             (previous_day, now_iso, chat_id),
         )
         await conn.commit()
+
+
+# ---------------- DeepTalk Admins & Settings Operations ----------------
+
+_DEEPTALK_SESSION_COLS = (
+    "id, chat_id, thread_id, subject, description, created_by, creator_name, "
+    "start_at, end_at, duration_minutes, status, announce_message_id, "
+    "start_message_id, end_message_id, checkin_deck_json, last_checkin_idx, "
+    "created_at, started_at, ended_at"
+)
+
+
+def _clean_username(username: str | None) -> str | None:
+    if not isinstance(username, str):
+        return None
+    cleaned = username.strip().lstrip("@").strip()
+    return cleaned if cleaned else None
+
+
+async def add_deeptalk_admin(
+    *,
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    added_by: int,
+    added_at_iso: str | None = None,
+) -> dict[str, Any]:
+    """Register or refresh a designated DeepTalk admin."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = added_at_iso or datetime.now(timezone.utc).isoformat()
+    clean_u = _clean_username(username)
+    clean_name = (full_name or "").strip() or f"کاربر {user_id}"
+
+    sql = """
+    INSERT INTO deeptalk_admins (user_id, username, full_name, added_by, added_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username = COALESCE(excluded.username, deeptalk_admins.username),
+        full_name = CASE
+            WHEN excluded.full_name != '' AND excluded.full_name != ('کاربر ' || excluded.user_id)
+            THEN excluded.full_name
+            ELSE COALESCE(deeptalk_admins.full_name, excluded.full_name)
+        END,
+        added_by = excluded.added_by,
+        added_at = excluded.added_at;
+    """
+    async with lock:
+        await conn.execute(sql, (user_id, clean_u, clean_name, added_by, now_iso))
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT user_id, username, full_name, added_by, added_at FROM deeptalk_admins WHERE user_id = ?;",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row is not None else {
+        "user_id": user_id,
+        "username": clean_u,
+        "full_name": clean_name,
+        "added_by": added_by,
+        "added_at": now_iso,
+    }
+
+
+async def remove_deeptalk_admin(user_id: int) -> bool:
+    """Remove a designated DeepTalk admin by user_id. Returns True if removed."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM deeptalk_admins WHERE user_id = ?;",
+            (user_id,),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def is_deeptalk_admin(user_id: int) -> bool:
+    """Return True if user_id is explicitly registered in deeptalk_admins."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT 1 FROM deeptalk_admins WHERE user_id = ? LIMIT 1;",
+        (user_id,),
+    )
+    return (await cursor.fetchone()) is not None
+
+
+async def list_deeptalk_admins() -> list[dict[str, Any]]:
+    """Return all designated DeepTalk admins ordered by added_at ASC."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT user_id, username, full_name, added_by, added_at "
+        "FROM deeptalk_admins ORDER BY added_at ASC, user_id ASC;"
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def find_known_user_by_username(username: str) -> dict[str, Any] | None:
+    """Look up a user's user_id and display info case-insensitively across known tables."""
+    clean_u = _clean_username(username)
+    if not clean_u:
+        return None
+
+    conn = get_db()
+    # 1. Check bot_users (most up-to-date private interactions)
+    cur = await conn.execute(
+        "SELECT user_id, username, full_name FROM bot_users "
+        "WHERE LOWER(LTRIM(username, '@')) = LOWER(?) ORDER BY last_seen DESC LIMIT 1;",
+        (clean_u,),
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return {
+            "user_id": int(row["user_id"]),
+            "username": _clean_username(row["username"]) or clean_u,
+            "full_name": row["full_name"] or clean_u,
+        }
+
+    # 2. Check deeptalk_participants
+    cur = await conn.execute(
+        "SELECT user_id, username, full_name FROM deeptalk_participants "
+        "WHERE LOWER(LTRIM(username, '@')) = LOWER(?) ORDER BY session_id DESC LIMIT 1;",
+        (clean_u,),
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return {
+            "user_id": int(row["user_id"]),
+            "username": _clean_username(row["username"]) or clean_u,
+            "full_name": row["full_name"] or clean_u,
+        }
+
+    # 3. Check timers
+    cur = await conn.execute(
+        "SELECT user_id, username, full_name FROM timers "
+        "WHERE LOWER(LTRIM(username, '@')) = LOWER(?) ORDER BY id DESC LIMIT 1;",
+        (clean_u,),
+    )
+    row = await cur.fetchone()
+    if row is not None:
+        return {
+            "user_id": int(row["user_id"]),
+            "username": _clean_username(row["username"]) or clean_u,
+            "full_name": row["full_name"] or clean_u,
+        }
+
+    return None
+
+
+async def get_deeptalk_settings(chat_id: int) -> dict[str, Any] | None:
+    """Fetch per-group DeepTalk configuration if set."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, thread_id, default_duration_minutes, updated_at "
+        "FROM deeptalk_settings WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def set_deeptalk_topic(
+    chat_id: int,
+    thread_id: int,
+    default_duration_minutes: int | None = None,
+) -> dict[str, Any]:
+    """Persist target forum topic thread_id (and optional default duration) for a group's DeepTalks."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    safe_tid = int(thread_id) if thread_id and int(thread_id) > 0 else 1
+    dur = max(5, min(360, int(default_duration_minutes))) if default_duration_minutes is not None else 45
+
+    async with lock:
+        if default_duration_minutes is not None:
+            await conn.execute(
+                """
+                INSERT INTO deeptalk_settings (chat_id, thread_id, default_duration_minutes, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    default_duration_minutes = excluded.default_duration_minutes,
+                    updated_at = excluded.updated_at;
+                """,
+                (chat_id, safe_tid, dur, now_iso),
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO deeptalk_settings (chat_id, thread_id, default_duration_minutes, updated_at)
+                VALUES (?, ?, 45, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    updated_at = excluded.updated_at;
+                """,
+                (chat_id, safe_tid, now_iso),
+            )
+        await conn.commit()
+        cur = await conn.execute(
+            "SELECT chat_id, thread_id, default_duration_minutes, updated_at "
+            "FROM deeptalk_settings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        updated = await cur.fetchone()
+    return dict(updated)
+
+
+async def detect_deepwork_topic_id(chat_id: int) -> int | None:
+    """Return configured DeepTalk thread_id, or auto-detect a 'Deep Work / دیپ‌ورک' topic if present."""
+    cfg = await get_deeptalk_settings(chat_id)
+    if cfg and cfg.get("thread_id") is not None:
+        return int(cfg["thread_id"])
+
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT thread_id, name FROM topics WHERE chat_id = ? ORDER BY thread_id ASC;",
+        (chat_id,),
+    )
+    rows = await cursor.fetchall()
+    keywords = ("deep work", "deepwork", "دیپ‌ورک", "دیپ ورک", "دیپورک", "deeptalk", "دیپ‌تاک", "دیپ تاک")
+    for r in rows:
+        raw_name = (r["name"] or "").strip().lower()
+        normalized = raw_name.replace("\u200c", "")
+        for kw in keywords:
+            kw_norm = kw.replace("\u200c", "")
+            if kw in raw_name or kw_norm in normalized:
+                return int(r["thread_id"])
+    return None
+
+
+# ---------------- DeepTalk Sessions & Participants Operations ----------------
+
+
+async def create_deeptalk_session(
+    *,
+    chat_id: int,
+    thread_id: int,
+    subject: str,
+    description: str | None,
+    created_by: int,
+    creator_name: str,
+    start_at_iso: str,
+    end_at_iso: str,
+    duration_minutes: int,
+    created_at_iso: str | None = None,
+) -> dict[str, Any]:
+    """Insert a new scheduled DeepTalk session and return its record."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = created_at_iso or datetime.now(timezone.utc).isoformat()
+    clean_subject = subject.strip()
+    clean_desc = description.strip() if isinstance(description, str) and description.strip() else None
+    clean_creator = (creator_name or "").strip() or "ادمین دیپ‌تاک"
+    safe_tid = int(thread_id) if thread_id and int(thread_id) > 0 else 1
+
+    sql = """
+    INSERT INTO deeptalk_sessions (
+        chat_id, thread_id, subject, description, created_by, creator_name,
+        start_at, end_at, duration_minutes, status,
+        announce_message_id, start_message_id, end_message_id,
+        checkin_deck_json, last_checkin_idx, created_at, started_at, ended_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL);
+    """
+    async with lock:
+        cursor = await conn.execute(
+            sql,
+            (
+                chat_id,
+                safe_tid,
+                clean_subject,
+                clean_desc,
+                created_by,
+                clean_creator,
+                start_at_iso,
+                end_at_iso,
+                int(duration_minutes),
+                now_iso,
+            ),
+        )
+        session_id = int(cursor.lastrowid)
+        await conn.commit()
+        cur = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+    return dict(row)
+
+
+async def get_deeptalk_session(session_id: int) -> dict[str, Any] | None:
+    """Fetch a single DeepTalk session by primary ID."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+        (session_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def update_deeptalk_message_ids(
+    session_id: int,
+    *,
+    announce_message_id: int | None = None,
+    start_message_id: int | None = None,
+    end_message_id: int | None = None,
+) -> None:
+    """Store Telegram message IDs for announcement, start, or end cards."""
+    conn = get_db()
+    lock = get_write_lock()
+    updates: list[str] = []
+    params: list[Any] = []
+    if announce_message_id is not None:
+        updates.append("announce_message_id = ?")
+        params.append(int(announce_message_id))
+    if start_message_id is not None:
+        updates.append("start_message_id = ?")
+        params.append(int(start_message_id))
+    if end_message_id is not None:
+        updates.append("end_message_id = ?")
+        params.append(int(end_message_id))
+    if not updates:
+        return
+    params.append(session_id)
+    sql = f"UPDATE deeptalk_sessions SET {', '.join(updates)} WHERE id = ?;"
+    async with lock:
+        await conn.execute(sql, tuple(params))
+        await conn.commit()
+
+
+async def list_active_or_scheduled_deeptalks(chat_id: int | None = None) -> list[dict[str, Any]]:
+    """List 'live' and 'scheduled' DeepTalk sessions ('live' first, then by start_at ASC)."""
+    conn = get_db()
+    if chat_id is not None:
+        cursor = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions "
+            "WHERE chat_id = ? AND status IN ('live', 'scheduled') "
+            "ORDER BY CASE WHEN status = 'live' THEN 0 ELSE 1 END ASC, start_at ASC, id ASC;",
+            (chat_id,),
+        )
+    else:
+        cursor = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions "
+            "WHERE status IN ('live', 'scheduled') "
+            "ORDER BY CASE WHEN status = 'live' THEN 0 ELSE 1 END ASC, start_at ASC, id ASC;"
+        )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_due_deeptalk_starts(now_utc_iso: str) -> list[dict[str, Any]]:
+    """Return scheduled DeepTalk sessions whose start_at is at or before now_utc_iso."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions "
+        "WHERE status = 'scheduled' AND start_at <= ? ORDER BY start_at ASC, id ASC;",
+        (now_utc_iso,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_due_deeptalk_ends(now_utc_iso: str) -> list[dict[str, Any]]:
+    """Return live DeepTalk sessions whose end_at is at or before now_utc_iso."""
+    conn = get_db()
+    cursor = await conn.execute(
+        f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions "
+        "WHERE status = 'live' AND end_at <= ? ORDER BY end_at ASC, id ASC;",
+        (now_utc_iso,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def claim_deeptalk_for_start(
+    session_id: int,
+    *,
+    started_at_iso: str | None = None,
+    new_end_at_iso: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically transition a 'scheduled' session to 'live', returning the updated row or None."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = started_at_iso or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        if new_end_at_iso is not None:
+            cursor = await conn.execute(
+                "UPDATE deeptalk_sessions SET status = 'live', started_at = ?, end_at = ? "
+                "WHERE id = ? AND status = 'scheduled';",
+                (ts, new_end_at_iso, session_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "UPDATE deeptalk_sessions SET status = 'live', started_at = ? "
+                "WHERE id = ? AND status = 'scheduled';",
+                (ts, session_id),
+            )
+        if cursor.rowcount != 1:
+            await conn.commit()
+            return None
+        cur = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        await conn.commit()
+    return dict(row) if row is not None else None
+
+
+async def claim_deeptalk_for_end(
+    session_id: int,
+    *,
+    ended_at_iso: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically transition a 'live' session to 'completed', returning the updated row or None."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = ended_at_iso or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "UPDATE deeptalk_sessions SET status = 'completed', ended_at = ? "
+            "WHERE id = ? AND status = 'live';",
+            (ts, session_id),
+        )
+        if cursor.rowcount != 1:
+            await conn.commit()
+            return None
+        cur = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        await conn.commit()
+    return dict(row) if row is not None else None
+
+
+async def extend_deeptalk_session(
+    session_id: int,
+    extra_minutes: int,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Extend a 'live' DeepTalk session's end_at and duration_minutes atomically."""
+    if extra_minutes <= 0:
+        return None
+    conn = get_db()
+    lock = get_write_lock()
+    current_utc = now_utc.astimezone(timezone.utc) if now_utc else datetime.now(timezone.utc)
+
+    async with lock:
+        cur = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ? AND status = 'live';",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+
+        raw_end = str(row["end_at"])
+        end_dt = datetime.fromisoformat(raw_end)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        else:
+            end_dt = end_dt.astimezone(timezone.utc)
+
+        base_dt = max(end_dt, current_utc)
+        new_end_dt = (base_dt + timedelta(minutes=extra_minutes)).replace(microsecond=0)
+        new_dur = int(row["duration_minutes"]) + int(extra_minutes)
+
+        await conn.execute(
+            "UPDATE deeptalk_sessions SET end_at = ?, duration_minutes = ? WHERE id = ? AND status = 'live';",
+            (new_end_dt.isoformat(), new_dur, session_id),
+        )
+        await conn.commit()
+        cur2 = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        updated = await cur2.fetchone()
+    return dict(updated) if updated is not None else None
+
+
+async def cancel_deeptalk_session(
+    session_id: int,
+    *,
+    ended_at_iso: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically cancel a 'scheduled' or 'live' DeepTalk session."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = ended_at_iso or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "UPDATE deeptalk_sessions SET status = 'cancelled', ended_at = ? "
+            "WHERE id = ? AND status IN ('scheduled', 'live');",
+            (ts, session_id),
+        )
+        if cursor.rowcount != 1:
+            await conn.commit()
+            return None
+        cur = await conn.execute(
+            f"SELECT {_DEEPTALK_SESSION_COLS} FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        row = await cur.fetchone()
+        await conn.commit()
+    return dict(row) if row is not None else None
+
+
+async def delete_old_deeptalk_sessions(retention_days: int = 30) -> int:
+    """Delete completed or cancelled DeepTalk sessions older than retention_days."""
+    conn = get_db()
+    lock = get_write_lock()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM deeptalk_sessions WHERE status IN ('completed', 'cancelled') "
+            "AND COALESCE(ended_at, end_at, created_at) < ?;",
+            (cutoff,),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
+async def register_deeptalk_participant(
+    *,
+    session_id: int,
+    user_id: int,
+    username: str | None,
+    full_name: str,
+    now_iso: str | None = None,
+) -> tuple[bool, int]:
+    """Pre-register a user for a DeepTalk session. Returns (newly_registered, total_registered)."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = now_iso or datetime.now(timezone.utc).isoformat()
+    clean_u = _clean_username(username)
+    clean_name = (full_name or "").strip() or "کاربر"
+
+    async with lock:
+        cur = await conn.execute(
+            "SELECT registered FROM deeptalk_participants WHERE session_id = ? AND user_id = ?;",
+            (session_id, user_id),
+        )
+        existing = await cur.fetchone()
+        already_reg = bool(existing and int(existing["registered"]) == 1)
+
+        await conn.execute(
+            """
+            INSERT INTO deeptalk_participants (
+                session_id, user_id, username, full_name,
+                registered, registered_at, checked_in, checked_in_at, message_count
+            ) VALUES (?, ?, ?, ?, 1, ?, 0, NULL, 0)
+            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name,
+                registered = 1,
+                registered_at = COALESCE(deeptalk_participants.registered_at, excluded.registered_at);
+            """,
+            (session_id, user_id, clean_u, clean_name, ts),
+        )
+        cnt_cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND registered = 1;",
+            (session_id,),
+        )
+        cnt_row = await cnt_cur.fetchone()
+        total = int(cnt_row["cnt"]) if cnt_row else 0
+        await conn.commit()
+
+    return (not already_reg), total
+
+
+async def unregister_deeptalk_participant(
+    *,
+    session_id: int,
+    user_id: int,
+) -> tuple[bool, int]:
+    """Cancel pre-registration for a user. Returns (was_registered, total_registered)."""
+    conn = get_db()
+    lock = get_write_lock()
+
+    async with lock:
+        cur = await conn.execute(
+            "SELECT registered, checked_in, message_count FROM deeptalk_participants "
+            "WHERE session_id = ? AND user_id = ?;",
+            (session_id, user_id),
+        )
+        row = await cur.fetchone()
+        if row is None or int(row["registered"]) == 0:
+            cnt_cur = await conn.execute(
+                "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND registered = 1;",
+                (session_id,),
+            )
+            cnt_row = await cnt_cur.fetchone()
+            return False, (int(cnt_row["cnt"]) if cnt_row else 0)
+
+        if int(row["checked_in"]) == 0 and int(row["message_count"]) == 0:
+            await conn.execute(
+                "DELETE FROM deeptalk_participants WHERE session_id = ? AND user_id = ?;",
+                (session_id, user_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE deeptalk_participants SET registered = 0, registered_at = NULL "
+                "WHERE session_id = ? AND user_id = ?;",
+                (session_id, user_id),
+            )
+
+        cnt_cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND registered = 1;",
+            (session_id,),
+        )
+        cnt_row = await cnt_cur.fetchone()
+        total = int(cnt_row["cnt"]) if cnt_row else 0
+        await conn.commit()
+
+    return True, total
+
+
+async def checkin_deeptalk_participant_and_draw(
+    *,
+    session_id: int,
+    user_id: int,
+    username: str | None,
+    full_name: str,
+    now_iso: str | None = None,
+) -> tuple[bool, int, int] | None:
+    """Atomically check in a user to a 'live' DeepTalk and draw a unique check-in template index.
+
+    Returns:
+      - None if the session does not exist or is not currently 'live'.
+      - (False, -1, total_checked_in) if user already checked in earlier.
+      - (True, chosen_template_idx, total_checked_in) on first check-in.
+    """
+    from bot.texts.deeptalk_texts import draw_next_checkin_index
+
+    conn = get_db()
+    lock = get_write_lock()
+    ts = now_iso or datetime.now(timezone.utc).isoformat()
+    clean_u = _clean_username(username)
+    clean_name = (full_name or "").strip() or "کاربر"
+
+    async with lock:
+        sess_cur = await conn.execute(
+            "SELECT status, checkin_deck_json, last_checkin_idx FROM deeptalk_sessions WHERE id = ?;",
+            (session_id,),
+        )
+        sess_row = await sess_cur.fetchone()
+        if sess_row is None or str(sess_row["status"]) != "live":
+            return None
+
+        part_cur = await conn.execute(
+            "SELECT checked_in FROM deeptalk_participants WHERE session_id = ? AND user_id = ?;",
+            (session_id, user_id),
+        )
+        part_row = await part_cur.fetchone()
+        if part_row is not None and int(part_row["checked_in"]) == 1:
+            await conn.execute(
+                "UPDATE deeptalk_participants SET username = ?, full_name = ? "
+                "WHERE session_id = ? AND user_id = ?;",
+                (clean_u, clean_name, session_id, user_id),
+            )
+            cnt_cur = await conn.execute(
+                "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND checked_in = 1;",
+                (session_id,),
+            )
+            cnt_row = await cnt_cur.fetchone()
+            await conn.commit()
+            return False, -1, (int(cnt_row["cnt"]) if cnt_row else 1)
+
+        raw_deck = sess_row["checkin_deck_json"]
+        deck: list[int] | None = None
+        if raw_deck:
+            try:
+                parsed = json.loads(raw_deck)
+                if isinstance(parsed, list):
+                    deck = parsed
+            except Exception:
+                deck = None
+
+        last_idx = sess_row["last_checkin_idx"]
+        chosen_idx, remaining_deck = draw_next_checkin_index(
+            deck,
+            int(last_idx) if last_idx is not None else None,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO deeptalk_participants (
+                session_id, user_id, username, full_name,
+                registered, registered_at, checked_in, checked_in_at, message_count
+            ) VALUES (?, ?, ?, ?, 0, NULL, 1, ?, 0)
+            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name,
+                checked_in = 1,
+                checked_in_at = COALESCE(deeptalk_participants.checked_in_at, excluded.checked_in_at);
+            """,
+            (session_id, user_id, clean_u, clean_name, ts),
+        )
+        await conn.execute(
+            "UPDATE deeptalk_sessions SET checkin_deck_json = ?, last_checkin_idx = ? WHERE id = ?;",
+            (json.dumps(remaining_deck), chosen_idx, session_id),
+        )
+        cnt_cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND checked_in = 1;",
+            (session_id,),
+        )
+        cnt_row = await cnt_cur.fetchone()
+        total_checked_in = int(cnt_row["cnt"]) if cnt_row else 1
+        await conn.commit()
+
+    return True, chosen_idx, total_checked_in
+
+
+async def increment_deeptalk_message_count(
+    *,
+    session_id: int,
+    user_id: int,
+    username: str | None,
+    full_name: str,
+) -> None:
+    """Increment live discussion message count for a participant in an active DeepTalk."""
+    conn = get_db()
+    lock = get_write_lock()
+    clean_u = _clean_username(username)
+    clean_name = (full_name or "").strip() or "کاربر"
+
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO deeptalk_participants (
+                session_id, user_id, username, full_name,
+                registered, registered_at, checked_in, checked_in_at, message_count
+            ) VALUES (?, ?, ?, ?, 0, NULL, 0, NULL, 1)
+            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, deeptalk_participants.username),
+                full_name = excluded.full_name,
+                message_count = deeptalk_participants.message_count + 1;
+            """,
+            (session_id, user_id, clean_u, clean_name),
+        )
+        await conn.commit()
+
+
+async def list_deeptalk_participants(session_id: int) -> list[dict[str, Any]]:
+    """List all registered or checked-in participants for a DeepTalk session."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT session_id, user_id, username, full_name, registered, registered_at, "
+        "checked_in, checked_in_at, message_count "
+        "FROM deeptalk_participants "
+        "WHERE session_id = ? AND (registered = 1 OR checked_in = 1) "
+        "ORDER BY checked_in DESC, COALESCE(checked_in_at, registered_at) ASC, user_id ASC;",
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_deeptalk_dm_targets(session_id: int) -> list[dict[str, Any]]:
+    """Return pre-registered participants who have started the bot in private chat (dm_started = 1)."""
+    conn = get_db()
+    cursor = await conn.execute(
+        """
+        SELECT p.user_id, p.username, p.full_name
+        FROM deeptalk_participants p
+        INNER JOIN bot_users u ON u.user_id = p.user_id
+        WHERE p.session_id = ? AND p.registered = 1 AND u.dm_started = 1
+        ORDER BY p.registered_at ASC;
+        """,
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_deeptalk_session_stats(session_id: int) -> dict[str, Any]:
+    """Compute attendance, first-responder, message count, and top speakers for a DeepTalk session."""
+    conn = get_db()
+    agg_cur = await conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN registered = 1 THEN 1 ELSE 0 END), 0) AS registered_count,
+            COALESCE(SUM(CASE WHEN checked_in = 1 THEN 1 ELSE 0 END), 0) AS checked_in_count,
+            COALESCE(SUM(CASE WHEN registered = 1 AND checked_in = 1 THEN 1 ELSE 0 END), 0) AS on_time_count,
+            COALESCE(SUM(CASE WHEN registered = 0 AND checked_in = 1 THEN 1 ELSE 0 END), 0) AS walk_in_count,
+            COALESCE(SUM(CASE WHEN registered = 1 AND checked_in = 0 THEN 1 ELSE 0 END), 0) AS missed_count,
+            COALESCE(SUM(message_count), 0) AS total_messages
+        FROM deeptalk_participants
+        WHERE session_id = ?;
+        """,
+        (session_id,),
+    )
+    agg = await agg_cur.fetchone()
+
+    first_cur = await conn.execute(
+        "SELECT user_id, username, full_name, checked_in_at FROM deeptalk_participants "
+        "WHERE session_id = ? AND checked_in = 1 "
+        "ORDER BY checked_in_at ASC, user_id ASC LIMIT 1;",
+        (session_id,),
+    )
+    first_row = await first_cur.fetchone()
+
+    top_cur = await conn.execute(
+        "SELECT user_id, username, full_name, message_count FROM deeptalk_participants "
+        "WHERE session_id = ? AND message_count > 0 "
+        "ORDER BY message_count DESC, checked_in DESC, user_id ASC LIMIT 3;",
+        (session_id,),
+    )
+    top_rows = await top_cur.fetchall()
+
+    return {
+        "registered_count": int(agg["registered_count"]) if agg else 0,
+        "checked_in_count": int(agg["checked_in_count"]) if agg else 0,
+        "on_time_count": int(agg["on_time_count"]) if agg else 0,
+        "walk_in_count": int(agg["walk_in_count"]) if agg else 0,
+        "missed_count": int(agg["missed_count"]) if agg else 0,
+        "total_messages": int(agg["total_messages"]) if agg else 0,
+        "first_responder": dict(first_row) if first_row is not None else None,
+        "top_speakers": [dict(r) for r in top_rows],
+    }

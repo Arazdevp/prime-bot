@@ -19,6 +19,7 @@ from bot.services.llm_client import BaseLLMClient
 from bot.services.morning_service import morning_greeting_job
 from bot.services.publisher import send_summary, send_summary_parts
 from bot.services.summarizer import summarize_topic_messages
+from bot.services.deeptalk_service import sweep_due_deeptalks
 from bot.services.timer_service import sweep_due_timers
 from bot.utils.dates import compute_nightly_cutoff
 from bot.utils.html_utils import escape_html
@@ -599,6 +600,11 @@ async def cleanup_job() -> None:
     if deleted_chunks:
         logger.info("Deleted %s cached map chunks older than %s days.", deleted_chunks, settings.RETENTION_DAYS)
 
+    # 1e. Purge completed/cancelled DeepTalk sessions older than timer retention days
+    deleted_deeptalks = await repository.delete_old_deeptalk_sessions(settings.TIMER_RETENTION_DAYS)
+    if deleted_deeptalks:
+        logger.info("Deleted %s old DeepTalk sessions older than %s days.", deleted_deeptalks, settings.TIMER_RETENTION_DAYS)
+
     # 2. SQLite PRAGMA optimize
     conn = get_db()
     lock = get_write_lock()
@@ -685,6 +691,18 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="daily_morning_greeting",
         name="Daily Hills Morning Greeting",
         misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 5. Periodic safety-net DeepTalk sweep every 60 seconds
+    scheduler.add_job(
+        sweep_due_deeptalks,
+        trigger=IntervalTrigger(seconds=60, timezone=tz),
+        args=[bot],
+        id="deeptalk_sweep",
+        name="DeepTalk Sessions Due Sweep",
+        misfire_grace_time=60,
         coalesce=True,
         max_instances=1,
     )

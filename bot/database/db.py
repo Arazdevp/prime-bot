@@ -131,6 +131,66 @@ CREATE TABLE IF NOT EXISTS map_chunk_cache (
 
 CREATE INDEX IF NOT EXISTS idx_map_chunk_cache_created
     ON map_chunk_cache(created_at);
+
+CREATE TABLE IF NOT EXISTS deeptalk_admins (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    added_by INTEGER NOT NULL,
+    added_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deeptalk_settings (
+    chat_id INTEGER PRIMARY KEY,
+    thread_id INTEGER,
+    default_duration_minutes INTEGER NOT NULL DEFAULT 45,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deeptalk_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    description TEXT,
+    created_by INTEGER NOT NULL,
+    creator_name TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL,
+    duration_minutes INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    announce_message_id INTEGER,
+    start_message_id INTEGER,
+    end_message_id INTEGER,
+    checkin_deck_json TEXT,
+    last_checkin_idx INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_deeptalk_sessions_status_times
+    ON deeptalk_sessions(status, start_at, end_at);
+
+CREATE INDEX IF NOT EXISTS idx_deeptalk_sessions_chat_status
+    ON deeptalk_sessions(chat_id, status, start_at);
+
+CREATE TABLE IF NOT EXISTS deeptalk_participants (
+    session_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    full_name TEXT NOT NULL,
+    registered INTEGER NOT NULL DEFAULT 0,
+    registered_at TEXT,
+    checked_in INTEGER NOT NULL DEFAULT 0,
+    checked_in_at TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(session_id, user_id),
+    FOREIGN KEY(session_id) REFERENCES deeptalk_sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_deeptalk_participants_session
+    ON deeptalk_participants(session_id, checked_in, registered);
 """
 
 
@@ -278,6 +338,65 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
                 ON map_chunk_cache(created_at);
         """)
         await conn.execute("PRAGMA user_version = 6;")
+        await conn.commit()
+
+    if current_version < 7:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS deeptalk_admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                added_by INTEGER NOT NULL,
+                added_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deeptalk_settings (
+                chat_id INTEGER PRIMARY KEY,
+                thread_id INTEGER,
+                default_duration_minutes INTEGER NOT NULL DEFAULT 45,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deeptalk_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                description TEXT,
+                created_by INTEGER NOT NULL,
+                creator_name TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                announce_message_id INTEGER,
+                start_message_id INTEGER,
+                end_message_id INTEGER,
+                checkin_deck_json TEXT,
+                last_checkin_idx INTEGER,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                ended_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_deeptalk_sessions_status_times
+                ON deeptalk_sessions(status, start_at, end_at);
+            CREATE INDEX IF NOT EXISTS idx_deeptalk_sessions_chat_status
+                ON deeptalk_sessions(chat_id, status, start_at);
+            CREATE TABLE IF NOT EXISTS deeptalk_participants (
+                session_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT NOT NULL,
+                registered INTEGER NOT NULL DEFAULT 0,
+                registered_at TEXT,
+                checked_in INTEGER NOT NULL DEFAULT 0,
+                checked_in_at TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_id, user_id),
+                FOREIGN KEY(session_id) REFERENCES deeptalk_sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_deeptalk_participants_session
+                ON deeptalk_participants(session_id, checked_in, registered);
+        """)
+        await conn.execute("PRAGMA user_version = 7;")
         await conn.commit()
 
 

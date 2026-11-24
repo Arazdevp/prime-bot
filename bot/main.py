@@ -13,9 +13,10 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
-from bot.handlers import admin, listener, panel, private, timer
+from bot.handlers import admin, deeptalk, listener, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
 from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
+from bot.services.deeptalk_service import rehydrate_deeptalk_sessions
 from bot.services.llm_client import close_llm_client
 from bot.services.morning_service import run_morning_catchup_if_needed
 from bot.services.timer_service import rehydrate_active_timers, set_bot_username
@@ -122,6 +123,7 @@ async def main() -> None:
 
     dp.include_router(admin.router)
     dp.include_router(timer.router)
+    dp.include_router(deeptalk.router)
     dp.include_router(listener.router)
     dp.include_router(private.router)
     dp.include_router(panel.router)
@@ -157,8 +159,9 @@ async def main() -> None:
         task.add_done_callback(_on_done)
         return task
 
-    # Restore pending/missed user timers from SQLite
+    # Restore pending/missed user timers and DeepTalk sessions from SQLite
     _spawn_background_task(rehydrate_active_timers(bot), "rehydrate_active_timers")
+    _spawn_background_task(rehydrate_deeptalk_sessions(bot), "rehydrate_deeptalk_sessions")
 
     # Log next run time of nightly job
     nightly_job = scheduler.get_job("nightly_summary")

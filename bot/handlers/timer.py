@@ -723,6 +723,7 @@ async def cmd_timer(message: Message, bot: Bot, state: FSMContext) -> None:
                     note=note,
                     timer_type=timer_type,
                     fire_at=fire_at_tehran,
+                    now_utc=now_tehran,
                 )
                 if err is not None or timer_row is None:
                     await _send_in_origin(message, err or "❌ نتونستم تایمر رو ثبت کنم.")
@@ -995,6 +996,7 @@ async def handle_timer_callback(
                 note=draft.note,
                 timer_type=draft.mode,
                 fire_at=fire_at,
+                now_utc=now_tehran,
                 source_message_id=callback.message.message_id if callback.message else None,
             )
             if err is not None or timer_row is None:

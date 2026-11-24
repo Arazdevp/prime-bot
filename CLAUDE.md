@@ -50,23 +50,27 @@ tg-daily-summarizer/
 │   │   ├── db.py            # aiosqlite connection with PRAGMA WAL, foreign keys, write lock, user_version migrations
 │   │   └── repository.py    # All parameterized async queries (messages, topics, settings, bot_users, known_groups)
 │   ├── handlers/
-│   │   ├── listener.py      # Captures text, captions, replies, topic creation/rename, my_chat_member tracking
+│   │   ├── listener.py      # Captures text, captions, replies, topic creation/rename, my_chat_member & live DeepTalk msg counts
 │   │   ├── admin.py         # Full Persian group admin command suite (/status, /topics, /mode, etc.)
 │   │   ├── timer.py         # Interactive /timer panel (countdown, Jalali calendar, quick shorthand, FSM, snooze/ack)
-│   │   ├── private.py       # Role-aware private commands (/start, /panel, /help, /about, /cancel) & DM timer activation
+│   │   ├── deeptalk.py      # Interactive /deeptalk panel (PV + group, owner admin registry, session wizard, check-ins, live controls)
+│   │   ├── private.py       # Role-aware private commands (/start, /panel, /help, /about, /cancel), DM timer & DeepTalk PV lists
 │   │   └── panel.py         # Inline-keyboard Private Admin Panel (8 screens, FSM min-messages, live run, DM preview)
 │   ├── keyboards/
 │   │   ├── panel.py         # Compact PanelCB (prefix="pn", <= 64 bytes) & paginated inline keyboard builders
-│   │   └── timer.py         # Compact TimerCB (prefix="tm", <= 64 bytes), Jalali calendar grid & timer keyboards
+│   │   ├── timer.py         # Compact TimerCB (prefix="tm", <= 64 bytes), Jalali calendar grid & timer keyboards
+│   │   └── deeptalk.py      # Compact DeepTalkCB (prefix="dt", <= 64 bytes), announcement/start/end cards & wizard keyboards
 │   ├── middlewares/
 │   │   └── throttle.py      # PrivateThrottleMiddleware (1 update/sec per user in private chat)
 │   ├── texts/
 │   │   ├── private_texts.py # Casual Persian message pools & non-repeating pick() helper
-│   │   └── morning_texts.py # 100 unique Hills/Prime morning greetings, day counter & shuffle-bag draw
+│   │   ├── morning_texts.py # 100 unique Hills/Prime morning greetings, day counter & shuffle-bag draw
+│   │   └── deeptalk_texts.py # 20 unique DeepTalk check-in templates, shuffle-bag draw & card/PV formatters
 │   ├── services/
-│   │   ├── access.py        # Private role resolution, group membership check & shared AdminFilter TTL cache
+│   │   ├── access.py        # Private role resolution, DeepTalk admin check, group membership & shared AdminFilter TTL cache
 │   │   ├── morning_service.py # Daily 05:01 Hills morning greeting job, catch-up & admin test sender
 │   │   ├── timer_service.py # APScheduler DateTrigger scheduling, rehydration, atomic claim & group+DM firing
+│   │   ├── deeptalk_service.py # DeepTalk scheduling, live start/end cards, DM reminders, extensions & rehydration
 │   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (OpenRouter / OpenAI-compatible)
 │   │   ├── summarizer.py    # Transcript formatting, map-reduce chunking, Telegram HTML sanitize
 │   │   └── publisher.py     # Safe sender with smart tag-aware splitting, destination override & parse error recovery

@@ -122,6 +122,14 @@ def build_home_kb(
 
     footer: list[InlineKeyboardButton] = []
     if is_global_admin:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🎙 پنل دیپ‌تاک و مدیریت ادمین‌ها",
+                    callback_data=PanelCB(action="dtk").pack(),
+                )
+            ]
+        )
         footer.append(
             InlineKeyboardButton(
                 text="📊 وضعیت کلی",

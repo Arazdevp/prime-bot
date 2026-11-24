@@ -8,6 +8,7 @@ from aiogram.types import ChatMemberUpdated, Message
 from bot.config import get_settings
 from bot.database import repository
 from bot.filters import ForumGroupFilter
+from bot.services.deeptalk_service import get_live_session_id_for_topic
 from bot.texts.private_texts import pick
 from bot.utils.general_topic import resolve_thread_id
 from bot.utils.noise_filter import is_noise
@@ -250,6 +251,19 @@ async def capture_message(message: Message) -> None:
         # 4. Skip bot commands
         if text.strip().startswith("/"):
             return
+
+        # 4b. Track live DeepTalk participation stats (O(1) memory lookup; zero DB hit when idle)
+        live_dt_sid = get_live_session_id_for_topic(message.chat.id, resolve_thread_id(message))
+        if live_dt_sid is not None and message.from_user and not message.from_user.is_bot:
+            try:
+                await repository.increment_deeptalk_message_count(
+                    session_id=live_dt_sid,
+                    user_id=message.from_user.id,
+                    username=message.from_user.username,
+                    full_name=message.from_user.full_name or message.from_user.first_name or "کاربر",
+                )
+            except Exception as dt_exc:
+                logger.debug("Failed incrementing DeepTalk message count: %s", dt_exc)
 
         # 5. Apply noise filter
         settings = get_settings()

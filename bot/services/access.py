@@ -170,3 +170,44 @@ async def is_active_group_member(
             continue
 
     return False
+
+
+async def can_manage_deeptalk(user_id: int) -> bool:
+    """Return True ONLY if user_id is a bot owner (ADMIN_IDS) or an explicitly designated DeepTalk admin."""
+    if is_global_admin(user_id):
+        return True
+    try:
+        return await repository.is_deeptalk_admin(user_id)
+    except Exception as exc:
+        logger.debug("Failed checking DeepTalk admin status for %s: %s", user_id, exc)
+        return False
+
+
+async def get_deeptalk_groups() -> list[dict[str, Any]]:
+    """Return active allowed groups available for DeepTalk management."""
+    return _filter_allowed_groups(await repository.list_active_known_groups())
+
+
+async def is_user_in_specific_group(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    ttl: float = MEMBER_CACHE_TTL_SECONDS,
+) -> bool:
+    """Check whether user_id belongs to chat_id (using shared TTL cache), or is a bot owner / DeepTalk admin."""
+    if await can_manage_deeptalk(user_id):
+        return True
+
+    now = time.monotonic()
+    cached = _member_cache.get((chat_id, user_id))
+    if cached is not None and now < cached[1]:
+        return cached[0]
+
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        is_member = member.status in ("creator", "administrator", "member", "restricted")
+        _member_cache[(chat_id, user_id)] = (is_member, now + ttl)
+        return is_member
+    except Exception as exc:
+        logger.debug("Failed checking group %s membership for user %s: %s", chat_id, user_id, exc)
+        return False

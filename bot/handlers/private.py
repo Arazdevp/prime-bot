@@ -13,9 +13,17 @@ from bot.config import get_settings
 from bot.database import repository
 from bot.filters import PrivateChatFilter
 from bot.handlers.panel import build_admin_help_text, render_home_or_dashboard
+from bot.keyboards.deeptalk import DeepTalkCB
 from bot.keyboards.panel import PanelCB, build_open_panel_kb
 from bot.keyboards.timer import TimerCB, build_dm_timer_entry_kb
-from bot.services.access import UserRole, is_active_group_member, resolve_user_role
+from bot.services.access import (
+    UserRole,
+    can_manage_deeptalk,
+    is_active_group_member,
+    is_user_in_specific_group,
+    resolve_user_role,
+)
+from bot.services.deeptalk_service import render_pv_participants_view
 from bot.texts.private_texts import pick
 from bot.utils.dates import format_persian_date, format_persian_short_date
 from bot.utils.html_utils import escape_html
@@ -55,6 +63,26 @@ def _parse_utc_iso(value: str | None) -> datetime | None:
 def _display_name(user: User) -> str:
     """Return friendly casual display name for a Telegram user."""
     return (user.first_name or user.full_name or "دوست عزیز").strip() or "دوست عزیز"
+
+
+def _build_deeptalk_admin_entry_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Quick entry keyboard for designated DeepTalk admins in private chat."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎙 باز کردن پنل دیپ‌تاک",
+                    callback_data=DeepTalkCB(action="home", sid=user_id).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏱ پنل تایمر شخصی",
+                    callback_data=TimerCB(action="home", owner_id=user_id).pack(),
+                )
+            ],
+        ]
+    )
 
 
 async def _safe_answer(
@@ -237,6 +265,13 @@ async def cmd_private_cancel(message: Message, bot: Bot, state: FSMContext) -> N
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await can_manage_deeptalk(user.id):
+                await _safe_answer(
+                    message,
+                    "الان هیچ عملیاتی در جریان نیست 😄 برای مدیریت جلسات گفتگو <code>/deeptalk</code> رو بزن.",
+                    reply_markup=_build_deeptalk_admin_entry_kb(user.id),
+                )
+                return
             if await is_active_group_member(bot, user.id):
                 await _safe_answer(
                     message,
@@ -274,7 +309,62 @@ async def cmd_private_start(message: Message, bot: Bot, state: FSMContext) -> No
         payload = _extract_start_payload(message.text)
         role, _groups = await resolve_user_role(bot, user.id)
 
+        # Deep-link: '/start dt_<session_id>' -> show DeepTalk participant list to any group member
+        if payload.startswith("dt_") and payload[3:].isdigit():
+            session_id = int(payload[3:])
+            session = await repository.get_deeptalk_session(session_id)
+            if session is None:
+                if (
+                    role != UserRole.STRANGER
+                    or await can_manage_deeptalk(user.id)
+                    or await is_active_group_member(bot, user.id)
+                ):
+                    await _safe_answer(message, "⚠️ این جلسه دیپ‌تاک پیدا نشد یا منقضی شده است.")
+                    return
+                await handle_stranger_contact(message, bot, is_start=True)
+                return
+
+            allowed_viewer = (
+                role != UserRole.STRANGER
+                or await is_user_in_specific_group(bot, int(session["chat_id"]), user.id)
+            )
+            if not allowed_viewer:
+                await handle_stranger_contact(message, bot, is_start=True)
+                return
+
+            await repository.set_bot_user_dm_started(
+                user.id,
+                True,
+                username=user.username,
+                full_name=user.full_name,
+            )
+            rendered_pv = await render_pv_participants_view(session_id)
+            if rendered_pv is not None:
+                await _safe_answer(message, rendered_pv[0], reply_markup=rendered_pv[1])
+                return
+
         if role == UserRole.STRANGER:
+            if await can_manage_deeptalk(user.id):
+                await repository.set_bot_user_dm_started(
+                    user.id,
+                    True,
+                    username=user.username,
+                    full_name=user.full_name,
+                )
+                safe_name = escape_html(_display_name(user))
+                dt_welcome = (
+                    f"سلام <b>{safe_name}</b> عزیز! 👋🔥\n\n"
+                    "🎙 تو به عنوان <b>ادمین دیپ‌تاک</b> به این ربات دسترسی داری!\n"
+                    "با دستور <code>/deeptalk</code> یا دکمه زیر می‌تونی محوریت و ساعت دیپ‌تاک بعدی رو تنظیم کنی "
+                    "یا جلسات در حال برگزاری رو مدیریت کنی 👇"
+                )
+                await _safe_answer(
+                    message,
+                    dt_welcome,
+                    reply_markup=_build_deeptalk_admin_entry_kb(user.id),
+                )
+                return
+
             if await is_active_group_member(bot, user.id):
                 await repository.set_bot_user_dm_started(
                     user.id,
@@ -368,6 +458,13 @@ async def cmd_private_panel(message: Message, bot: Bot, state: FSMContext) -> No
         await state.clear()
         rendered = await render_home_or_dashboard(bot, user.id, auto_enter_single=True)
         if rendered is None:
+            if await can_manage_deeptalk(user.id):
+                await _safe_answer(
+                    message,
+                    "🎙 تو ادمین دیپ‌تاک هستی! برای ساخت و مدیریت جلسات دیپ‌تاک از دکمه زیر یا دستور <code>/deeptalk</code> استفاده کن 👇",
+                    reply_markup=_build_deeptalk_admin_entry_kb(user.id),
+                )
+                return
             await handle_stranger_contact(message, bot, is_start=False)
             return
 
@@ -388,6 +485,16 @@ async def cmd_private_help(message: Message, bot: Bot) -> None:
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await can_manage_deeptalk(user.id):
+                dt_help = (
+                    "🎙 <b>راهنمای ادمین دیپ‌تاک</b>\n\n"
+                    "• با دستور <code>/deeptalk</code> (همینجا یا داخل تاپیک گروه) پنل ساخت و کنترل دیپ‌تاک باز می‌شه.\n"
+                    "• می‌تونی <b>محوریت گفتگو</b>، <b>توضیحات</b>، <b>ساعت و تاریخ شروع</b> و <b>مدت بحث</b> رو مشخص کنی.\n"
+                    "• بعد از انتشار فراخوان، بچه‌ها با دکمه <b>«منم هستم»</b> ثبت‌نام می‌کنن و سر ساعت هم با <b>«اعلام حضور»</b> وارد بحث می‌شن!\n"
+                    "• حین جلسه هم از بخش «📋 جلسات فعال» می‌تونی زمان بحث رو تمدید کنی (<code>+۱۵ دقیقه</code>) یا دستی جمع‌بندیش کنی 🔥"
+                )
+                await _safe_answer(message, dt_help, reply_markup=_build_deeptalk_admin_entry_kb(user.id))
+                return
             if await is_active_group_member(bot, user.id):
                 member_help = (
                     "⏱ <b>راهنمای تایمر و یادآور</b>\n\n"
@@ -449,6 +556,13 @@ async def handle_private_fallback(message: Message, bot: Bot) -> None:
 
         role, _groups = await resolve_user_role(bot, user.id)
         if role == UserRole.STRANGER:
+            if await can_manage_deeptalk(user.id):
+                await _safe_answer(
+                    message,
+                    "برای ساخت یا مدیریت جلسات گفتگو دستور <code>/deeptalk</code> رو بزن یا از دکمه زیر استفاده کن 🎙",
+                    reply_markup=_build_deeptalk_admin_entry_kb(user.id),
+                )
+                return
             if await is_active_group_member(bot, user.id):
                 await _safe_answer(
                     message,

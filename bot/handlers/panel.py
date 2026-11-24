@@ -65,7 +65,7 @@ router.message.filter(PrivateChatFilter())
 
 _PERSIAN_DIGIT_TABLE = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
-_GLOBAL_ONLY_ACTIONS = {"stat"}
+_GLOBAL_ONLY_ACTIONS = {"stat", "dtk"}
 _GROUP_ACTIONS = {
     "grp",
     "tog",
@@ -204,6 +204,7 @@ def build_admin_help_text(is_global: bool) -> str:
         f"{role_note}\n\n"
         "<b>دستورات پیوی:</b>\n"
         "• <code>/panel</code> — باز کردن پنل مدیریتی دکمه‌ای\n"
+        "• <code>/deeptalk</code> — پنل ساخت و مدیریت جلسات دیپ‌تاک (ویژه مالک ربات و ادمین‌های دیپ‌تاک)\n"
         "• <code>/timer</code> — پنل شیشه‌ای تایمر و یادآور (دقیقه‌ای/ساعتی و تقویم شمسی)\n"
         "• <code>/start</code> — خوش‌آمدگویی و دکمه سریع پنل\n"
         "• <code>/help</code> — نمایش همین راهنما\n"
@@ -725,6 +726,12 @@ async def handle_panel_callback(
             text, kb = await render_global_status()
             await safe_edit_message(callback, text, kb)
             await safe_answer_callback(callback)
+            return
+
+        if action == "dtk":
+            from bot.handlers.deeptalk import open_deeptalk_hub_from_panel
+
+            await open_deeptalk_hub_from_panel(callback, bot, state)
             return
 
         if action == "grp":
