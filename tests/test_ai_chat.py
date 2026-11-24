@@ -38,7 +38,8 @@ def _fake_settings(admin_ids: list[int] | None = None, allowed_chats: list[int] 
         ALLOWED_CHAT_IDS=allowed_chats if allowed_chats is not None else [],
         AI_CHAT_API_KEY="AQ.TestKeyForUnitTests",
         GEMINI_API_KEY=None,
-        AI_CHAT_MODEL="gemini-2.5-flash",
+        AI_CHAT_MODEL="gemini-3.5-flash-lite",
+        AI_CHAT_FALLBACK_MODELS=["gemini-flash-lite-latest", "gemini-3.8-flash"],
         AI_CHAT_MAX_OUTPUT_TOKENS=1024,
         AI_CHAT_TEMPERATURE=0.85,
         AI_CHAT_HISTORY_LIMIT=6,
@@ -140,7 +141,7 @@ async def test_gemini_client_generate_chat_multiturn_payload_and_thought_filter(
 
     client = GeminiClient(
         api_key="AQ.test",
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash-lite",
         max_output_tokens=512,
         http_client=mock_http,
     )
@@ -153,9 +154,11 @@ async def test_gemini_client_generate_chat_multiturn_payload_and_thought_filter(
         ],
         temperature=0.85,
         max_output_tokens=1024,
+        model="gemini-flash-lite-latest",
     )
 
     assert reply == "آره دقیقاً، همون مسیر خیلی بهتره!"
+    assert "models/gemini-flash-lite-latest:generateContent" in mock_http.post.call_args.args[0]
     call_kwargs = mock_http.post.call_args.kwargs
     assert call_kwargs["headers"]["x-goog-api-key"] == "AQ.test"
     payload = call_kwargs["json"]
@@ -165,7 +168,7 @@ async def test_gemini_client_generate_chat_multiturn_payload_and_thought_filter(
     assert payload["contents"][1]["role"] == "model"
     assert payload["generationConfig"]["temperature"] == 0.85
     assert payload["generationConfig"]["maxOutputTokens"] == 1024
-    assert payload["generationConfig"]["thinkingConfig"] == {"thinkingBudget": 0}
+    assert "thinkingConfig" not in payload["generationConfig"]
 
 
 @pytest.mark.asyncio
@@ -376,7 +379,7 @@ async def test_generate_ai_chat_reply_history_prompt_override_and_handler(tmp_pa
     try:
         recorded_calls: list[tuple[str, list[dict[str, str]]]] = []
 
-        async def fake_generate_chat(system_prompt, messages, temperature=0.85, max_output_tokens=1024):
+        async def fake_generate_chat(system_prompt, messages, temperature=0.85, max_output_tokens=1024, model=None):
             recorded_calls.append((system_prompt, list(messages)))
             return f"باشه آرش، حله! (تعداد پیام‌ها: {len(messages)})"
 
@@ -452,6 +455,44 @@ async def test_generate_ai_chat_reply_history_prompt_override_and_handler(tmp_pa
 
             assert clear_conversation_history() >= 1
             assert count_active_conversations() == 0
+    finally:
+        await close_db()
+        reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_automatic_model_fallback_on_503_and_404(tmp_path: Path) -> None:
+    """Verify generate_ai_chat_reply automatically falls back on 404/503 without failing the user."""
+    reset_ai_chat_state()
+    await init_db(str(tmp_path / "ai_chat_fallback.db"))
+    cfg = _fake_settings(admin_ids=[11111])
+    try:
+        tried_models: list[str] = []
+
+        async def fallback_generate_chat(system_prompt, messages, temperature=0.85, max_output_tokens=1024, model=None):
+            tried_models.append(model)
+            if model == "gemini-3.5-flash-lite":
+                raise LLMError("model deprecated", status_code=404, is_retryable=False)
+            if model == "gemini-flash-lite-latest":
+                raise LLMError("high demand", status_code=503, is_retryable=True)
+            return "الان روبه‌راه شدم رفیق!"
+
+        mock_client = MagicMock(spec=GeminiClient)
+        mock_client.generate_chat = AsyncMock(side_effect=fallback_generate_chat)
+
+        with patch("bot.services.ai_chat_service.get_settings", return_value=cfg), patch(
+            "bot.services.ai_chat_service.get_ai_chat_client", return_value=mock_client
+        ):
+            reply = await generate_ai_chat_reply(
+                chat_id=-100555,
+                thread_id=1,
+                chat_type="supergroup",
+                speaker_name="آرش",
+                user_text="تست فال‌بک",
+            )
+
+        assert reply == "الان روبه‌راه شدم رفیق!"
+        assert tried_models == ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash"]
     finally:
         await close_db()
         reset_ai_chat_state()

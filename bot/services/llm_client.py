@@ -285,10 +285,16 @@ class GeminiClient(BaseLLMClient):
             self._owns_client = True
         return self._client
 
-    async def _post_generate(self, payload: dict[str, Any], allow_truncated: bool) -> str:
+    async def _post_generate(
+        self,
+        payload: dict[str, Any],
+        allow_truncated: bool,
+        model: str | None = None,
+    ) -> str:
         """Send a Gemini generateContent request and extract clean non-thought text."""
         client = await self._get_client()
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        target_model = (model or self.model).strip()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key,
@@ -304,7 +310,7 @@ class GeminiClient(BaseLLMClient):
             excerpt = response.text[:400]
             parsed_err = _safe_parse_json(response)
             retry_after = _parse_retry_after(response, parsed_err) if response.status_code in (429, 503) else None
-            logger.error("Gemini API non-200 response [%s]: %s", response.status_code, excerpt)
+            logger.error("Gemini API non-200 response [%s] (model=%s): %s", response.status_code, target_model, excerpt)
             raise LLMError(
                 f"Gemini API returned status {response.status_code}: {excerpt}",
                 status_code=response.status_code,
@@ -346,17 +352,17 @@ class GeminiClient(BaseLLMClient):
                 logger.warning(
                     "Gemini generation truncated due to finishReason MAX_TOKENS (model=%s, output_chars=%d). "
                     "Raising retryable LLMTruncationError.",
-                    self.model,
+                    target_model,
                     len(full_text),
                 )
                 raise LLMTruncationError(
-                    f"Gemini output truncated due to MAX_TOKENS (model: {self.model})",
+                    f"Gemini output truncated due to MAX_TOKENS (model: {target_model})",
                     truncated_text=full_text,
                 )
             logger.warning(
                 "Gemini generation truncated due to MAX_TOKENS persisted on retry (model=%s, output_chars=%d). "
                 "Returning truncated output for sanitization.",
-                self.model,
+                target_model,
                 len(full_text),
             )
             if not full_text:
@@ -411,6 +417,7 @@ class GeminiClient(BaseLLMClient):
         messages: list[dict[str, str]],
         temperature: float = 0.85,
         max_output_tokens: int | None = None,
+        model: str | None = None,
     ) -> str:
         """Generate a multi-turn conversational reply using Gemini REST contents history."""
         contents = [
@@ -432,12 +439,9 @@ class GeminiClient(BaseLLMClient):
             "generationConfig": {
                 "temperature": float(temperature),
                 "maxOutputTokens": int(max_output_tokens or self.max_output_tokens),
-                "thinkingConfig": {
-                    "thinkingBudget": 0,
-                },
             },
         }
-        return await self._post_generate(payload, allow_truncated=True)
+        return await self._post_generate(payload, allow_truncated=True, model=model)
 
     async def close(self) -> None:
         if self._owns_client and self._client and not self._client.is_closed:

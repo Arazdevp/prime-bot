@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.types import Message
 from bot.config import get_settings
 from bot.database import repository
-from bot.services.llm_client import GeminiClient, get_ai_chat_client
+from bot.services.llm_client import GeminiClient, LLMError, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
 from bot.services.timer_service import get_bot_username
 from bot.texts.ai_chat_texts import DEFAULT_AI_CHAT_SYSTEM_PROMPT, build_runtime_system_prompt
@@ -226,15 +226,42 @@ async def generate_ai_chat_reply(
             topic_name=topic_name,
         )
 
-        raw_reply = await async_retry(
-            lambda: active_client.generate_chat(
-                system_prompt=runtime_system,
-                messages=pending_turns,
-                temperature=settings.AI_CHAT_TEMPERATURE,
-                max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
-            ),
-            retries=1,
-        )
+        raw_fallbacks = getattr(settings, "AI_CHAT_FALLBACK_MODELS", None) or []
+        candidate_models: list[str] = []
+        for candidate in [settings.AI_CHAT_MODEL, *raw_fallbacks]:
+            cleaned = str(candidate).strip()
+            if cleaned and cleaned not in candidate_models:
+                candidate_models.append(cleaned)
+        if not candidate_models:
+            candidate_models = ["gemini-3.5-flash-lite"]
+
+        raw_reply: str | None = None
+        for idx, candidate_model in enumerate(candidate_models):
+            is_last = idx == len(candidate_models) - 1
+            try:
+                raw_reply = await async_retry(
+                    lambda m=candidate_model: active_client.generate_chat(
+                        system_prompt=runtime_system,
+                        messages=pending_turns,
+                        temperature=settings.AI_CHAT_TEMPERATURE,
+                        max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+                        model=m,
+                    ),
+                    retries=1 if is_last else 0,
+                )
+                break
+            except LLMError as exc:
+                if not is_last and exc.status_code in (404, 429, 503):
+                    logger.warning(
+                        "AI chat model '%s' failed (status=%s); falling back to next model...",
+                        candidate_model,
+                        exc.status_code,
+                    )
+                    continue
+                raise
+
+        if raw_reply is None:
+            raise LLMError("All AI chat model candidates failed", status_code=503, is_retryable=True)
 
         sanitized = sanitize_telegram_html(raw_reply)
         if not sanitized:

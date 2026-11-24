@@ -82,8 +82,16 @@ class Settings(BaseSettings):
         description="Dedicated Google Gemini API key for interactive AI chat (falls back to GEMINI_API_KEY)",
     )
     AI_CHAT_MODEL: str = Field(
-        default="gemini-2.5-flash",
+        default="gemini-3.5-flash-lite",
         description="Google Gemini model identifier used for interactive AI chat",
+    )
+    AI_CHAT_FALLBACK_MODELS: Any = Field(
+        default_factory=lambda: [
+            "gemini-flash-lite-latest",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+        ],
+        description="Comma-separated or list of fallback Gemini models used if AI_CHAT_MODEL hits 404/429/503",
     )
     AI_CHAT_MAX_OUTPUT_TOKENS: int = Field(
         default=1024,
@@ -273,6 +281,19 @@ class Settings(BaseSettings):
             stripped = value.strip()
             return stripped if stripped else None
         return value
+
+    @field_validator("AI_CHAT_FALLBACK_MODELS", mode="after")
+    @classmethod
+    def parse_str_list(cls, value: Any) -> list[str]:
+        """Parse comma-separated strings or lists into clean non-empty model names."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        cleaned = str(value).strip()
+        return [cleaned] if cleaned else []
 
     @model_validator(mode="after")
     def validate_provider_keys(self) -> "Settings":
