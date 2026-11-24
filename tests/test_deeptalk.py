@@ -641,11 +641,13 @@ async def test_end_to_end_deeptalk_lifecycle_group_pv_checkins_extension_and_sta
             started = await start_deeptalk_session(bot, sid, now_utc=t_start)
             assert started is True
 
-            # Topic received Start Card AND User A (dm_started=1) received DM reminder!
+            # Topic received Start Card (with registered members tagged!) AND User A received DM reminder!
             topic_starts = [m for m in sent_messages if m["chat_id"] == chat_id]
             dm_pings = [m for m in sent_messages if m["chat_id"] == user_a]
             assert len(topic_starts) == 1
             assert "بحث دیپ‌تاک رسماً شروع شد" in topic_starts[0]["text"]
+            assert "@ali_creator" in topic_starts[0]["text"]
+            assert "@sara_editor" in topic_starts[0]["text"]
             assert len(dm_pings) == 1
             assert "دیپ‌تاکی که توش ثبت‌نام کرده بودی شروع شد" in dm_pings[0]["text"]
 
@@ -809,3 +811,79 @@ async def test_rehydrate_and_sweep_deeptalk_sessions(tmp_path: Path):
             assert (await repository.get_deeptalk_session(int(s_in_window["id"])))["status"] == "completed"
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_start_deeptalk_tags_all_registered_members_including_no_username_and_overflow_batches(tmp_path: Path):
+    """Verify all registered members (with or without @username) are tagged in batches of 5 when DeepTalk starts."""
+    clear_deeptalk_runtime_cache()
+    set_bot_username("prime_summarizer_bot")
+    await init_db(str(tmp_path / "dt_mentions.db"))
+
+    sent_topic_texts: list[str] = []
+
+    async def _fake_send(**kwargs):
+        if kwargs.get("chat_id") == -1007777:
+            sent_topic_texts.append(kwargs["text"])
+        return SimpleNamespace(message_id=500 + len(sent_topic_texts))
+
+    bot = AsyncMock(spec=Bot)
+    bot.send_message = AsyncMock(side_effect=_fake_send)
+    bot.edit_message_text = AsyncMock()
+
+    now_utc = datetime(2026, 11, 24, 19, 0, 0, tzinfo=timezone.utc)
+
+    try:
+        await repository.upsert_known_group(-1007777, "Prime Group", is_forum=True)
+        sess = await repository.create_deeptalk_session(
+            chat_id=-1007777,
+            thread_id=77,
+            subject="تگ کردن همه ثبت‌نامی‌ها",
+            description=None,
+            created_by=1001,
+            creator_name="آرش",
+            start_at_iso=to_utc_iso(now_utc),
+            end_at_iso=to_utc_iso(now_utc + timedelta(minutes=45)),
+            duration_minutes=45,
+        )
+        sid = int(sess["id"])
+
+        # Register 8 users: 6 with @username and 2 without @username (fallback to tg://user?id=...)
+        for idx in range(1, 9):
+            uid = 8000 + idx
+            uname = f"member_{idx}" if idx not in (3, 7) else None
+            await repository.register_deeptalk_participant(
+                session_id=sid,
+                user_id=uid,
+                username=uname,
+                full_name=f"عضو {idx} <x>",
+                now_iso=to_utc_iso(now_utc + timedelta(seconds=idx)),
+            )
+
+        with patch("bot.services.deeptalk_service.get_settings") as mock_svc:
+            mock_svc.return_value.TIMEZONE = "Asia/Tehran"
+
+            ok = await start_deeptalk_session(bot, sid, now_utc=now_utc)
+            assert ok is True
+
+        # Expect 2 topic messages: Start Card (first 5 tags) + 1 overflow Roll-Call message (remaining 3 tags)
+        assert len(sent_topic_texts) == 2
+        start_card, overflow_card = sent_topic_texts[0], sent_topic_texts[1]
+        assert _is_html_balanced(start_card)
+        assert _is_html_balanced(overflow_card)
+
+        # First 5 in Start Card
+        assert "@member_1" in start_card
+        assert "@member_2" in start_card
+        assert 'href="tg://user?id=8003"' in start_card
+        assert "@member_4" in start_card
+        assert "@member_5" in start_card
+        assert "@member_6" not in start_card
+
+        # Remaining 3 in Overflow Card
+        assert "@member_6" in overflow_card
+        assert 'href="tg://user?id=8007"' in overflow_card
+        assert "@member_8" in overflow_card
+    finally:
+        await close_db()
+

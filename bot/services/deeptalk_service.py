@@ -21,10 +21,12 @@ from bot.keyboards.deeptalk import (
 )
 from bot.services.timer_service import build_topic_deep_link, ensure_bot_username
 from bot.texts.deeptalk_texts import (
+    MENTION_BATCH_SIZE,
     format_deeptalk_announcement_card,
     format_deeptalk_dm_reminder,
     format_deeptalk_end_card,
     format_deeptalk_participants_pv,
+    format_deeptalk_rollcall_batch,
     format_deeptalk_start_card,
 )
 from bot.utils.general_topic import to_send_thread_id
@@ -274,19 +276,26 @@ async def refresh_start_card(
     stats = await repository.get_deeptalk_session_stats(session_id)
     reg_cnt = int(stats["registered_count"])
     chk_cnt = int(checked_in_count) if checked_in_count is not None else int(stats["checked_in_count"])
+    status = str(session.get("status") or "live")
+    initial_mentions: list[dict[str, Any]] | None = None
+    if status == "live" and reg_cnt > 0:
+        reg_users = await repository.list_registered_deeptalk_participants(session_id)
+        initial_mentions = reg_users[:MENTION_BATCH_SIZE]
+
     bot_username = await ensure_bot_username(bot)
 
     text = format_deeptalk_start_card(
         session,
         checked_in_count=chk_cnt,
         registered_count=reg_cnt,
+        initial_mentions=initial_mentions,
         tz_name=settings.TIMEZONE,
     )
     kb = build_start_card_kb(
         session_id,
         checked_in_count=chk_cnt,
         bot_username=bot_username,
-        status=str(session.get("status") or "live"),
+        status=status,
     )
     await _safe_edit_topic_card(
         bot,
@@ -474,18 +483,19 @@ async def start_deeptalk_session(
     schedule_deeptalk_end_job(bot, session)
 
     settings = get_settings()
-    stats = await repository.get_deeptalk_session_stats(session_id)
-    reg_cnt = int(stats["registered_count"])
+    reg_users = await repository.list_registered_deeptalk_participants(session_id)
+    reg_cnt = len(reg_users)
 
     # 1. Update original announcement card status
     await refresh_announcement_card(bot, session_id, registered_count=reg_cnt)
 
-    # 2. Send live Start Card with check-in button
+    # 2. Send live Start Card with check-in button + first batch of registered user mentions
     bot_username = await ensure_bot_username(bot)
     start_text = format_deeptalk_start_card(
         session,
         checked_in_count=0,
         registered_count=reg_cnt,
+        initial_mentions=reg_users[:MENTION_BATCH_SIZE],
         tz_name=settings.TIMEZONE,
     )
     start_kb = build_start_card_kb(
@@ -504,6 +514,29 @@ async def start_deeptalk_session(
     msg_id = getattr(sent, "message_id", None) if sent is not None else None
     if isinstance(msg_id, int):
         await repository.update_deeptalk_message_ids(session_id, start_message_id=msg_id)
+
+    # 2b. Tag remaining pre-registered members in batches of 5 so Telegram notifies every single one!
+    overflow_users = reg_users[MENTION_BATCH_SIZE:]
+    if overflow_users:
+        batches = [
+            overflow_users[i : i + MENTION_BATCH_SIZE]
+            for i in range(0, len(overflow_users), MENTION_BATCH_SIZE)
+        ]
+        total_overflow = len(batches)
+        for b_idx, batch in enumerate(batches, start=1):
+            rollcall_text = format_deeptalk_rollcall_batch(
+                batch,
+                batch_index=b_idx,
+                total_overflow_batches=total_overflow,
+            )
+            await send_deeptalk_topic_message(
+                bot,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                text=rollcall_text,
+            )
+            if b_idx < total_overflow:
+                await asyncio.sleep(0.5)
 
     # 3. Best-effort DM reminders to pre-registered participants
     await _dispatch_start_dm_reminders(bot, session)

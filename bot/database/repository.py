@@ -2124,6 +2124,20 @@ async def list_deeptalk_participants(session_id: int) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+async def list_registered_deeptalk_participants(session_id: int) -> list[dict[str, Any]]:
+    """Return all pre-registered participants (registered = 1) ordered by registered_at ASC."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT user_id, username, full_name, registered_at "
+        "FROM deeptalk_participants "
+        "WHERE session_id = ? AND registered = 1 "
+        "ORDER BY registered_at ASC, user_id ASC;",
+        (session_id,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def list_deeptalk_dm_targets(session_id: int) -> list[dict[str, Any]]:
     """Return pre-registered participants who have started the bot in private chat (dm_started = 1)."""
     conn = get_db()

@@ -152,11 +152,54 @@ def format_deeptalk_announcement_card(
     return "\n".join(lines)
 
 
+MENTION_BATCH_SIZE = 5
+
+
+def format_single_group_tag(
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+) -> str:
+    """Format a 1-entity group mention (@username when present, or tg://user text_mention)."""
+    safe_name = escape_html((full_name or "").strip() or "کاربر")
+    if username and username.strip():
+        clean_u = escape_html(username.strip().lstrip("@"))
+        return f"<b>{safe_name}</b> (@{clean_u})"
+    return f'<a href="tg://user?id={user_id}"><b>{safe_name}</b></a>'
+
+
+def format_deeptalk_rollcall_batch(
+    batch: list[dict[str, Any]],
+    *,
+    batch_index: int,
+    total_overflow_batches: int,
+) -> str:
+    """Render an overflow roll-call mention message (max 5 mentions per message so Telegram notifies all)."""
+    tags = [
+        format_single_group_tag(
+            int(p["user_id"]),
+            p.get("username"),
+            p.get("full_name"),
+        )
+        for p in batch
+    ]
+    part_note = (
+        f" ({to_persian_digits(batch_index)}/{to_persian_digits(total_overflow_batches)})"
+        if total_overflow_batches > 1
+        else ""
+    )
+    return (
+        f"📣 <b>ادامه فراخوان بچه‌های ثبت‌نامی دیپ‌تاک{part_note} — بپرین تو بحث! 🔥</b>\n\n"
+        + " • ".join(tags)
+    )
+
+
 def format_deeptalk_start_card(
     session: dict[str, Any],
     *,
     checked_in_count: int,
     registered_count: int,
+    initial_mentions: list[dict[str, Any]] | None = None,
     tz_name: str = "Asia/Tehran",
 ) -> str:
     """Render the live 'DeepTalk Started!!' card posted when start_at arrives."""
@@ -194,6 +237,24 @@ def format_deeptalk_start_card(
             f"✋ <b>حاضرین تا الان:</b> <b>{to_persian_digits(checked_in_count)} نفر</b>",
         ]
     )
+
+    if status == "live" and initial_mentions:
+        tags = [
+            format_single_group_tag(
+                int(p["user_id"]),
+                p.get("username"),
+                p.get("full_name"),
+            )
+            for p in initial_mentions[:MENTION_BATCH_SIZE]
+        ]
+        lines.extend(
+            [
+                "",
+                "📣 <b>فراخوان بچه‌های ثبت‌نام‌شده:</b>",
+                " • ".join(tags),
+            ]
+        )
+
     if cta:
         lines.extend(["", cta])
     return "\n".join(lines)
