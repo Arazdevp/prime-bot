@@ -71,6 +71,10 @@ class Settings(BaseSettings):
         ge=256,
         description="Maximum output tokens for AI response generation",
     )
+    AI_REASONING_EFFORT: str | None = Field(
+        default=None,
+        description="Optional OpenRouter reasoning effort (e.g. 'none', 'minimal', 'low', 'medium', 'high')",
+    )
 
     # Thresholds & Limits
     MIN_MESSAGES_PER_TOPIC: int = Field(
@@ -123,10 +127,15 @@ class Settings(BaseSettings):
         ge=0,
         description="Maximum retry attempts on retryable AI failures",
     )
+    AI_THROTTLE_MAX_RETRIES: int = Field(
+        default=6,
+        ge=0,
+        description="Maximum retry attempts on transient rate-limit (429) or OpenRouter in-flight budget (402) errors",
+    )
     AI_CHUNK_DELAY_SECONDS: float = Field(
-        default=4.0,
+        default=6.0,
         ge=0.0,
-        description="Delay in seconds between consecutive LLM calls to prevent RPM/TPM bursts",
+        description="Delay in seconds after each LLM call before sending the next request to let OpenRouter in-flight holds settle and prevent RPM/TPM bursts",
     )
 
     # Storage & Paths
@@ -228,12 +237,13 @@ class Settings(BaseSettings):
             return [value]
         return [int(value)]
 
-    @field_validator("PROXY_URL", mode="before")
+    @field_validator("PROXY_URL", "AI_REASONING_EFFORT", mode="before")
     @classmethod
     def parse_optional_str(cls, value: Any) -> str | None:
-        """Treat empty string as None."""
-        if isinstance(value, str) and not value.strip():
-            return None
+        """Treat empty or whitespace-only string as None."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped if stripped else None
         return value
 
     @model_validator(mode="after")

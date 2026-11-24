@@ -619,6 +619,72 @@ async def delete_old_summaries(retention_days: int) -> int:
         return cursor.rowcount
 
 
+# ---------------- Map-Reduce Chunk Cache Operations ----------------
+
+
+async def get_cached_map_chunk(chat_id: int, thread_id: int, chunk_hash: str) -> str | None:
+    """Fetch a previously completed Map chunk summary by deterministic content hash."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT summary_text FROM map_chunk_cache "
+        "WHERE chat_id = ? AND thread_id = ? AND chunk_hash = ?;",
+        (chat_id, thread_id, chunk_hash),
+    )
+    row = await cursor.fetchone()
+    if row and row["summary_text"]:
+        return str(row["summary_text"])
+    return None
+
+
+async def save_cached_map_chunk(
+    chat_id: int,
+    thread_id: int,
+    chunk_hash: str,
+    summary_text: str,
+) -> None:
+    """Persist a completed Map chunk summary so retries resume without re-paying API costs."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_utc = datetime.now(timezone.utc).isoformat()
+    sql = """
+    INSERT INTO map_chunk_cache (chat_id, thread_id, chunk_hash, summary_text, created_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id, thread_id, chunk_hash) DO UPDATE SET
+        summary_text = excluded.summary_text,
+        created_at = excluded.created_at;
+    """
+    async with lock:
+        await conn.execute(sql, (chat_id, thread_id, chunk_hash, summary_text, now_utc))
+        await conn.commit()
+
+
+async def clear_cached_map_chunks(chat_id: int, thread_id: int) -> int:
+    """Delete all cached Map chunk summaries for a topic once its final summary is persisted."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM map_chunk_cache WHERE chat_id = ? AND thread_id = ?;",
+            (chat_id, thread_id),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
+async def delete_old_cached_map_chunks(retention_days: int) -> int:
+    """Delete stale cached Map chunk summaries older than retention_days (UTC)."""
+    conn = get_db()
+    lock = get_write_lock()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "DELETE FROM map_chunk_cache WHERE created_at < ?;",
+            (cutoff,),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+
 # ---------------- Bot Users Table Operations ----------------
 
 

@@ -119,6 +119,18 @@ CREATE TABLE IF NOT EXISTS morning_greetings (
     last_index INTEGER,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS map_chunk_cache (
+    chat_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, thread_id, chunk_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_map_chunk_cache_created
+    ON map_chunk_cache(created_at);
 """
 
 
@@ -252,6 +264,22 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
         await conn.execute("PRAGMA user_version = 5;")
         await conn.commit()
 
+    if current_version < 6:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS map_chunk_cache (
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                summary_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, thread_id, chunk_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_map_chunk_cache_created
+                ON map_chunk_cache(created_at);
+        """)
+        await conn.execute("PRAGMA user_version = 6;")
+        await conn.commit()
+
 
 async def init_db(db_path: str = "data/bot.db") -> aiosqlite.Connection:
     """Initialize database directory, connection, PRAGMAs, and tables."""
@@ -283,6 +311,11 @@ async def init_db(db_path: str = "data/bot.db") -> aiosqlite.Connection:
 
     _db_connection = conn
     return _db_connection
+
+
+def is_db_initialized() -> bool:
+    """Return True if the shared database connection is currently active."""
+    return _db_connection is not None
 
 
 def get_db() -> aiosqlite.Connection:

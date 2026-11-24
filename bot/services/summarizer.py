@@ -2,12 +2,15 @@
 
 import asyncio
 from datetime import datetime
+import hashlib
 import html
 import logging
 import re
 import time
 from zoneinfo import ZoneInfo
 from bot.config import get_settings
+from bot.database import repository
+from bot.database.db import is_db_initialized
 from bot.services.llm_client import BaseLLMClient, LLMError, LLMTruncationError, get_llm_client
 from bot.utils.dates import format_date_heading, get_tehran_now
 from bot.utils.link_parser import get_clean_chat_id
@@ -15,22 +18,39 @@ from bot.utils.retry import async_retry
 
 logger = logging.getLogger(__name__)
 
-# Shared LLM pacing and rate-limit cooldown state across topics and chunks
+# Shared LLM serialization, pacing, and throttle-cooldown state across topics, chunks, and previews
 _llm_pace_lock = asyncio.Lock()
 _next_allowed_call_ts: float = 0.0
 _rate_limit_until_ts: float = 0.0
+_adaptive_extra_delay: float = 0.0
+_adaptive_delay_expires_ts: float = 0.0
+_ADAPTIVE_DELAY_STEP_SECONDS = 10.0
+_ADAPTIVE_DELAY_MAX_SECONDS = 30.0
+_ADAPTIVE_DELAY_TTL_SECONDS = 900.0
 _MAX_REDUCE_ROUNDS = 5
 
 
 def reset_llm_pacer() -> None:
-    """Reset in-memory LLM pacing and cooldown timestamps (useful for test isolation)."""
-    global _next_allowed_call_ts, _rate_limit_until_ts
+    """Reset in-memory LLM pacing, adaptive backoff, and cooldown timestamps (useful for test isolation)."""
+    global _next_allowed_call_ts, _rate_limit_until_ts, _adaptive_extra_delay, _adaptive_delay_expires_ts
     _next_allowed_call_ts = 0.0
     _rate_limit_until_ts = 0.0
+    _adaptive_extra_delay = 0.0
+    _adaptive_delay_expires_ts = 0.0
+
+
+def _get_effective_chunk_delay(chunk_delay: float) -> float:
+    """Compute effective inter-request delay including any active adaptive in-flight throttle buffer."""
+    global _adaptive_extra_delay, _adaptive_delay_expires_ts
+    if _adaptive_extra_delay > 0 and time.monotonic() >= _adaptive_delay_expires_ts:
+        _adaptive_extra_delay = 0.0
+        _adaptive_delay_expires_ts = 0.0
+    base = max(0.0, float(chunk_delay))
+    return base + _adaptive_extra_delay
 
 
 def _record_rate_limit_cooldown(delay_seconds: float) -> None:
-    """Record a shared cooldown deadline when the LLM API returns HTTP 429."""
+    """Record a shared cooldown deadline when the LLM API returns HTTP 429 or transient 402."""
     global _rate_limit_until_ts
     if delay_seconds > 0:
         deadline = time.monotonic() + float(delay_seconds)
@@ -38,18 +58,53 @@ def _record_rate_limit_cooldown(delay_seconds: float) -> None:
             _rate_limit_until_ts = deadline
 
 
+def _clear_expired_or_resolved_cooldown() -> None:
+    """Clear the throttle cooldown deadline after an LLM call succeeds."""
+    global _rate_limit_until_ts
+    _rate_limit_until_ts = 0.0
+
+
+def _record_in_flight_throttle(delay_seconds: float) -> None:
+    """Record cooldown and adaptively widen inter-request spacing after OpenRouter in-flight 402."""
+    global _adaptive_extra_delay, _adaptive_delay_expires_ts
+    _record_rate_limit_cooldown(delay_seconds)
+    _adaptive_extra_delay = min(
+        _ADAPTIVE_DELAY_MAX_SECONDS,
+        _adaptive_extra_delay + _ADAPTIVE_DELAY_STEP_SECONDS,
+    )
+    _adaptive_delay_expires_ts = time.monotonic() + _ADAPTIVE_DELAY_TTL_SECONDS
+    logger.warning(
+        "OpenRouter in-flight credit limit triggered; adding +%.1fs adaptive delay between LLM calls for %.0fs.",
+        _adaptive_extra_delay,
+        _ADAPTIVE_DELAY_TTL_SECONDS,
+    )
+
+
+async def _wait_for_llm_slot_locked(chunk_delay: float) -> None:
+    """Wait for any active throttle cooldown or inter-chunk pacing slot (caller MUST hold _llm_pace_lock)."""
+    effective_delay = _get_effective_chunk_delay(chunk_delay)
+    now = time.monotonic()
+    wait_until = max(_rate_limit_until_ts, _next_allowed_call_ts if effective_delay > 0 else 0.0)
+    if wait_until > now:
+        sleep_for = wait_until - now
+        logger.debug("Pacing LLM call: sleeping %.2fs before next request.", sleep_for)
+        await asyncio.sleep(sleep_for)
+
+
 async def _wait_for_llm_slot(chunk_delay: float) -> None:
     """Wait for any active rate-limit cooldown or inter-chunk pacing slot before calling LLM."""
     global _next_allowed_call_ts
     async with _llm_pace_lock:
-        now = time.monotonic()
-        wait_until = max(_rate_limit_until_ts, _next_allowed_call_ts if chunk_delay > 0 else 0.0)
-        if wait_until > now:
-            sleep_for = wait_until - now
-            logger.debug("Pacing LLM call: sleeping %.2fs before next request.", sleep_for)
-            await asyncio.sleep(sleep_for)
-        if chunk_delay > 0:
-            _next_allowed_call_ts = time.monotonic() + chunk_delay
+        await _wait_for_llm_slot_locked(chunk_delay)
+        effective_delay = _get_effective_chunk_delay(chunk_delay)
+        if effective_delay > 0:
+            _next_allowed_call_ts = time.monotonic() + effective_delay
+
+
+def _compute_chunk_hash(chat_id: int, thread_id: int, link_prefix: str, chunk_text: str) -> str:
+    """Compute a deterministic SHA-256 cache key for a Map-Reduce transcript chunk."""
+    payload = f"{chat_id}:{thread_id}:{link_prefix}\n{chunk_text}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 SYSTEM_PROMPT_SINGLE = """شما یک دستیار هوشمند و تحلیل‌گر حرفه‌ای برای گروه‌های تلگرام هستید. وظیفه شما خواندن متن گفتگوهای روزانه یک تاپیک و تولید یک خلاصه دقیق، ساختاریافته، بسیار خوانا، سلیس و بدون حاشیه به زبان فارسی است.
 
@@ -417,9 +472,10 @@ async def _generate_with_retry(
     system_prompt: str,
     user_content: str,
     max_retries: int = 3,
+    throttle_retries: int | None = None,
     chunk_delay: float = 0.0,
 ) -> str:
-    """Execute LLM call with pacing, retry on network/rate-limit errors, and retry-once on token truncation."""
+    """Execute a strictly serialized LLM call with pacing, throttle-aware retry, and truncation recovery."""
     global _next_allowed_call_ts
 
     async def _call_once(allow_truncated: bool) -> str:
@@ -429,42 +485,57 @@ async def _generate_with_retry(
             allow_truncated=allow_truncated,
         )
 
-    await _wait_for_llm_slot(chunk_delay)
-    try:
+    # Hold _llm_pace_lock for the full request lifecycle so this bot NEVER has >1 in-flight LLM request
+    async with _llm_pace_lock:
+        await _wait_for_llm_slot_locked(chunk_delay)
         try:
-            return await async_retry(
-                lambda: _call_once(allow_truncated=False),
-                retries=max_retries,
-                on_rate_limit=_record_rate_limit_cooldown,
-            )
-        except LLMTruncationError as exc:
-            logger.warning(
-                "LLM response was truncated (token limit reached). Retrying generation once with allow_truncated=True..."
-            )
             try:
-                return await async_retry(
-                    lambda: _call_once(allow_truncated=True),
+                result = await async_retry(
+                    lambda: _call_once(allow_truncated=False),
                     retries=max_retries,
+                    throttle_retries=throttle_retries,
                     on_rate_limit=_record_rate_limit_cooldown,
+                    on_in_flight_budget=_record_in_flight_throttle,
                 )
-            except LLMTruncationError as exc_persisted:
+                _clear_expired_or_resolved_cooldown()
+                return result
+            except LLMTruncationError as exc:
                 logger.warning(
-                    "LLM response truncation persisted on retry (%d chars). Returning truncated output for sanitization.",
-                    len(exc_persisted.truncated_text),
+                    "LLM response was truncated (token limit reached). Retrying generation once with allow_truncated=True..."
                 )
-                return exc_persisted.truncated_text
-            except LLMError as retry_exc:
-                if exc.truncated_text:
-                    logger.warning(
-                        "Retry after truncation failed (%s); falling back to initial truncated output (%d chars).",
-                        retry_exc.message,
-                        len(exc.truncated_text),
+                now = time.monotonic()
+                if _rate_limit_until_ts > now:
+                    await asyncio.sleep(_rate_limit_until_ts - now)
+                try:
+                    result = await async_retry(
+                        lambda: _call_once(allow_truncated=True),
+                        retries=max_retries,
+                        throttle_retries=throttle_retries,
+                        on_rate_limit=_record_rate_limit_cooldown,
+                        on_in_flight_budget=_record_in_flight_throttle,
                     )
-                    return exc.truncated_text
-                raise
-    finally:
-        if chunk_delay > 0:
-            _next_allowed_call_ts = max(_next_allowed_call_ts, time.monotonic() + chunk_delay)
+                    _clear_expired_or_resolved_cooldown()
+                    return result
+                except LLMTruncationError as exc_persisted:
+                    logger.warning(
+                        "LLM response truncation persisted on retry (%d chars). Returning truncated output for sanitization.",
+                        len(exc_persisted.truncated_text),
+                    )
+                    _clear_expired_or_resolved_cooldown()
+                    return exc_persisted.truncated_text
+                except LLMError as retry_exc:
+                    if exc.truncated_text:
+                        logger.warning(
+                            "Retry after truncation failed (%s); falling back to initial truncated output (%d chars).",
+                            retry_exc.message,
+                            len(exc.truncated_text),
+                        )
+                        return exc.truncated_text
+                    raise
+        finally:
+            effective_delay = _get_effective_chunk_delay(chunk_delay)
+            if effective_delay > 0:
+                _next_allowed_call_ts = max(_next_allowed_call_ts, time.monotonic() + effective_delay)
 
 
 async def summarize_topic_messages(
@@ -475,11 +546,14 @@ async def summarize_topic_messages(
     min_messages: int = 5,
     is_nightly: bool = True,
     llm_client: BaseLLMClient | None = None,
+    use_chunk_cache: bool = False,
 ) -> str | None:
     """Summarize a list of messages for a topic.
 
     Returns None if messages count is below threshold.
     Performs Map-Reduce chunking if transcript length exceeds CHUNK_MAX_CHARS.
+    When use_chunk_cache=True and SQLite is initialized, completed Map chunks are persisted
+    so interrupted runs resume without re-paying for already summarized chunks.
     """
     if len(messages) < min_messages:
         logger.info(
@@ -524,8 +598,16 @@ async def summarize_topic_messages(
     else:
         link_prefix = clean_chat_id or "chat"
 
-    raw_chunk_delay = getattr(settings, "AI_CHUNK_DELAY_SECONDS", 4.0)
-    chunk_delay = float(raw_chunk_delay) if isinstance(raw_chunk_delay, (int, float)) else 4.0
+    raw_chunk_delay = getattr(settings, "AI_CHUNK_DELAY_SECONDS", 6.0)
+    chunk_delay = float(raw_chunk_delay) if isinstance(raw_chunk_delay, (int, float)) else 6.0
+
+    raw_throttle_retries = getattr(settings, "AI_THROTTLE_MAX_RETRIES", 6)
+    cfg_throttle_retries = (
+        int(raw_throttle_retries)
+        if isinstance(raw_throttle_retries, int) and not isinstance(raw_throttle_retries, bool)
+        else 6
+    )
+    throttle_retries = max(settings.AI_MAX_RETRIES, cfg_throttle_retries) if settings.AI_MAX_RETRIES > 0 else 0
 
     # Check if single call or map-reduce
     if len(transcript) <= settings.CHUNK_MAX_CHARS:
@@ -545,12 +627,13 @@ async def summarize_topic_messages(
             system_prompt=system_prompt,
             user_content=user_content,
             max_retries=settings.AI_MAX_RETRIES,
+            throttle_retries=throttle_retries,
             chunk_delay=chunk_delay,
         )
         return sanitize_telegram_html(raw_output, clean_chat_id=clean_chat_id, thread_id=target_thread)
 
     else:
-        # Map-Reduce pipeline with pacing, safety-block resilience, and hierarchical reduce
+        # Map-Reduce pipeline with pacing, chunk checkpointing, safety-block resilience, and hierarchical reduce
         chunks = chunk_transcript(transcript, max_chars=settings.CHUNK_MAX_CHARS)
         logger.info(
             "Topic '%s' transcript length %s exceeds limit %s. Running Map-Reduce over %s chunks.",
@@ -560,10 +643,37 @@ async def summarize_topic_messages(
             len(chunks),
         )
 
+        can_cache_chunks = bool(
+            use_chunk_cache
+            and target_chat is not None
+            and target_thread is not None
+            and is_db_initialized()
+        )
         chunk_prompt = SYSTEM_PROMPT_CHUNK.replace("{clean_chat_id}", link_prefix)
         partial_summaries: list[str] = []
         skipped_chunks = 0
         for i, chunk in enumerate(chunks, start=1):
+            chunk_hash: str | None = None
+            if can_cache_chunks:
+                chunk_hash = _compute_chunk_hash(int(target_chat), int(target_thread), link_prefix, chunk)
+                try:
+                    cached_partial = await repository.get_cached_map_chunk(
+                        int(target_chat),
+                        int(target_thread),
+                        chunk_hash,
+                    )
+                    if cached_partial:
+                        logger.info(
+                            "Reusing cached map summary for chunk %s/%s of topic '%s'.",
+                            i,
+                            len(chunks),
+                            topic_name,
+                        )
+                        partial_summaries.append(cached_partial.strip())
+                        continue
+                except Exception as cache_err:
+                    logger.debug("Chunk cache read skipped for topic '%s': %s", topic_name, cache_err)
+
             chunk_user_content = (
                 f"بخش {i} از {len(chunks)} پیام‌های تاپیک «{topic_name}»:\n\n"
                 f"{chunk}\n\n"
@@ -576,9 +686,21 @@ async def summarize_topic_messages(
                     system_prompt=chunk_prompt,
                     user_content=chunk_user_content,
                     max_retries=settings.AI_MAX_RETRIES,
+                    throttle_retries=throttle_retries,
                     chunk_delay=chunk_delay,
                 )
-                partial_summaries.append(partial_summary.strip())
+                cleaned_partial = partial_summary.strip()
+                partial_summaries.append(cleaned_partial)
+                if can_cache_chunks and chunk_hash is not None:
+                    try:
+                        await repository.save_cached_map_chunk(
+                            int(target_chat),
+                            int(target_thread),
+                            chunk_hash,
+                            cleaned_partial,
+                        )
+                    except Exception as cache_err:
+                        logger.debug("Chunk cache write skipped for topic '%s': %s", topic_name, cache_err)
             except LLMError as exc:
                 # Skip individual safety/content-blocked chunks so one edgy message doesn't break the whole topic
                 if len(chunks) > 1 and exc.status_code == 200 and not exc.is_retryable:
@@ -634,6 +756,7 @@ async def summarize_topic_messages(
                     system_prompt=chunk_prompt,
                     user_content=batch_user_content,
                     max_retries=settings.AI_MAX_RETRIES,
+                    throttle_retries=throttle_retries,
                     chunk_delay=chunk_delay,
                 )
                 next_level.append(reduced.strip())
@@ -667,6 +790,7 @@ async def summarize_topic_messages(
             system_prompt=merge_system_prompt,
             user_content=merge_user_content,
             max_retries=settings.AI_MAX_RETRIES,
+            throttle_retries=throttle_retries,
             chunk_delay=chunk_delay,
         )
         return sanitize_telegram_html(merged_output, clean_chat_id=clean_chat_id, thread_id=target_thread)

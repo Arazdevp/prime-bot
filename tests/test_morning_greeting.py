@@ -125,7 +125,7 @@ async def test_migration_v4_to_v5_creates_morning_greetings_table(tmp_path: Path
         await init_db(str(db_file))
         db = get_db()
         cur = await db.execute("PRAGMA user_version;")
-        assert (await cur.fetchone())[0] == 5
+        assert (await cur.fetchone())[0] >= 5
 
         gs = await repository.get_group_settings(-100555)
         assert gs is not None and gs["min_messages"] == 5

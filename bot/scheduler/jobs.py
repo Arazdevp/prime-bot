@@ -314,6 +314,7 @@ async def run_summary_for_topic(
                 min_messages=min_msgs,
                 is_nightly=is_nightly,
                 llm_client=llm_client,
+                use_chunk_cache=True,
             )
         except Exception as exc:
             logger.error("Summarization AI failed for topic '%s': %s", topic_name, exc, exc_info=True)
@@ -346,6 +347,7 @@ async def run_summary_for_topic(
 
         sent_count = 0
         await repository.save_summary_record(chat_id, thread_id, day, parts, sent_count=0)
+        await repository.clear_cached_map_chunks(chat_id, thread_id)
 
     # Publish remaining parts to Telegram
     async def _on_part_sent(new_sent: int) -> None:
@@ -591,6 +593,11 @@ async def cleanup_job() -> None:
     deleted_summaries = await repository.delete_old_summaries(settings.RETENTION_DAYS)
     if deleted_summaries:
         logger.info("Deleted %s summary records older than %s days.", deleted_summaries, settings.RETENTION_DAYS)
+
+    # 1d. Purge stale cached map-reduce chunk summaries older than retention days
+    deleted_chunks = await repository.delete_old_cached_map_chunks(settings.RETENTION_DAYS)
+    if deleted_chunks:
+        logger.info("Deleted %s cached map chunks older than %s days.", deleted_chunks, settings.RETENTION_DAYS)
 
     # 2. SQLite PRAGMA optimize
     conn = get_db()
