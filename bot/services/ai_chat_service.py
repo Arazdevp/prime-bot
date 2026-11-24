@@ -9,6 +9,7 @@ from aiogram import Bot
 from aiogram.types import Message
 from bot.config import get_settings
 from bot.database import repository
+from bot.services.ai_memory_service import build_live_and_learned_context
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
 from bot.services.timer_service import get_bot_username
@@ -211,6 +212,7 @@ async def generate_ai_chat_reply(
     chat_type: str,
     speaker_name: str,
     user_text: str,
+    speaker_user_id: int | None = None,
     topic_name: str | None = None,
     reply_context: str | None = None,
     client: GeminiClient | OpenAIClient | None = None,
@@ -240,11 +242,27 @@ async def generate_ai_chat_reply(
 
         custom_prompt = await repository.get_ai_chat_custom_prompt()
         base_prompt = custom_prompt or DEFAULT_AI_CHAT_SYSTEM_PROMPT
+
+        mem_ctx: dict = {}
+        try:
+            mem_ctx = await build_live_and_learned_context(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                chat_type=chat_type,
+                speaker_user_id=speaker_user_id,
+            )
+        except Exception as ctx_exc:
+            logger.debug("Skipping live/learned context injection due to error: %s", ctx_exc)
+
         runtime_system = build_runtime_system_prompt(
             base_prompt,
             speaker_name=speaker_name,
             chat_type=chat_type,
             topic_name=topic_name,
+            group_title=mem_ctx.get("group_title"),
+            group_memory=mem_ctx.get("group_memory"),
+            member_profiles=mem_ctx.get("member_profiles"),
+            recent_messages_text=mem_ctx.get("recent_messages_text"),
         )
 
         raw_reply: str | None = None

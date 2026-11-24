@@ -2258,3 +2258,360 @@ async def get_deeptalk_session_stats(session_id: int) -> dict[str, Any]:
         "first_responder": dict(first_row) if first_row is not None else None,
         "top_speakers": [dict(r) for r in top_rows],
     }
+
+
+# ---------------- AI Chat Live Awareness & Long-Term Memory ----------------
+
+
+async def fetch_recent_messages_for_topic(
+    chat_id: int,
+    thread_id: int,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    """Fetch the latest messages in a topic (regardless of is_summarized) in chronological order."""
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 200))
+    cursor = await conn.execute(
+        """
+        SELECT id, chat_id, thread_id, message_id, user_id, sender_name,
+               text, media_type, reply_to_message_id, reply_to_name,
+               reply_to_snippet, created_at, is_summarized
+        FROM messages
+        WHERE chat_id = ? AND thread_id = ?
+        ORDER BY created_at DESC, message_id DESC
+        LIMIT ?;
+        """,
+        (chat_id, thread_id, safe_limit),
+    )
+    rows = await cursor.fetchall()
+    result = [dict(r) for r in rows]
+    result.reverse()
+    return result
+
+
+async def fetch_messages_after_id(
+    chat_id: int,
+    thread_id: int,
+    after_message_id: int = 0,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Fetch topic messages with message_id > after_message_id ordered chronologically."""
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 2000))
+    cursor = await conn.execute(
+        """
+        SELECT id, chat_id, thread_id, message_id, user_id, sender_name,
+               text, media_type, reply_to_message_id, reply_to_name,
+               reply_to_snippet, created_at, is_summarized
+        FROM messages
+        WHERE chat_id = ? AND thread_id = ? AND message_id > ?
+        ORDER BY message_id ASC
+        LIMIT ?;
+        """,
+        (chat_id, thread_id, int(after_message_id), safe_limit),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def count_messages_after_id(
+    chat_id: int,
+    thread_id: int,
+    after_message_id: int = 0,
+) -> int:
+    """Count stored topic messages with message_id > after_message_id."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM messages WHERE chat_id = ? AND thread_id = ? AND message_id > ?;",
+        (chat_id, thread_id, int(after_message_id)),
+    )
+    row = await cursor.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def find_free_chat_topic(chat_id: int) -> dict[str, Any] | None:
+    """Find the group's free-chat / Hub topic row from the topics table."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, thread_id, name, is_active, updated_at FROM topics WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    rows = await cursor.fetchall()
+    for r in rows:
+        raw_name = str(r["name"] or "")
+        norm = raw_name.replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").strip().lower()
+        if "گفتگوی آزاد" in norm or "گفتگو آزاد" in norm or "the hub" in norm:
+            return dict(r)
+    return None
+
+
+async def upsert_ai_memory_source(
+    chat_id: int,
+    thread_id: int,
+    topic_name: str | None = None,
+) -> dict[str, Any]:
+    """Register or update a topic as an AI memory learning source."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_name = topic_name.strip() if isinstance(topic_name, str) and topic_name.strip() else None
+
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO ai_chat_memory_sources (
+                chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at
+            ) VALUES (?, ?, ?, 0, NULL, ?)
+            ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                topic_name = COALESCE(excluded.topic_name, ai_chat_memory_sources.topic_name);
+            """,
+            (chat_id, thread_id, clean_name, now_iso),
+        )
+        await conn.commit()
+        cursor = await conn.execute(
+            "SELECT chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at "
+            "FROM ai_chat_memory_sources WHERE chat_id = ? AND thread_id = ?;",
+            (chat_id, thread_id),
+        )
+        row = await cursor.fetchone()
+    return dict(row) if row else {
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "topic_name": clean_name,
+        "last_learned_message_id": 0,
+        "last_learned_at": None,
+        "created_at": now_iso,
+    }
+
+
+async def get_ai_memory_source(chat_id: int, thread_id: int) -> dict[str, Any] | None:
+    """Fetch a registered AI memory source topic row if present."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at "
+        "FROM ai_chat_memory_sources WHERE chat_id = ? AND thread_id = ?;",
+        (chat_id, thread_id),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_ai_memory_sources(chat_id: int | None = None) -> list[dict[str, Any]]:
+    """List registered AI memory source topics globally or for a specific group."""
+    conn = get_db()
+    if chat_id is not None:
+        cursor = await conn.execute(
+            "SELECT chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at "
+            "FROM ai_chat_memory_sources WHERE chat_id = ? ORDER BY created_at ASC, thread_id ASC;",
+            (chat_id,),
+        )
+    else:
+        cursor = await conn.execute(
+            "SELECT chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at "
+            "FROM ai_chat_memory_sources ORDER BY created_at ASC, chat_id ASC, thread_id ASC;"
+        )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_ai_memory_source_progress(
+    chat_id: int,
+    thread_id: int,
+    last_learned_message_id: int,
+    topic_name: str | None = None,
+) -> None:
+    """Advance last_learned_message_id watermark and timestamp for an AI memory source."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_name = topic_name.strip() if isinstance(topic_name, str) and topic_name.strip() else None
+
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO ai_chat_memory_sources (
+                chat_id, thread_id, topic_name, last_learned_message_id, last_learned_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                last_learned_message_id = MAX(ai_chat_memory_sources.last_learned_message_id, excluded.last_learned_message_id),
+                last_learned_at = excluded.last_learned_at,
+                topic_name = COALESCE(excluded.topic_name, ai_chat_memory_sources.topic_name);
+            """,
+            (chat_id, thread_id, clean_name, int(last_learned_message_id), now_iso, now_iso),
+        )
+        await conn.commit()
+
+
+async def get_ai_group_memory(chat_id: int) -> dict[str, Any] | None:
+    """Fetch persisted group culture and ongoing topics memory for chat_id."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, group_title, culture_summary, inside_jokes, ongoing_topics, updated_at "
+        "FROM ai_group_memory WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_ai_group_memory(
+    chat_id: int,
+    group_title: str | None,
+    culture_summary: str,
+    inside_jokes: str,
+    ongoing_topics: str,
+) -> None:
+    """Insert or update persisted group culture memory for chat_id."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_title = group_title.strip() if isinstance(group_title, str) and group_title.strip() else None
+
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO ai_group_memory (
+                chat_id, group_title, culture_summary, inside_jokes, ongoing_topics, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                group_title = COALESCE(excluded.group_title, ai_group_memory.group_title),
+                culture_summary = excluded.culture_summary,
+                inside_jokes = excluded.inside_jokes,
+                ongoing_topics = excluded.ongoing_topics,
+                updated_at = excluded.updated_at;
+            """,
+            (
+                chat_id,
+                clean_title,
+                culture_summary.strip(),
+                inside_jokes.strip(),
+                ongoing_topics.strip(),
+                now_iso,
+            ),
+        )
+        await conn.commit()
+
+
+async def upsert_ai_member_profile(
+    chat_id: int,
+    user_id: int,
+    display_name: str,
+    personality_summary: str,
+    speaking_style: str | None,
+    interests_and_topics: str | None,
+    notable_facts: str | None,
+    add_message_count: int = 0,
+    last_seen_at: str | None = None,
+) -> None:
+    """Insert or update an evolving AI member personality profile."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_seen = last_seen_at or now_iso
+
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO ai_member_profiles (
+                chat_id, user_id, display_name, personality_summary,
+                speaking_style, interests_and_topics, notable_facts,
+                message_count, last_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                personality_summary = excluded.personality_summary,
+                speaking_style = COALESCE(excluded.speaking_style, ai_member_profiles.speaking_style),
+                interests_and_topics = COALESCE(excluded.interests_and_topics, ai_member_profiles.interests_and_topics),
+                notable_facts = COALESCE(excluded.notable_facts, ai_member_profiles.notable_facts),
+                message_count = ai_member_profiles.message_count + excluded.message_count,
+                last_seen_at = CASE
+                    WHEN excluded.last_seen_at > ai_member_profiles.last_seen_at THEN excluded.last_seen_at
+                    ELSE ai_member_profiles.last_seen_at
+                END,
+                updated_at = excluded.updated_at;
+            """,
+            (
+                chat_id,
+                int(user_id),
+                display_name.strip() or "عضو",
+                personality_summary.strip(),
+                speaking_style.strip() if speaking_style and speaking_style.strip() else None,
+                interests_and_topics.strip() if interests_and_topics and interests_and_topics.strip() else None,
+                notable_facts.strip() if notable_facts and notable_facts.strip() else None,
+                max(0, int(add_message_count)),
+                clean_seen,
+                now_iso,
+            ),
+        )
+        await conn.commit()
+
+
+async def list_ai_member_profiles(
+    chat_id: int,
+    priority_user_ids: list[int] | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Return learned member profiles for chat_id, prioritizing priority_user_ids first."""
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 100))
+    cursor = await conn.execute(
+        """
+        SELECT chat_id, user_id, display_name, personality_summary,
+               speaking_style, interests_and_topics, notable_facts,
+               message_count, last_seen_at, updated_at
+        FROM ai_member_profiles
+        WHERE chat_id = ?
+        ORDER BY message_count DESC, updated_at DESC;
+        """,
+        (chat_id,),
+    )
+    all_rows = [dict(r) for r in await cursor.fetchall()]
+    if not all_rows:
+        return []
+
+    by_uid = {int(r["user_id"]): r for r in all_rows}
+    ordered: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    for uid in priority_user_ids or []:
+        if uid in by_uid and uid not in seen:
+            ordered.append(by_uid[uid])
+            seen.add(uid)
+            if len(ordered) >= safe_limit:
+                return ordered
+
+    for row in all_rows:
+        uid = int(row["user_id"])
+        if uid not in seen:
+            ordered.append(row)
+            seen.add(uid)
+            if len(ordered) >= safe_limit:
+                break
+
+    return ordered
+
+
+async def count_ai_member_profiles(chat_id: int) -> int:
+    """Count learned AI member personality profiles stored for chat_id."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS cnt FROM ai_member_profiles WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def clear_ai_chat_long_term_memory(chat_id: int) -> tuple[int, int]:
+    """Delete learned member/group memory for chat_id and reset source watermarks."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        c1 = await conn.execute("DELETE FROM ai_member_profiles WHERE chat_id = ?;", (chat_id,))
+        c2 = await conn.execute("DELETE FROM ai_group_memory WHERE chat_id = ?;", (chat_id,))
+        await conn.execute(
+            "UPDATE ai_chat_memory_sources SET last_learned_message_id = 0, last_learned_at = NULL WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        await conn.commit()
+    return int(c1.rowcount or 0), int(c2.rowcount or 0)

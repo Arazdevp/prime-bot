@@ -191,6 +191,42 @@ CREATE TABLE IF NOT EXISTS deeptalk_participants (
 
 CREATE INDEX IF NOT EXISTS idx_deeptalk_participants_session
     ON deeptalk_participants(session_id, checked_in, registered);
+
+CREATE TABLE IF NOT EXISTS ai_chat_memory_sources (
+    chat_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    topic_name TEXT,
+    last_learned_message_id INTEGER NOT NULL DEFAULT 0,
+    last_learned_at TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS ai_member_profiles (
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    display_name TEXT NOT NULL,
+    personality_summary TEXT NOT NULL,
+    speaking_style TEXT,
+    interests_and_topics TEXT,
+    notable_facts TEXT,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(chat_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_member_profiles_chat_updated
+    ON ai_member_profiles(chat_id, message_count DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS ai_group_memory (
+    chat_id INTEGER PRIMARY KEY,
+    group_title TEXT,
+    culture_summary TEXT NOT NULL DEFAULT '',
+    inside_jokes TEXT NOT NULL DEFAULT '',
+    ongoing_topics TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -397,6 +433,44 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
                 ON deeptalk_participants(session_id, checked_in, registered);
         """)
         await conn.execute("PRAGMA user_version = 7;")
+        await conn.commit()
+
+    if current_version < 8:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS ai_chat_memory_sources (
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                topic_name TEXT,
+                last_learned_message_id INTEGER NOT NULL DEFAULT 0,
+                last_learned_at TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, thread_id)
+            );
+            CREATE TABLE IF NOT EXISTS ai_member_profiles (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                personality_summary TEXT NOT NULL,
+                speaking_style TEXT,
+                interests_and_topics TEXT,
+                notable_facts TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_member_profiles_chat_updated
+                ON ai_member_profiles(chat_id, message_count DESC, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS ai_group_memory (
+                chat_id INTEGER PRIMARY KEY,
+                group_title TEXT,
+                culture_summary TEXT NOT NULL DEFAULT '',
+                inside_jokes TEXT NOT NULL DEFAULT '',
+                ongoing_topics TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+        """)
+        await conn.execute("PRAGMA user_version = 8;")
         await conn.commit()
 
 

@@ -15,6 +15,7 @@ from bot.database import repository
 from bot.handlers.panel import safe_answer_callback, safe_edit_message
 from bot.keyboards.ai_chat import (
     AiChatCB,
+    build_ai_memory_view_kb,
     build_ai_prompt_cancel_kb,
     build_ai_prompt_view_kb,
     build_manage_ai_kb,
@@ -31,6 +32,12 @@ from bot.services.ai_chat_service import (
     set_ai_chat_provider_state,
     set_ai_chat_state,
     strip_bot_mention,
+)
+from bot.services.ai_memory_service import (
+    bind_memory_source_topic,
+    ensure_memory_source_for_group,
+    learn_from_topic_messages,
+    resolve_memory_group,
 )
 from bot.services.llm_client import LLMError
 from bot.services.publisher import strip_html_tags
@@ -52,23 +59,29 @@ class AiChatStates(StatesGroup):
     waiting_custom_prompt = State()
 
 
-def _parse_toggle_arg(raw_text: str | None) -> tuple[bool | None, str | None]:
-    """Parse optional shorthand argument from '/manage_ai on|off|openai|gemini'."""
+def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, str | None]:
+    """Parse optional shorthand argument from '/manage_ai on|off|openai|gemini|bind|learn|memory'."""
     if not raw_text:
-        return None, None
+        return None, None, None
     parts = raw_text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        return None, None
+        return None, None, None
     arg = parts[1].strip().lower()
     if arg in ("on", "enable", "enabled", "1", "true", "روشن", "فعال"):
-        return True, None
+        return True, None, None
     if arg in ("off", "disable", "disabled", "0", "false", "خاموش", "غیرفعال"):
-        return False, None
+        return False, None, None
     if arg in ("openai", "openrouter", "gateway"):
-        return None, "openai"
+        return None, "openai", None
     if arg in ("gemini", "google", "aistudio"):
-        return None, "gemini"
-    return None, None
+        return None, "gemini", None
+    if arg in ("bind", "اتصال"):
+        return None, None, "bind"
+    if arg in ("learn", "یادگیری"):
+        return None, None, "learn"
+    if arg in ("memory", "mem", "حافظه"):
+        return None, None, "memory"
+    return None, None, None
 
 
 async def _send_in_context(
@@ -164,9 +177,90 @@ def _format_safe_llm_error(exc: LLMError) -> str:
     return combined[:240]
 
 
+async def _render_memory_overview(
+    owner_id: int,
+    chat_id: int | None = None,
+    chat_type: str = "private",
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Render learned group culture and member personalities overview."""
+    mem_chat_id, group_title = await resolve_memory_group(chat_id, chat_type)
+    if mem_chat_id is None:
+        return (
+            "👥 <b>حافظه بلندمدت اعضا</b>\n\nهنوز گروه فعالی برای یادگیری پیدا نشد.",
+            build_ai_memory_view_kb(owner_id=owner_id, has_memory=False),
+        )
+
+    source = await ensure_memory_source_for_group(mem_chat_id)
+    group_mem = await repository.get_ai_group_memory(mem_chat_id)
+    profiles = await repository.list_ai_member_profiles(mem_chat_id, limit=12)
+    total_profiles = await repository.count_ai_member_profiles(mem_chat_id)
+
+    lines = [f"👥 <b>حافظه بلندمدت گروه {escape_html(group_title or str(mem_chat_id))}</b>\n"]
+    if source:
+        src_name = source.get("topic_name") or f"تاپیک {source['thread_id']}"
+        lines.append(f"📚 تاپیک یادگیری: <b>{escape_html(src_name)}</b>")
+    else:
+        lines.append("📚 تاپیک یادگیری: <i>تنظیم نشده (/manage_ai bind داخل گفتگوی آزاد)</i>")
+
+    if group_mem and (
+        group_mem.get("culture_summary") or group_mem.get("inside_jokes") or group_mem.get("ongoing_topics")
+    ):
+        lines.append("\n🌐 <b>شناخت از فضای گروه:</b>")
+        if group_mem.get("culture_summary"):
+            lines.append(f"• حال‌وهوا: {escape_html(group_mem['culture_summary'])}")
+        if group_mem.get("inside_jokes"):
+            lines.append(f"• شوخی‌ها و اصطلاحات: {escape_html(group_mem['inside_jokes'])}")
+        if group_mem.get("ongoing_topics"):
+            lines.append(f"• بحث‌های فعلی: {escape_html(group_mem['ongoing_topics'])}")
+
+    if profiles:
+        lines.append(f"\n🧑 <b>اعضای شناخته‌شده ({total_profiles} نفر):</b>")
+        for prof in profiles:
+            name = escape_html(str(prof.get("display_name") or "عضو"))
+            summary = escape_html(str(prof.get("personality_summary") or ""))
+            entry = f"• <b>{name}</b>: {summary}"
+            if len("\n".join(lines)) + len(entry) + 2 > 3600:
+                lines.append("<i>… و اعضای بیشتر در دیتابیس</i>")
+                break
+            lines.append(entry)
+    else:
+        lines.append("\n<i>هنوز پروفایلی یادگیری نشده؛ دکمه «🧠 یادگیری الان» رو بزن.</i>")
+
+    has_memory = bool(profiles or group_mem)
+    return "\n".join(lines), build_ai_memory_view_kb(owner_id=owner_id, has_memory=has_memory)
+
+
+async def _run_manual_memory_learn(
+    chat_id: int | None,
+    chat_type: str,
+) -> tuple[bool, str]:
+    """Trigger immediate learning from the resolved group's free-chat topic."""
+    mem_chat_id, _ = await resolve_memory_group(chat_id, chat_type)
+    if mem_chat_id is None:
+        return False, "گروه فعالی برای یادگیری پیدا نشد."
+
+    source = await ensure_memory_source_for_group(mem_chat_id)
+    if source is None:
+        return False, "تاپیک گفتگوی آزاد پیدا نشد؛ داخل همون تاپیک دستور /manage_ai bind رو بزن."
+
+    result = await learn_from_topic_messages(
+        mem_chat_id,
+        int(source["thread_id"]),
+        topic_name=source.get("topic_name"),
+    )
+    processed = int(result.get("messages_processed") or 0)
+    members_cnt = int(result.get("members_updated") or 0)
+    topic_label = result.get("topic_name") or "گفتگوی آزاد"
+    if processed == 0:
+        return True, f"پیام جدیدی توی «{topic_label}» برای یادگیری نبود (حافظه به‌روزه)."
+    return True, f"🧠 {processed} پیام از «{topic_label}» بررسی شد و شناخت {members_cnt} عضو به‌روزرسانی شد."
+
+
 async def render_manage_ai_panel(
     owner_id: int,
     bot_username: str | None = None,
+    chat_id: int | None = None,
+    chat_type: str = "private",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render status summary text and inline keyboard for /manage_ai."""
     settings = get_settings()
@@ -174,6 +268,16 @@ async def render_manage_ai_panel(
     provider = get_effective_ai_chat_provider()
     custom_prompt = await repository.get_ai_chat_custom_prompt()
     conv_count = count_active_conversations()
+
+    mem_chat_id, _ = await resolve_memory_group(chat_id, chat_type)
+    source_label = "پیدا نشد (داخل تاپیک <code>/manage_ai bind</code> بزن)"
+    learned_count = 0
+    if mem_chat_id is not None:
+        source = await ensure_memory_source_for_group(mem_chat_id)
+        if source:
+            src_name = source.get("topic_name") or f"تاپیک {source['thread_id']}"
+            source_label = f"<b>{escape_html(src_name)}</b>"
+        learned_count = await repository.count_ai_member_profiles(mem_chat_id)
 
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
     provider_label = "OpenAI / Gateway" if provider == "openai" else "Google Gemini مستقیم"
@@ -198,11 +302,12 @@ async def render_manage_ai_panel(
         f"• مدل گفتگو: <code>{escape_html(active_model)}</code>\n"
         f"• کلید API: {key_badge}\n"
         f"• پرامپت فعال: {prompt_badge}\n"
-        f"• مکالمه‌های فعال در حافظه: <b>{conv_count}</b>\n\n"
+        f"• تاپیک یادگیری: 📚 {source_label}\n"
+        f"• حافظه بلندمدت: 👥 <b>{learned_count}</b> عضو شناخته‌شده | مکالمه‌های موقت: <b>{conv_count}</b>\n\n"
         "<b>نحوه تست هنگام روشن بودن:</b>\n"
         f"• در گروه: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
         "• در پیوی: مستقیم پیام بفرست\n"
-        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>openai</code> | <code>gemini</code>"
+        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>openai</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
     )
     kb = build_manage_ai_kb(
         enabled=enabled,
@@ -215,7 +320,7 @@ async def render_manage_ai_panel(
 
 @router.message(Command("manage_ai"))
 async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
-    """Owner-only command to open the AI chat control panel or toggle AI chat via /manage_ai on|off."""
+    """Owner-only command to open the AI chat control panel or run /manage_ai subcommands."""
     user = message.from_user
     if user is None or not is_global_admin(user.id):
         if message.chat and message.chat.type != "private":
@@ -235,15 +340,43 @@ async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
 
     await state.clear()
 
-    desired_toggle, desired_provider = _parse_toggle_arg(message.text)
+    chat_id = message.chat.id if message.chat else None
+    chat_type = message.chat.type if message.chat else "private"
+    desired_toggle, desired_provider, memory_action = _parse_manage_arg(message.text)
+
     if desired_toggle is not None:
         await set_ai_chat_state(desired_toggle)
     if desired_provider is not None:
         await set_ai_chat_provider_state(desired_provider)
 
+    notice = ""
+    if memory_action == "bind":
+        if chat_type == "private" or chat_id is None:
+            notice = "⚠️ دستور <code>/manage_ai bind</code> رو باید داخل خودِ تاپیک موردنظر (مثلاً گفتگوی آزاد) بزنی.\n\n"
+        else:
+            tid = resolve_thread_id(message)
+            src = await bind_memory_source_topic(chat_id, tid)
+            notice = f"✅ تاپیک <b>«{escape_html(src.get('topic_name') or str(tid))}»</b> برای یادگیری شخصیت اعضا متصل شد.\n\n"
+    elif memory_action == "learn":
+        try:
+            ok_learn, learn_msg = await _run_manual_memory_learn(chat_id, chat_type)
+            prefix = "✅" if ok_learn else "⚠️"
+            notice = f"{prefix} {escape_html(learn_msg)}\n\n"
+        except LLMError as exc:
+            notice = f"⚠️ خطا در یادگیری از پیام‌ها: <code>{escape_html(_format_safe_llm_error(exc))}</code>\n\n"
+    elif memory_action == "memory":
+        mem_text, mem_kb = await _render_memory_overview(owner_id=user.id, chat_id=chat_id, chat_type=chat_type)
+        await _send_in_context(message, mem_text, reply_markup=mem_kb, bot=bot)
+        return
+
     _, bot_username = await ensure_ai_bot_identity(bot)
-    text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
-    await _send_in_context(message, text, reply_markup=kb, bot=bot)
+    text, kb = await render_manage_ai_panel(
+        owner_id=user.id,
+        bot_username=bot_username,
+        chat_id=chat_id,
+        chat_type=chat_type,
+    )
+    await _send_in_context(message, f"{notice}{text}", reply_markup=kb, bot=bot)
 
 
 @router.callback_query(AiChatCB.filter())
@@ -261,12 +394,19 @@ async def on_manage_ai_callback(
 
     action = callback_data.action
     _, bot_username = await ensure_ai_bot_identity(bot)
+    cb_chat = getattr(callback.message, "chat", None) if callback.message else None
+    cb_chat_id = getattr(cb_chat, "id", None)
+    cb_chat_type = getattr(cb_chat, "type", None) or (
+        "supergroup" if isinstance(cb_chat_id, int) and cb_chat_id < 0 else "private"
+    )
 
     if action == "toggle":
         new_state = await set_ai_chat_state(not is_ai_chat_enabled_cached())
         toast = "🟢 چت هوش مصنوعی روشن شد!" if new_state else "🔴 چت هوش مصنوعی خاموش شد."
         await safe_answer_callback(callback, toast)
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
         return
 
@@ -280,21 +420,65 @@ async def on_manage_ai_callback(
             else "🔌 سرویس گفتگو به Google Gemini تغییر کرد."
         )
         await safe_answer_callback(callback, toast)
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
         return
 
     if action == "clear":
         cleared = clear_conversation_history()
         await safe_answer_callback(callback, f"🧹 حافظه {cleared} مکالمه پاک شد.")
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
+        return
+
+    if action == "learn":
+        try:
+            ok_learn, learn_msg = await _run_manual_memory_learn(cb_chat_id, cb_chat_type)
+            await safe_answer_callback(callback, learn_msg[:180], show_alert=not ok_learn)
+        except LLMError as exc:
+            await safe_answer_callback(
+                callback,
+                f"⚠️ خطای یادگیری: {_format_safe_llm_error(exc)[:150]}",
+                show_alert=True,
+            )
+            return
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
+        await safe_edit_message(callback, text, kb)
+        return
+
+    if action == "mem":
+        await safe_answer_callback(callback)
+        mem_text, mem_kb = await _render_memory_overview(
+            owner_id=user.id, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
+        await safe_edit_message(callback, mem_text, mem_kb)
+        return
+
+    if action == "clrmem":
+        mem_chat_id, _ = await resolve_memory_group(cb_chat_id, cb_chat_type)
+        if mem_chat_id is not None:
+            deleted_members, _ = await repository.clear_ai_chat_long_term_memory(mem_chat_id)
+            await safe_answer_callback(callback, f"🗑 حافظه بلندمدت ({deleted_members} عضو) پاک شد.")
+        else:
+            await safe_answer_callback(callback, "حافظه‌ای برای پاک کردن پیدا نشد.")
+        mem_text, mem_kb = await _render_memory_overview(
+            owner_id=user.id, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
+        await safe_edit_message(callback, mem_text, mem_kb)
         return
 
     if action == "refresh":
         await state.clear()
         await safe_answer_callback(callback)
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
         return
 
@@ -479,6 +663,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             chat_type=chat.type,
             speaker_name=speaker_name,
             user_text=user_text,
+            speaker_user_id=user.id,
             topic_name=topic_name,
             reply_context=reply_context,
         )

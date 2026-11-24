@@ -57,6 +57,16 @@ def build_manage_ai_kb(
                 callback_data=AiChatCB(action="setp", owner_id=owner_id).pack(),
             ),
         ],
+        [
+            InlineKeyboardButton(
+                text="🧠 یادگیری از گفتگوی آزاد",
+                callback_data=AiChatCB(action="learn", owner_id=owner_id).pack(),
+            ),
+            InlineKeyboardButton(
+                text="👥 حافظه اعضا",
+                callback_data=AiChatCB(action="mem", owner_id=owner_id).pack(),
+            ),
+        ],
     ]
     if has_custom_prompt:
         rows.append(
@@ -75,6 +85,32 @@ def build_manage_ai_kb(
             )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_ai_memory_view_kb(owner_id: int, has_memory: bool) -> InlineKeyboardMarkup:
+    """Build inline keyboard shown below the learned group & member memory view."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🧠 یادگیری الان",
+                callback_data=AiChatCB(action="learn", owner_id=owner_id).pack(),
+            ),
+            InlineKeyboardButton(
+                text="🔙 بازگشت به پنل",
+                callback_data=AiChatCB(action="refresh", owner_id=owner_id).pack(),
+            ),
+        ]
+    ]
+    if has_memory:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 پاک کردن حافظه بلندمدت",
+                    callback_data=AiChatCB(action="clrmem", owner_id=owner_id).pack(),
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

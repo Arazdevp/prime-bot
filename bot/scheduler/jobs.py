@@ -20,6 +20,7 @@ from bot.services.morning_service import morning_greeting_job
 from bot.services.publisher import send_summary, send_summary_parts
 from bot.services.summarizer import summarize_topic_messages
 from bot.services.deeptalk_service import sweep_due_deeptalks
+from bot.services.ai_memory_service import ai_memory_learn_sweep, maybe_learn_before_purge
 from bot.services.timer_service import sweep_due_timers
 from bot.utils.dates import compute_nightly_cutoff
 from bot.utils.html_utils import escape_html
@@ -379,6 +380,15 @@ async def run_summary_for_topic(
     if delivered and sent_count >= len(parts):
         # Delete source messages and completed summary record only after ALL parts are delivered
         if mark_summarized:
+            try:
+                await maybe_learn_before_purge(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    topic_name=topic_name,
+                    messages=messages,
+                )
+            except Exception as exc:
+                logger.warning("Pre-purge AI memory learning failed for topic '%s': %s", topic_name, exc)
             msg_ids = [m["id"] for m in messages]
             deleted_cnt = await repository.delete_messages_by_ids(msg_ids)
             await repository.delete_summary(chat_id, thread_id, day)
@@ -708,6 +718,17 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         id="deeptalk_sweep",
         name="DeepTalk Sessions Due Sweep",
         misfire_grace_time=60,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # 6. Periodic AI long-term memory learning sweep from free-chat topic every 30 minutes
+    scheduler.add_job(
+        ai_memory_learn_sweep,
+        trigger=IntervalTrigger(minutes=30, timezone=tz),
+        id="ai_memory_learn_sweep",
+        name="AI Chat Long-Term Memory Sweep",
+        misfire_grace_time=300,
         coalesce=True,
         max_instances=1,
     )
