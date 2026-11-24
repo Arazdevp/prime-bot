@@ -474,29 +474,31 @@ class OpenAIClient(BaseLLMClient):
             self._owns_client = True
         return self._client
 
-    async def generate(
+    async def _post_chat_completions(
         self,
-        system_prompt: str,
-        user_content: str,
-        allow_truncated: bool = False,
+        messages_payload: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        allow_truncated: bool,
+        model: str | None = None,
     ) -> str:
+        """Send an OpenAI-compatible chat/completions request with 402 clamp and SSE handling."""
         client = await self._get_client()
+        target_model = (model or self.model).strip()
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
-        effective_max_tokens = self.max_output_tokens
+        effective_max_tokens = int(max_tokens)
 
         for clamp_attempt in range(2):
             payload: dict[str, Any] = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                "temperature": 0.3,
+                "model": target_model,
+                "messages": messages_payload,
+                "temperature": float(temperature),
                 "max_tokens": effective_max_tokens,
                 "stream": False,
             }
@@ -580,7 +582,7 @@ class OpenAIClient(BaseLLMClient):
                     sse_text = "".join(accumulated).strip()
                     if sse_finish_reason == "length" and not allow_truncated:
                         raise LLMTruncationError(
-                            f"OpenAI SSE output truncated due to length (model: {self.model})",
+                            f"OpenAI SSE output truncated due to length (model: {target_model})",
                             truncated_text=sse_text,
                         )
                     return sse_text
@@ -650,18 +652,18 @@ class OpenAIClient(BaseLLMClient):
                 logger.warning(
                     "OpenAI generation truncated due to finish_reason 'length' (model=%s, output_chars=%d). "
                     "Raising retryable LLMTruncationError.",
-                    self.model,
+                    target_model,
                     len(content),
                 )
                 raise LLMTruncationError(
-                    f"OpenAI output truncated due to length (model: {self.model})",
+                    f"OpenAI output truncated due to length (model: {target_model})",
                     truncated_text=content,
                 )
             else:
                 logger.warning(
                     "OpenAI generation truncated due to finish_reason 'length' persisted on retry (model=%s, output_chars=%d). "
                     "Returning truncated output for sanitization.",
-                    self.model,
+                    target_model,
                     len(content),
                 )
                 if not content:
@@ -676,6 +678,52 @@ class OpenAIClient(BaseLLMClient):
             raise LLMError("OpenAI returned empty message content", status_code=200, is_retryable=False)
 
         return content
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_content: str,
+        allow_truncated: bool = False,
+    ) -> str:
+        return await self._post_chat_completions(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.3,
+            max_tokens=self.max_output_tokens,
+            allow_truncated=allow_truncated,
+        )
+
+    async def generate_chat(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.85,
+        max_output_tokens: int | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Generate a multi-turn conversational reply via OpenAI-compatible chat/completions."""
+        chat_messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        has_turn = False
+        for msg in messages:
+            txt = (msg.get("text") or "").strip()
+            if not txt:
+                continue
+            role = "assistant" if msg.get("role") == "model" else "user"
+            chat_messages.append({"role": role, "content": txt})
+            has_turn = True
+
+        if not has_turn:
+            raise LLMError("Cannot generate chat reply without messages", status_code=400, is_retryable=False)
+
+        return await self._post_chat_completions(
+            chat_messages,
+            temperature=float(temperature),
+            max_tokens=int(max_output_tokens or self.max_output_tokens),
+            allow_truncated=True,
+            model=model,
+        )
 
     async def close(self) -> None:
         if self._owns_client and self._client and not self._client.is_closed:
@@ -746,45 +794,89 @@ async def close_llm_client() -> None:
             _shared_http_client = None
 
 
-_shared_ai_chat_client: GeminiClient | None = None
+_shared_ai_chat_gemini_client: GeminiClient | None = None
+_shared_ai_chat_openai_client: OpenAIClient | None = None
 _shared_ai_chat_http_client: httpx.AsyncClient | None = None
 
 
-def get_ai_chat_client(settings: Settings | None = None) -> GeminiClient:
-    """Return dedicated GeminiClient singleton for interactive AI chat."""
-    global _shared_ai_chat_client, _shared_ai_chat_http_client
-    if _shared_ai_chat_client is not None:
-        return _shared_ai_chat_client
+def _get_ai_chat_http_client(settings: Settings) -> httpx.AsyncClient:
+    """Return shared httpx.AsyncClient for interactive AI chat clients."""
+    global _shared_ai_chat_http_client
+    if _shared_ai_chat_http_client is None or _shared_ai_chat_http_client.is_closed:
+        client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(60.0, connect=20.0)}
+        if settings.PROXY_URL:
+            client_kwargs["proxy"] = settings.PROXY_URL
+        _shared_ai_chat_http_client = httpx.AsyncClient(**client_kwargs)
+    return _shared_ai_chat_http_client
 
+
+def get_ai_chat_client(
+    settings: Settings | None = None,
+    provider: str | None = None,
+) -> GeminiClient | OpenAIClient:
+    """Return dedicated interactive AI chat client singleton for 'gemini' or 'openai'."""
+    global _shared_ai_chat_gemini_client, _shared_ai_chat_openai_client
     if settings is None:
         settings = get_settings()
 
-    api_key = (settings.AI_CHAT_API_KEY or settings.GEMINI_API_KEY or "").strip()
-    if not api_key:
-        raise ValueError("AI_CHAT_API_KEY (or GEMINI_API_KEY) is required for interactive AI chat")
+    target = (provider or getattr(settings, "AI_CHAT_PROVIDER", "gemini") or "gemini").strip().lower()
+    if target == "gemini":
+        if _shared_ai_chat_gemini_client is not None:
+            return _shared_ai_chat_gemini_client
+        api_key = (settings.AI_CHAT_API_KEY or settings.GEMINI_API_KEY or "").strip()
+        if not api_key:
+            raise ValueError("AI_CHAT_API_KEY (or GEMINI_API_KEY) is required for Gemini AI chat")
+        http_client = _get_ai_chat_http_client(settings)
+        _shared_ai_chat_gemini_client = GeminiClient(
+            api_key=api_key,
+            model=settings.AI_CHAT_MODEL,
+            max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+            http_client=http_client,
+        )
+        return _shared_ai_chat_gemini_client
 
-    client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(60.0, connect=20.0)}
-    if settings.PROXY_URL:
-        client_kwargs["proxy"] = settings.PROXY_URL
+    if target == "openai":
+        if _shared_ai_chat_openai_client is not None:
+            return _shared_ai_chat_openai_client
+        base_url = (getattr(settings, "AI_CHAT_OPENAI_BASE_URL", None) or settings.OPENAI_BASE_URL or "").strip()
+        api_key = (getattr(settings, "AI_CHAT_OPENAI_API_KEY", None) or settings.OPENAI_API_KEY or "").strip()
+        model = (getattr(settings, "AI_CHAT_OPENAI_MODEL", None) or settings.OPENAI_MODEL or "").strip()
+        if not base_url or not api_key or not model:
+            raise ValueError(
+                "AI_CHAT_OPENAI_BASE_URL/OPENAI_BASE_URL, API_KEY, and MODEL are required for OpenAI AI chat"
+            )
+        raw_effort = getattr(settings, "AI_REASONING_EFFORT", None)
+        reasoning_effort = raw_effort if isinstance(raw_effort, str) and raw_effort.strip() else None
+        http_client = _get_ai_chat_http_client(settings)
+        _shared_ai_chat_openai_client = OpenAIClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+            http_client=http_client,
+            reasoning_effort=reasoning_effort,
+        )
+        return _shared_ai_chat_openai_client
 
-    _shared_ai_chat_http_client = httpx.AsyncClient(**client_kwargs)
-    _shared_ai_chat_client = GeminiClient(
-        api_key=api_key,
-        model=settings.AI_CHAT_MODEL,
-        max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
-        http_client=_shared_ai_chat_http_client,
-    )
-    return _shared_ai_chat_client
+    raise ValueError(f"Unsupported AI_CHAT_PROVIDER: {target}")
 
 
 async def close_ai_chat_client() -> None:
-    """Close dedicated AI chat Gemini and HTTP clients."""
-    global _shared_ai_chat_client, _shared_ai_chat_http_client
-    if _shared_ai_chat_client is not None:
-        try:
-            await _shared_ai_chat_client.close()
-        finally:
-            _shared_ai_chat_client = None
+    """Close dedicated AI chat clients and shared HTTP client."""
+    global _shared_ai_chat_gemini_client, _shared_ai_chat_openai_client, _shared_ai_chat_http_client
+    for attr_name, client_obj in (
+        ("gemini", _shared_ai_chat_gemini_client),
+        ("openai", _shared_ai_chat_openai_client),
+    ):
+        if client_obj is not None:
+            try:
+                await client_obj.close()
+            except Exception:
+                pass
+            if attr_name == "gemini":
+                _shared_ai_chat_gemini_client = None
+            else:
+                _shared_ai_chat_openai_client = None
 
     if _shared_ai_chat_http_client is not None and not _shared_ai_chat_http_client.is_closed:
         try:

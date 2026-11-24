@@ -25,8 +25,10 @@ from bot.services.ai_chat_service import (
     count_active_conversations,
     ensure_ai_bot_identity,
     generate_ai_chat_reply,
+    get_effective_ai_chat_provider,
     is_ai_chat_enabled_cached,
     is_message_addressing_bot,
+    set_ai_chat_provider_state,
     set_ai_chat_state,
     strip_bot_mention,
 )
@@ -50,19 +52,23 @@ class AiChatStates(StatesGroup):
     waiting_custom_prompt = State()
 
 
-def _parse_toggle_arg(raw_text: str | None) -> bool | None:
-    """Parse optional shorthand argument from '/manage_ai on|off'."""
+def _parse_toggle_arg(raw_text: str | None) -> tuple[bool | None, str | None]:
+    """Parse optional shorthand argument from '/manage_ai on|off|openai|gemini'."""
     if not raw_text:
-        return None
+        return None, None
     parts = raw_text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        return None
+        return None, None
     arg = parts[1].strip().lower()
     if arg in ("on", "enable", "enabled", "1", "true", "روشن", "فعال"):
-        return True
+        return True, None
     if arg in ("off", "disable", "disabled", "0", "false", "خاموش", "غیرفعال"):
-        return False
-    return None
+        return False, None
+    if arg in ("openai", "openrouter", "gateway"):
+        return None, "openai"
+    if arg in ("gemini", "google", "aistudio"):
+        return None, "gemini"
+    return None, None
 
 
 async def _send_in_context(
@@ -98,8 +104,25 @@ async def _send_in_context(
 _SECRET_REDACT_RE = re.compile(r"(?:AQ\.[A-Za-z0-9._-]+|AIza[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)")
 
 
-def _format_key_status(settings: object) -> str:
+def _format_key_status(settings: object, provider: str) -> str:
     """Format masked API key source label (last 4 chars only, never exposing secret)."""
+    if provider == "openai":
+        base_url = (
+            getattr(settings, "AI_CHAT_OPENAI_BASE_URL", None)
+            or getattr(settings, "OPENAI_BASE_URL", None)
+            or ""
+        ).strip()
+        api_key = (
+            getattr(settings, "AI_CHAT_OPENAI_API_KEY", None)
+            or getattr(settings, "OPENAI_API_KEY", None)
+            or ""
+        ).strip()
+        key_src = "AI_CHAT_OPENAI_API_KEY" if getattr(settings, "AI_CHAT_OPENAI_API_KEY", None) else "OPENAI_API_KEY"
+        if base_url and api_key:
+            suffix = api_key[-4:] if len(api_key) >= 4 else "****"
+            return f"✅ متصل (<code>{key_src}: ...{escape_html(suffix)}</code>)"
+        return "❌ تنظیمات OpenAI کامل نیست"
+
     chat_key = (getattr(settings, "AI_CHAT_API_KEY", None) or "").strip()
     if chat_key:
         suffix = chat_key[-4:] if len(chat_key) >= 4 else "****"
@@ -148,31 +171,44 @@ async def render_manage_ai_panel(
     """Render status summary text and inline keyboard for /manage_ai."""
     settings = get_settings()
     enabled = is_ai_chat_enabled_cached()
+    provider = get_effective_ai_chat_provider()
     custom_prompt = await repository.get_ai_chat_custom_prompt()
     conv_count = count_active_conversations()
 
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
-    key_badge = _format_key_status(settings)
+    provider_label = "OpenAI / Gateway" if provider == "openai" else "Google Gemini مستقیم"
+    active_model = (
+        (
+            getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
+            or getattr(settings, "OPENAI_MODEL", None)
+            or "تنظیم‌نشده"
+        )
+        if provider == "openai"
+        else settings.AI_CHAT_MODEL
+    )
+    key_badge = _format_key_status(settings, provider)
     prompt_badge = "✏️ سفارشی" if custom_prompt else "🇮🇷 پیش‌فرض (لحن طبیعی ایرانی)"
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
 
     text = (
         "🧠 <b>مدیریت چت هوش مصنوعی (نسخه تستی)</b>\n\n"
         f"• وضعیت فعلی: {status_badge}\n"
+        f"• سرویس فعال: 🔌 <b>{provider_label}</b>\n"
         "• سطح دسترسی: 🔒 <b>فقط مدیر ربات</b>\n"
-        f"• مدل گفتگو: <code>{escape_html(settings.AI_CHAT_MODEL)}</code>\n"
-        f"• کلید Gemini: {key_badge}\n"
+        f"• مدل گفتگو: <code>{escape_html(active_model)}</code>\n"
+        f"• کلید API: {key_badge}\n"
         f"• پرامپت فعال: {prompt_badge}\n"
         f"• مکالمه‌های فعال در حافظه: <b>{conv_count}</b>\n\n"
         "<b>نحوه تست هنگام روشن بودن:</b>\n"
         f"• در گروه: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
         "• در پیوی: مستقیم پیام بفرست\n"
-        "• میانبر سریع: <code>/manage_ai on</code> و <code>/manage_ai off</code>"
+        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>openai</code> | <code>gemini</code>"
     )
     kb = build_manage_ai_kb(
         enabled=enabled,
         has_custom_prompt=bool(custom_prompt),
         owner_id=owner_id,
+        provider=provider,
     )
     return text, kb
 
@@ -199,9 +235,11 @@ async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
 
     await state.clear()
 
-    desired = _parse_toggle_arg(message.text)
-    if desired is not None:
-        await set_ai_chat_state(desired)
+    desired_toggle, desired_provider = _parse_toggle_arg(message.text)
+    if desired_toggle is not None:
+        await set_ai_chat_state(desired_toggle)
+    if desired_provider is not None:
+        await set_ai_chat_provider_state(desired_provider)
 
     _, bot_username = await ensure_ai_bot_identity(bot)
     text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
@@ -227,6 +265,20 @@ async def on_manage_ai_callback(
     if action == "toggle":
         new_state = await set_ai_chat_state(not is_ai_chat_enabled_cached())
         toast = "🟢 چت هوش مصنوعی روشن شد!" if new_state else "🔴 چت هوش مصنوعی خاموش شد."
+        await safe_answer_callback(callback, toast)
+        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        await safe_edit_message(callback, text, kb)
+        return
+
+    if action == "prov":
+        current_provider = get_effective_ai_chat_provider()
+        next_provider = "openai" if current_provider == "gemini" else "gemini"
+        await set_ai_chat_provider_state(next_provider)
+        toast = (
+            "🔌 سرویس گفتگو به OpenAI / Gateway تغییر کرد."
+            if next_provider == "openai"
+            else "🔌 سرویس گفتگو به Google Gemini تغییر کرد."
+        )
         await safe_answer_callback(callback, toast)
         text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
         await safe_edit_message(callback, text, kb)
@@ -430,18 +482,22 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             topic_name=topic_name,
             reply_context=reply_context,
         )
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("AI chat configuration error: %s", exc)
         await _send_in_context(
             message,
-            "⚠️ کلید <code>AI_CHAT_API_KEY</code> یا <code>GEMINI_API_KEY</code> تنظیم نشده.",
+            f"⚠️ تنظیمات کلید/مدل برای سرویس فعلی کامل نیست: <code>{escape_html(str(exc))}</code>",
             bot=bot,
         )
         return
     except LLMError as exc:
         logger.warning("AI chat LLMError for chat %s [status=%s]: %s", chat.id, exc.status_code, exc)
-        err_text = "الان به سرویس Gemini وصل نشدم 😅 یه چند لحظه دیگه دوباره پیام بده."
+        err_text = "الان به سرویس هوش مصنوعی وصل نشدم 😅 یه چند لحظه دیگه دوباره پیام بده."
         if is_global_admin(user.id):
-            err_text += f"\n\n🔍 <b>علت خطا:</b> <code>{escape_html(_format_safe_llm_error(exc))}</code>"
+            safe_err = _format_safe_llm_error(exc)
+            err_text += f"\n\n🔍 <b>علت خطا:</b> <code>{escape_html(safe_err)}</code>"
+            if "location is not supported" in safe_err.lower():
+                err_text += "\n💡 آی‌پی سرور در Google AI Studio محدود است؛ از <code>/manage_ai openai</code> استفاده کن."
         await _send_in_context(
             message,
             err_text,

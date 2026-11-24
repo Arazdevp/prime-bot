@@ -76,10 +76,26 @@ class Settings(BaseSettings):
         description="Optional OpenRouter reasoning effort (e.g. 'none', 'minimal', 'low', 'medium', 'high')",
     )
 
-    # Interactive AI Chat Settings (Independent Google Gemini Client)
+    # Interactive AI Chat Settings (Independent Google Gemini / OpenAI Client)
+    AI_CHAT_PROVIDER: Literal["gemini", "openai"] = Field(
+        default="gemini",
+        description="Default AI provider for interactive AI chat: 'gemini' or 'openai'",
+    )
     AI_CHAT_API_KEY: str | None = Field(
         default=None,
         description="Dedicated Google Gemini API key for interactive AI chat (falls back to GEMINI_API_KEY)",
+    )
+    AI_CHAT_OPENAI_BASE_URL: str | None = Field(
+        default=None,
+        description="Optional OpenAI-compatible base URL for AI chat (falls back to OPENAI_BASE_URL)",
+    )
+    AI_CHAT_OPENAI_API_KEY: str | None = Field(
+        default=None,
+        description="Optional OpenAI-compatible API key for AI chat (falls back to OPENAI_API_KEY)",
+    )
+    AI_CHAT_OPENAI_MODEL: str | None = Field(
+        default=None,
+        description="Optional OpenAI-compatible model for AI chat (falls back to OPENAI_MODEL)",
     )
     AI_CHAT_MODEL: str = Field(
         default="gemini-3.5-flash-lite",
@@ -273,7 +289,15 @@ class Settings(BaseSettings):
             return [value]
         return [int(value)]
 
-    @field_validator("PROXY_URL", "AI_REASONING_EFFORT", "AI_CHAT_API_KEY", mode="before")
+    @field_validator(
+        "PROXY_URL",
+        "AI_REASONING_EFFORT",
+        "AI_CHAT_API_KEY",
+        "AI_CHAT_OPENAI_BASE_URL",
+        "AI_CHAT_OPENAI_API_KEY",
+        "AI_CHAT_OPENAI_MODEL",
+        mode="before",
+    )
     @classmethod
     def parse_optional_str(cls, value: Any) -> str | None:
         """Treat empty or whitespace-only string as None."""

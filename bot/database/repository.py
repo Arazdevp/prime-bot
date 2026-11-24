@@ -571,6 +571,31 @@ async def set_ai_chat_custom_prompt(prompt: str | None) -> None:
         await conn.commit()
 
 
+async def get_ai_chat_provider() -> str | None:
+    """Return persisted AI chat provider override ('gemini' or 'openai'), or None if unset."""
+    val = await get_meta_value("ai_chat_provider")
+    if val is None:
+        return None
+    cleaned = val.strip().lower()
+    return cleaned if cleaned in ("gemini", "openai") else None
+
+
+async def set_ai_chat_provider(provider: str | None) -> None:
+    """Persist AI chat provider override ('gemini'/'openai') or clear it when None."""
+    if provider is None:
+        conn = get_db()
+        lock = get_write_lock()
+        async with lock:
+            await conn.execute("DELETE FROM meta WHERE key = ?;", ("ai_chat_provider",))
+            await conn.commit()
+        return
+
+    cleaned = provider.strip().lower()
+    if cleaned not in ("gemini", "openai"):
+        raise ValueError(f"Unsupported AI chat provider: {provider}")
+    await set_meta_value("ai_chat_provider", cleaned)
+
+
 # ---------------- Summaries Table Operations ----------------
 
 

@@ -25,23 +25,32 @@ from bot.services.ai_chat_service import (
     clear_conversation_history,
     count_active_conversations,
     generate_ai_chat_reply,
+    get_effective_ai_chat_provider,
     init_ai_chat_state,
     is_ai_chat_enabled_cached,
     reset_ai_chat_state,
     set_ai_bot_identity,
     set_ai_chat_state,
 )
-from bot.services.llm_client import GeminiClient, LLMError
+from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient
 
 
 def _fake_settings(admin_ids: list[int] | None = None, allowed_chats: list[int] | None = None):
     return SimpleNamespace(
         ADMIN_IDS=admin_ids if admin_ids is not None else [11111],
         ALLOWED_CHAT_IDS=allowed_chats if allowed_chats is not None else [],
+        AI_CHAT_PROVIDER="gemini",
         AI_CHAT_API_KEY="AQ.TestKeyForUnitTests",
         GEMINI_API_KEY=None,
         AI_CHAT_MODEL="gemini-3.5-flash-lite",
         AI_CHAT_FALLBACK_MODELS=["gemini-flash-lite-latest", "gemini-3.8-flash"],
+        AI_CHAT_OPENAI_BASE_URL=None,
+        AI_CHAT_OPENAI_API_KEY=None,
+        AI_CHAT_OPENAI_MODEL=None,
+        OPENAI_BASE_URL="https://openrouter.ai/api/v1",
+        OPENAI_API_KEY="sk-or-test9999",
+        OPENAI_MODEL="google/gemini-2.5-flash",
+        AI_REASONING_EFFORT=None,
         AI_CHAT_MAX_OUTPUT_TOKENS=1024,
         AI_CHAT_TEMPERATURE=0.85,
         AI_CHAT_HISTORY_LIMIT=6,
@@ -516,6 +525,125 @@ async def test_ai_chat_automatic_model_fallback_on_503_and_404(tmp_path: Path) -
 
         assert reply == "الان روبه‌راه شدم رفیق!"
         assert tried_models == ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash"]
+    finally:
+        await close_db()
+        reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_openai_client_generate_chat_multiturn_roles_and_override() -> None:
+    """Verify OpenAIClient.generate_chat sends system/user/assistant roles, temperature, and model override."""
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "قربونت رفیق، بگو چیکار کنیم!"},
+            }
+        ]
+    }
+
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.is_closed = False
+    mock_http.post = AsyncMock(return_value=mock_resp)
+
+    client = OpenAIClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-test9999",
+        model="google/gemini-2.5-flash",
+        max_output_tokens=1024,
+        http_client=mock_http,
+    )
+    reply = await client.generate_chat(
+        system_prompt="پرامپت فارسی",
+        messages=[
+            {"role": "user", "text": "سلام!"},
+            {"role": "model", "text": "سلام رفیق!"},
+            {"role": "user", "text": "یه ایده بده"},
+        ],
+        temperature=0.85,
+        max_output_tokens=768,
+        model="antigravity/gemini-2.5-flash",
+    )
+
+    assert reply == "قربونت رفیق، بگو چیکار کنیم!"
+    assert mock_http.post.call_args.args[0] == "https://openrouter.ai/api/v1/chat/completions"
+    payload = mock_http.post.call_args.kwargs["json"]
+    assert payload["model"] == "antigravity/gemini-2.5-flash"
+    assert payload["temperature"] == 0.85
+    assert payload["max_tokens"] == 768
+    assert [m["role"] for m in payload["messages"]] == ["system", "user", "assistant", "user"]
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_provider_switch_via_command_callback_and_reply(tmp_path: Path) -> None:
+    """Verify /manage_ai openai|gemini, AiChatCB('prov'), OpenAI routing, and geo-block hint."""
+    reset_ai_chat_state()
+    await init_db(str(tmp_path / "ai_provider_switch.db"))
+    cfg = _fake_settings(admin_ids=[11111])
+    try:
+        assert len(AiChatCB(action="prov", owner_id=999999999999).pack().encode("utf-8")) <= 64
+        bot = _make_bot()
+        fsm = _make_fsm()
+
+        with patch("bot.services.access.get_settings", return_value=cfg), patch(
+            "bot.handlers.ai_chat.get_settings", return_value=cfg
+        ), patch("bot.services.ai_chat_service.get_settings", return_value=cfg):
+            # 1. Switch to OpenAI via '/manage_ai openai'
+            cmd_msg = _make_message(user_id=11111, text="/manage_ai openai", chat_type="private")
+            await cmd_manage_ai(cmd_msg, bot, fsm)
+            assert get_effective_ai_chat_provider() == "openai"
+            assert await repository.get_ai_chat_provider() == "openai"
+            panel_text = cmd_msg.answer.call_args.kwargs["text"]
+            assert "OpenAI / Gateway" in panel_text
+            assert "OPENAI_API_KEY: ...9999" in panel_text
+            assert "google/gemini-2.5-flash" in panel_text
+
+            # 2. Callback 'prov' toggles back to Gemini and then to OpenAI again
+            cb = MagicMock(spec=CallbackQuery)
+            cb.from_user = SimpleNamespace(id=11111)
+            cb.answer = AsyncMock()
+            cb.message = MagicMock(spec=Message)
+            cb.message.chat = SimpleNamespace(id=11111)
+            cb.message.message_id = 101
+            cb.message.edit_text = AsyncMock()
+
+            await on_manage_ai_callback(cb, AiChatCB(action="prov", owner_id=11111), bot, fsm)
+            assert get_effective_ai_chat_provider() == "gemini"
+            await on_manage_ai_callback(cb, AiChatCB(action="prov", owner_id=11111), bot, fsm)
+            assert get_effective_ai_chat_provider() == "openai"
+
+            # 3. generate_ai_chat_reply routes through OpenAIClient when provider == 'openai'
+            mock_openai = MagicMock(spec=OpenAIClient)
+            mock_openai.generate_chat = AsyncMock(return_value="حله، الان از درگاه OpenAI جواب میدم!")
+            with patch("bot.services.ai_chat_service.get_ai_chat_client", return_value=mock_openai) as mock_factory:
+                reply = await generate_ai_chat_reply(
+                    chat_id=11111,
+                    thread_id=0,
+                    chat_type="private",
+                    speaker_name="آرش",
+                    user_text="تست سرویس OpenAI",
+                )
+            mock_factory.assert_called_once_with(cfg, provider="openai")
+            assert reply == "حله، الان از درگاه OpenAI جواب میدم!"
+
+            # 4. Geo-block error on Gemini includes /manage_ai openai hint
+            await on_manage_ai_callback(cb, AiChatCB(action="prov", owner_id=11111), bot, fsm)
+            assert get_effective_ai_chat_provider() == "gemini"
+            with patch(
+                "bot.handlers.ai_chat.generate_ai_chat_reply",
+                side_effect=LLMError(
+                    'Gemini API returned status 400: {"error":{"message":"User location is not supported for the API use."}}',
+                    status_code=400,
+                    body_excerpt='{"error":{"message":"User location is not supported for the API use."}}',
+                    is_retryable=False,
+                ),
+            ):
+                pv_msg = _make_message(user_id=11111, text="سلام", chat_type="private")
+                await handle_ai_chat_message(pv_msg, bot)
+            err_reply = pv_msg.answer.call_args.kwargs["text"]
+            assert "/manage_ai openai" in err_reply
     finally:
         await close_db()
         reset_ai_chat_state()

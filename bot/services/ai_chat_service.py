@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.types import Message
 from bot.config import get_settings
 from bot.database import repository
-from bot.services.llm_client import GeminiClient, LLMError, get_ai_chat_client
+from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
 from bot.services.timer_service import get_bot_username
 from bot.texts.ai_chat_texts import DEFAULT_AI_CHAT_SYSTEM_PROMPT, build_runtime_system_prompt
@@ -30,6 +30,7 @@ class _ConversationState:
 
 
 _ai_chat_enabled_cache: bool = False
+_ai_chat_provider_cache: str | None = None
 _bot_id_cache: int | None = None
 _bot_username_cache: str | None = None
 _conversations: dict[tuple[int, int], _ConversationState] = {}
@@ -37,9 +38,10 @@ _conv_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
 
 def reset_ai_chat_state() -> None:
-    """Reset in-memory AI chat toggle, identity, and conversation caches (for test isolation)."""
-    global _ai_chat_enabled_cache, _bot_id_cache, _bot_username_cache
+    """Reset in-memory AI chat toggle, provider, identity, and conversation caches (for test isolation)."""
+    global _ai_chat_enabled_cache, _ai_chat_provider_cache, _bot_id_cache, _bot_username_cache
     _ai_chat_enabled_cache = False
+    _ai_chat_provider_cache = None
     _bot_id_cache = None
     _bot_username_cache = None
     _conversations.clear()
@@ -51,10 +53,19 @@ def is_ai_chat_enabled_cached() -> bool:
     return _ai_chat_enabled_cache
 
 
+def get_effective_ai_chat_provider() -> str:
+    """Return active interactive AI chat provider ('gemini' or 'openai')."""
+    if _ai_chat_provider_cache in ("gemini", "openai"):
+        return _ai_chat_provider_cache
+    raw = str(getattr(get_settings(), "AI_CHAT_PROVIDER", "gemini") or "gemini").strip().lower()
+    return raw if raw in ("gemini", "openai") else "gemini"
+
+
 async def init_ai_chat_state() -> bool:
-    """Load persisted ai_chat_enabled flag from SQLite into the in-memory cache."""
-    global _ai_chat_enabled_cache
+    """Load persisted ai_chat_enabled and ai_chat_provider from SQLite into memory caches."""
+    global _ai_chat_enabled_cache, _ai_chat_provider_cache
     _ai_chat_enabled_cache = await repository.get_ai_chat_enabled()
+    _ai_chat_provider_cache = await repository.get_ai_chat_provider()
     return _ai_chat_enabled_cache
 
 
@@ -64,6 +75,17 @@ async def set_ai_chat_state(enabled: bool) -> bool:
     await repository.set_ai_chat_enabled(enabled)
     _ai_chat_enabled_cache = bool(enabled)
     return _ai_chat_enabled_cache
+
+
+async def set_ai_chat_provider_state(provider: str) -> str:
+    """Persist ai_chat_provider ('gemini' or 'openai') to SQLite and update cache."""
+    global _ai_chat_provider_cache
+    cleaned = provider.strip().lower()
+    if cleaned not in ("gemini", "openai"):
+        raise ValueError(f"Unsupported AI chat provider: {provider}")
+    await repository.set_ai_chat_provider(cleaned)
+    _ai_chat_provider_cache = cleaned
+    return cleaned
 
 
 def set_ai_bot_identity(bot_id: int | None, username: str | None) -> None:
@@ -191,11 +213,12 @@ async def generate_ai_chat_reply(
     user_text: str,
     topic_name: str | None = None,
     reply_context: str | None = None,
-    client: GeminiClient | None = None,
+    client: GeminiClient | OpenAIClient | None = None,
 ) -> str:
     """Generate a natural Iranian Persian conversational reply and update rolling memory."""
     settings = get_settings()
-    active_client = client or get_ai_chat_client(settings)
+    provider = get_effective_ai_chat_provider()
+    active_client = client or get_ai_chat_client(settings, provider=provider)
     key = (chat_id, thread_id)
     lock = _get_conv_lock(key)
 
@@ -224,39 +247,56 @@ async def generate_ai_chat_reply(
             topic_name=topic_name,
         )
 
-        raw_fallbacks = getattr(settings, "AI_CHAT_FALLBACK_MODELS", None) or []
-        candidate_models: list[str] = []
-        for candidate in [settings.AI_CHAT_MODEL, *raw_fallbacks]:
-            cleaned = str(candidate).strip()
-            if cleaned and cleaned not in candidate_models:
-                candidate_models.append(cleaned)
-        if not candidate_models:
-            candidate_models = ["gemini-3.5-flash-lite"]
-
         raw_reply: str | None = None
-        for idx, candidate_model in enumerate(candidate_models):
-            is_last = idx == len(candidate_models) - 1
-            try:
-                raw_reply = await async_retry(
-                    lambda m=candidate_model: active_client.generate_chat(
-                        system_prompt=runtime_system,
-                        messages=pending_turns,
-                        temperature=settings.AI_CHAT_TEMPERATURE,
-                        max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
-                        model=m,
-                    ),
-                    retries=1 if is_last else 0,
-                )
-                break
-            except LLMError as exc:
-                if not is_last and exc.status_code in (404, 429, 503):
-                    logger.warning(
-                        "AI chat model '%s' failed (status=%s); falling back to next model...",
-                        candidate_model,
-                        exc.status_code,
+        if isinstance(active_client, OpenAIClient):
+            openai_model = (
+                getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
+                or getattr(settings, "OPENAI_MODEL", None)
+                or ""
+            ).strip() or None
+            raw_reply = await async_retry(
+                lambda: active_client.generate_chat(
+                    system_prompt=runtime_system,
+                    messages=pending_turns,
+                    temperature=settings.AI_CHAT_TEMPERATURE,
+                    max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+                    model=openai_model,
+                ),
+                retries=1,
+            )
+        else:
+            raw_fallbacks = getattr(settings, "AI_CHAT_FALLBACK_MODELS", None) or []
+            candidate_models: list[str] = []
+            for candidate in [settings.AI_CHAT_MODEL, *raw_fallbacks]:
+                cleaned = str(candidate).strip()
+                if cleaned and cleaned not in candidate_models:
+                    candidate_models.append(cleaned)
+            if not candidate_models:
+                candidate_models = ["gemini-3.5-flash-lite"]
+
+            for idx, candidate_model in enumerate(candidate_models):
+                is_last = idx == len(candidate_models) - 1
+                try:
+                    raw_reply = await async_retry(
+                        lambda m=candidate_model: active_client.generate_chat(
+                            system_prompt=runtime_system,
+                            messages=pending_turns,
+                            temperature=settings.AI_CHAT_TEMPERATURE,
+                            max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+                            model=m,
+                        ),
+                        retries=1 if is_last else 0,
                     )
-                    continue
-                raise
+                    break
+                except LLMError as exc:
+                    if not is_last and exc.status_code in (404, 429, 503):
+                        logger.warning(
+                            "AI chat model '%s' failed (status=%s); falling back to next model...",
+                            candidate_model,
+                            exc.status_code,
+                        )
+                        continue
+                    raise
 
         if raw_reply is None:
             raise LLMError("All AI chat model candidates failed", status_code=503, is_retryable=True)
