@@ -199,11 +199,17 @@ def build_admin_help_text(is_global: bool) -> str:
         if is_global
         else "تو <b>ادمین گروه</b> هستی و هر گروهی که توش ادمین باشی برات توی پنل میاد 🔥"
     )
+    global_only_cmd = (
+        "• <code>/manage_ai</code> — مدیریت و روشن/خاموش کردن چت هوش مصنوعی (ویژه مدیر ربات)\n"
+        if is_global
+        else ""
+    )
     return (
         "📖 <b>راهنمای پنل مدیریت ربات خلاصه‌ساز</b>\n\n"
         f"{role_note}\n\n"
         "<b>دستورات پیوی:</b>\n"
         "• <code>/panel</code> — باز کردن پنل مدیریتی دکمه‌ای\n"
+        f"{global_only_cmd}"
         "• <code>/deeptalk</code> — پنل ساخت و مدیریت جلسات دیپ‌تاک (ویژه مالک ربات و ادمین‌های دیپ‌تاک)\n"
         "• <code>/timer</code> — پنل شیشه‌ای تایمر و یادآور (دقیقه‌ای/ساعتی و تقویم شمسی)\n"
         "• <code>/start</code> — خوش‌آمدگویی و دکمه سریع پنل\n"

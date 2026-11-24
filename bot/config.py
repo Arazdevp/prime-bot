@@ -76,6 +76,34 @@ class Settings(BaseSettings):
         description="Optional OpenRouter reasoning effort (e.g. 'none', 'minimal', 'low', 'medium', 'high')",
     )
 
+    # Interactive AI Chat Settings (Independent Google Gemini Client)
+    AI_CHAT_API_KEY: str | None = Field(
+        default=None,
+        description="Dedicated Google Gemini API key for interactive AI chat (falls back to GEMINI_API_KEY)",
+    )
+    AI_CHAT_MODEL: str = Field(
+        default="gemini-2.5-flash",
+        description="Google Gemini model identifier used for interactive AI chat",
+    )
+    AI_CHAT_MAX_OUTPUT_TOKENS: int = Field(
+        default=1024,
+        ge=128,
+        le=8192,
+        description="Maximum output tokens for interactive AI chat replies",
+    )
+    AI_CHAT_TEMPERATURE: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for conversational Persian AI chat",
+    )
+    AI_CHAT_HISTORY_LIMIT: int = Field(
+        default=14,
+        ge=2,
+        le=40,
+        description="Maximum recent conversation turns kept in memory per chat/topic",
+    )
+
     # Thresholds & Limits
     MIN_MESSAGES_PER_TOPIC: int = Field(
         default=5,
@@ -237,7 +265,7 @@ class Settings(BaseSettings):
             return [value]
         return [int(value)]
 
-    @field_validator("PROXY_URL", "AI_REASONING_EFFORT", mode="before")
+    @field_validator("PROXY_URL", "AI_REASONING_EFFORT", "AI_CHAT_API_KEY", mode="before")
     @classmethod
     def parse_optional_str(cls, value: Any) -> str | None:
         """Treat empty or whitespace-only string as None."""

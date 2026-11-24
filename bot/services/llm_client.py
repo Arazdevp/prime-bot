@@ -285,35 +285,13 @@ class GeminiClient(BaseLLMClient):
             self._owns_client = True
         return self._client
 
-    async def generate(
-        self,
-        system_prompt: str,
-        user_content: str,
-        allow_truncated: bool = False,
-    ) -> str:
+    async def _post_generate(self, payload: dict[str, Any], allow_truncated: bool) -> str:
+        """Send a Gemini generateContent request and extract clean non-thought text."""
         client = await self._get_client()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key,
-        }
-        payload = {
-            "systemInstruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": user_content}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": self.max_output_tokens,
-                "thinkingConfig": {
-                    "thinkingBudget": 0,
-                },
-            },
         }
 
         try:
@@ -375,20 +353,19 @@ class GeminiClient(BaseLLMClient):
                     f"Gemini output truncated due to MAX_TOKENS (model: {self.model})",
                     truncated_text=full_text,
                 )
-            else:
-                logger.warning(
-                    "Gemini generation truncated due to MAX_TOKENS persisted on retry (model=%s, output_chars=%d). "
-                    "Returning truncated output for sanitization.",
-                    self.model,
-                    len(full_text),
+            logger.warning(
+                "Gemini generation truncated due to MAX_TOKENS persisted on retry (model=%s, output_chars=%d). "
+                "Returning truncated output for sanitization.",
+                self.model,
+                len(full_text),
+            )
+            if not full_text:
+                raise LLMError(
+                    "Gemini returned empty parts with finishReason MAX_TOKENS",
+                    status_code=200,
+                    is_retryable=False,
                 )
-                if not full_text:
-                    raise LLMError(
-                        "Gemini returned empty parts with finishReason MAX_TOKENS",
-                        status_code=200,
-                        is_retryable=False,
-                    )
-                return full_text
+            return full_text
 
         if not parts:
             raise LLMError(
@@ -401,6 +378,66 @@ class GeminiClient(BaseLLMClient):
             raise LLMError("Gemini returned empty text", status_code=200, is_retryable=False)
 
         return full_text
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_content: str,
+        allow_truncated: bool = False,
+    ) -> str:
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_content}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": self.max_output_tokens,
+                "thinkingConfig": {
+                    "thinkingBudget": 0,
+                },
+            },
+        }
+        return await self._post_generate(payload, allow_truncated=allow_truncated)
+
+    async def generate_chat(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.85,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """Generate a multi-turn conversational reply using Gemini REST contents history."""
+        contents = [
+            {
+                "role": msg["role"],
+                "parts": [{"text": msg["text"]}],
+            }
+            for msg in messages
+            if msg.get("text")
+        ]
+        if not contents:
+            raise LLMError("Cannot generate chat reply without messages", status_code=400, is_retryable=False)
+
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": float(temperature),
+                "maxOutputTokens": int(max_output_tokens or self.max_output_tokens),
+                "thinkingConfig": {
+                    "thinkingBudget": 0,
+                },
+            },
+        }
+        return await self._post_generate(payload, allow_truncated=True)
 
     async def close(self) -> None:
         if self._owns_client and self._client and not self._client.is_closed:
@@ -703,3 +740,50 @@ async def close_llm_client() -> None:
             await _shared_http_client.aclose()
         finally:
             _shared_http_client = None
+
+
+_shared_ai_chat_client: GeminiClient | None = None
+_shared_ai_chat_http_client: httpx.AsyncClient | None = None
+
+
+def get_ai_chat_client(settings: Settings | None = None) -> GeminiClient:
+    """Return dedicated GeminiClient singleton for interactive AI chat."""
+    global _shared_ai_chat_client, _shared_ai_chat_http_client
+    if _shared_ai_chat_client is not None:
+        return _shared_ai_chat_client
+
+    if settings is None:
+        settings = get_settings()
+
+    api_key = (settings.AI_CHAT_API_KEY or settings.GEMINI_API_KEY or "").strip()
+    if not api_key:
+        raise ValueError("AI_CHAT_API_KEY (or GEMINI_API_KEY) is required for interactive AI chat")
+
+    client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(60.0, connect=20.0)}
+    if settings.PROXY_URL:
+        client_kwargs["proxy"] = settings.PROXY_URL
+
+    _shared_ai_chat_http_client = httpx.AsyncClient(**client_kwargs)
+    _shared_ai_chat_client = GeminiClient(
+        api_key=api_key,
+        model=settings.AI_CHAT_MODEL,
+        max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+        http_client=_shared_ai_chat_http_client,
+    )
+    return _shared_ai_chat_client
+
+
+async def close_ai_chat_client() -> None:
+    """Close dedicated AI chat Gemini and HTTP clients."""
+    global _shared_ai_chat_client, _shared_ai_chat_http_client
+    if _shared_ai_chat_client is not None:
+        try:
+            await _shared_ai_chat_client.close()
+        finally:
+            _shared_ai_chat_client = None
+
+    if _shared_ai_chat_http_client is not None and not _shared_ai_chat_http_client.is_closed:
+        try:
+            await _shared_ai_chat_http_client.aclose()
+        finally:
+            _shared_ai_chat_http_client = None

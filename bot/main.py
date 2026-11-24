@@ -13,11 +13,12 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
-from bot.handlers import admin, deeptalk, listener, panel, private, timer
+from bot.handlers import admin, ai_chat, deeptalk, listener, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
 from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
+from bot.services.ai_chat_service import init_ai_chat_state, set_ai_bot_identity
 from bot.services.deeptalk_service import rehydrate_deeptalk_sessions
-from bot.services.llm_client import close_llm_client
+from bot.services.llm_client import close_ai_chat_client, close_llm_client
 from bot.services.morning_service import run_morning_catchup_if_needed
 from bot.services.timer_service import rehydrate_active_timers, set_bot_username
 from bot.utils.dates import format_persian_date, get_tehran_now
@@ -103,9 +104,11 @@ async def main() -> None:
     setup_logging(log_dir=settings.LOG_DIR, log_level=settings.LOG_LEVEL)
     logger.info("Starting Telegram Forum Daily Summarizer Bot...")
 
-    # 1. Initialize SQLite Database
+    # 1. Initialize SQLite Database & persisted AI chat toggle cache
     await init_db(settings.DB_PATH)
     logger.info("Database initialized successfully at %s", settings.DB_PATH)
+    ai_enabled = await init_ai_chat_state()
+    logger.info("Interactive AI chat state loaded: %s", "ON" if ai_enabled else "OFF")
 
     # 2. Build Telegram Bot with custom session & default HTML parsing
     session = create_bot_session(settings.PROXY_URL)
@@ -124,14 +127,16 @@ async def main() -> None:
     dp.include_router(admin.router)
     dp.include_router(timer.router)
     dp.include_router(deeptalk.router)
+    dp.include_router(ai_chat.router)
     dp.include_router(listener.router)
     dp.include_router(private.router)
     dp.include_router(panel.router)
 
-    # Best-effort cache bot username for DM activation deep links
+    # Best-effort cache bot username & ID for DM deep links and AI group mention/reply checks
     try:
         me = await bot.get_me()
         set_bot_username(me.username)
+        set_ai_bot_identity(me.id, me.username)
     except Exception as exc:
         logger.debug("Could not fetch bot username on startup: %s", exc)
 
@@ -253,6 +258,7 @@ async def main() -> None:
         logger.info("Bot session closed.")
 
         await close_llm_client()
+        await close_ai_chat_client()
         logger.info("LLM client closed.")
 
         await close_db()

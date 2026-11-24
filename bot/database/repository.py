@@ -538,6 +538,39 @@ async def set_last_nightly_run(timestamp_iso: str) -> None:
     await set_meta_value("last_nightly_run", timestamp_iso)
 
 
+async def get_ai_chat_enabled() -> bool:
+    """Return True if interactive AI chat mode is enabled in meta settings (default False)."""
+    val = await get_meta_value("ai_chat_enabled")
+    return val == "1"
+
+
+async def set_ai_chat_enabled(enabled: bool) -> None:
+    """Persist interactive AI chat enabled/disabled flag in meta settings."""
+    await set_meta_value("ai_chat_enabled", "1" if enabled else "0")
+
+
+async def get_ai_chat_custom_prompt() -> str | None:
+    """Return custom interactive AI chat system prompt if configured, else None."""
+    val = await get_meta_value("ai_chat_custom_prompt")
+    if val is None:
+        return None
+    stripped = val.strip()
+    return stripped if stripped else None
+
+
+async def set_ai_chat_custom_prompt(prompt: str | None) -> None:
+    """Save or clear the custom interactive AI chat system prompt."""
+    clean = prompt.strip() if isinstance(prompt, str) and prompt.strip() else None
+    if clean is not None:
+        await set_meta_value("ai_chat_custom_prompt", clean)
+        return
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute("DELETE FROM meta WHERE key = ?;", ("ai_chat_custom_prompt",))
+        await conn.commit()
+
+
 # ---------------- Summaries Table Operations ----------------
 
 
