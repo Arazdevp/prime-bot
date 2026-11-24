@@ -16,6 +16,7 @@ def build_manage_ai_kb(
     has_custom_prompt: bool,
     owner_id: int,
     provider: str = "gemini",
+    access_mode: str = "public",
 ) -> InlineKeyboardMarkup:
     """Build main inline keyboard for /manage_ai panel."""
     toggle_label = "🔴 خاموش کردن هوش مصنوعی" if enabled else "🟢 روشن کردن هوش مصنوعی"
@@ -23,6 +24,11 @@ def build_manage_ai_kb(
         "🔄 تغییر سرویس به OpenAI"
         if provider == "gemini"
         else "🔄 تغییر سرویس به Gemini"
+    )
+    access_label = (
+        "🔒 محدود به مدیر ربات"
+        if access_mode == "public"
+        else "👥 باز کردن برای همه (۲۰/۲ساعت)"
     )
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -35,7 +41,11 @@ def build_manage_ai_kb(
             InlineKeyboardButton(
                 text=provider_label,
                 callback_data=AiChatCB(action="prov", owner_id=owner_id).pack(),
-            )
+            ),
+            InlineKeyboardButton(
+                text=access_label,
+                callback_data=AiChatCB(action="acc", owner_id=owner_id).pack(),
+            ),
         ],
         [
             InlineKeyboardButton(

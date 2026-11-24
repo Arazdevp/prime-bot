@@ -596,6 +596,22 @@ async def set_ai_chat_provider(provider: str | None) -> None:
     await set_meta_value("ai_chat_provider", cleaned)
 
 
+async def get_ai_chat_access_mode() -> str:
+    """Return persisted AI chat access mode ('public' or 'owner_only'; default 'public')."""
+    val = await get_meta_value("ai_chat_access_mode")
+    if val and val.strip().lower() == "owner_only":
+        return "owner_only"
+    return "public"
+
+
+async def set_ai_chat_access_mode(mode: str) -> None:
+    """Persist AI chat access mode ('public' or 'owner_only') in meta settings."""
+    cleaned = mode.strip().lower()
+    if cleaned not in ("public", "owner_only"):
+        raise ValueError(f"Unsupported AI chat access mode: {mode}")
+    await set_meta_value("ai_chat_access_mode", cleaned)
+
+
 # ---------------- Summaries Table Operations ----------------
 
 

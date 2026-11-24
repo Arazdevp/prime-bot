@@ -110,7 +110,7 @@ class Settings(BaseSettings):
         description="Comma-separated or list of fallback Gemini models used if AI_CHAT_MODEL hits 404/429/503",
     )
     AI_CHAT_MAX_OUTPUT_TOKENS: int = Field(
-        default=1024,
+        default=600,
         ge=128,
         le=8192,
         description="Maximum output tokens for interactive AI chat replies",
@@ -122,10 +122,22 @@ class Settings(BaseSettings):
         description="Sampling temperature for conversational Persian AI chat",
     )
     AI_CHAT_HISTORY_LIMIT: int = Field(
-        default=14,
+        default=8,
         ge=2,
         le=40,
         description="Maximum recent conversation turns kept in memory per chat/topic",
+    )
+    AI_CHAT_USER_LIMIT_COUNT: int = Field(
+        default=20,
+        ge=1,
+        le=500,
+        description="Max AI chat messages per non-manager user inside the rolling window",
+    )
+    AI_CHAT_USER_LIMIT_WINDOW_SECONDS: int = Field(
+        default=7200,
+        ge=60,
+        le=86400,
+        description="Rolling rate-limit window in seconds (default 7200 = 2 hours)",
     )
 
     # Thresholds & Limits

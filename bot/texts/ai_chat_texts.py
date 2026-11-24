@@ -44,9 +44,16 @@ SYSTEM_PROMPT_LEARN_MEMORY = """شما یک تحلیل‌گر رفتارشناس
 }"""
 
 
+def _clip_field(value: Any, max_len: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
 def _format_member_profiles_section(
     member_profiles: list[dict[str, Any]],
-    max_chars: int = 3200,
+    max_chars: int = 1500,
 ) -> str:
     """Format learned member personality profiles cleanly within a strict character budget."""
     if not member_profiles:
@@ -54,11 +61,11 @@ def _format_member_profiles_section(
     lines: list[str] = ["[شناخت تو از شخصیت اعضای گروه]"]
     used = len(lines[0])
     for prof in member_profiles:
-        name = str(prof.get("display_name") or "عضو").strip()
-        summary = str(prof.get("personality_summary") or "").strip()
-        style = str(prof.get("speaking_style") or "").strip()
-        interests = str(prof.get("interests_and_topics") or "").strip()
-        facts = str(prof.get("notable_facts") or "").strip()
+        name = _clip_field(prof.get("display_name") or "عضو", 40)
+        summary = _clip_field(prof.get("personality_summary"), 140)
+        style = _clip_field(prof.get("speaking_style"), 90)
+        interests = _clip_field(prof.get("interests_and_topics"), 110)
+        facts = _clip_field(prof.get("notable_facts"), 140)
 
         parts = [f"- {name}"]
         if summary:
@@ -85,9 +92,9 @@ def _format_group_memory_section(group_memory: dict[str, Any] | None) -> str:
     """Format persisted group culture, inside jokes, and ongoing topics."""
     if not group_memory:
         return ""
-    culture = str(group_memory.get("culture_summary") or "").strip()
-    jokes = str(group_memory.get("inside_jokes") or "").strip()
-    topics = str(group_memory.get("ongoing_topics") or "").strip()
+    culture = _clip_field(group_memory.get("culture_summary"), 180)
+    jokes = _clip_field(group_memory.get("inside_jokes"), 160)
+    topics = _clip_field(group_memory.get("ongoing_topics"), 180)
     if not (culture or jokes or topics):
         return ""
 
@@ -159,8 +166,8 @@ def build_runtime_system_prompt(
 
     if recent_messages_text and recent_messages_text.strip():
         trimmed_recent = recent_messages_text.strip()
-        if len(trimmed_recent) > 2400:
-            trimmed_recent = "…\n" + trimmed_recent[-2400:]
+        if len(trimmed_recent) > 1300:
+            trimmed_recent = "…\n" + trimmed_recent[-1300:]
         sections.append(
             "[آخرین پیام‌های همین الان در تاپیک]\n"
             f"{trimmed_recent}\n"

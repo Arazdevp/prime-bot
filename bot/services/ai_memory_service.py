@@ -20,6 +20,14 @@ _LEARN_MAX_BATCHES_PER_RUN = 5
 AI_MEMORY_SWEEP_MIN_MESSAGES = 25
 AI_MEMORY_PRE_PURGE_MIN_MESSAGES = 5
 
+# Fast in-memory cache of chat_id -> allowed free-chat thread_id
+_allowed_topic_cache: dict[int, int] = {}
+
+
+def reset_ai_memory_caches() -> None:
+    """Clear cached allowed-topic bindings (useful for test isolation)."""
+    _allowed_topic_cache.clear()
+
 
 def _normalize_topic_label(name: str | None) -> str:
     if not name:
@@ -122,20 +130,37 @@ async def bind_memory_source_topic(
     thread_id: int,
     topic_name: str | None = None,
 ) -> dict[str, Any]:
-    """Explicitly bind a group topic as the AI memory learning source."""
+    """Explicitly bind a group topic as the AI memory learning source and active chat topic."""
     resolved_name = topic_name or await repository.get_topic_name(chat_id, thread_id)
     if not resolved_name:
         resolved_name = "عمومی" if thread_id == 1 else f"تاپیک {thread_id}"
-    return await repository.upsert_ai_memory_source(
+    src = await repository.upsert_ai_memory_source(
         chat_id=chat_id,
         thread_id=thread_id,
         topic_name=resolved_name,
     )
+    _allowed_topic_cache[chat_id] = int(thread_id)
+    return src
+
+
+async def is_allowed_ai_chat_topic(chat_id: int, thread_id: int) -> bool:
+    """Return True ONLY when thread_id matches the group's free-chat ('گفتگوی آزاد') / bound topic."""
+    cached_tid = _allowed_topic_cache.get(chat_id)
+    if cached_tid is not None:
+        return cached_tid == int(thread_id)
+
+    source = await ensure_memory_source_for_group(chat_id)
+    if source is not None:
+        bound_tid = int(source["thread_id"])
+        _allowed_topic_cache[chat_id] = bound_tid
+        return bound_tid == int(thread_id)
+
+    return False
 
 
 def format_recent_group_messages(
     messages: list[dict[str, Any]],
-    max_chars: int = 2400,
+    max_chars: int = 1300,
 ) -> str:
     """Format recent DB messages chronologically in Tehran time within max_chars."""
     if not messages:
@@ -150,7 +175,7 @@ def format_recent_group_messages(
         sender = (msg.get("sender_name") or "کاربر").strip()
         reply_name = (msg.get("reply_to_name") or "").strip()
         reply_part = f" (در پاسخ به {reply_name})" if reply_name else ""
-        lines.append(f"[{hhmm}] {sender}{reply_part}: {text[:260]}")
+        lines.append(f"[{hhmm}] {sender}{reply_part}: {text[:180]}")
 
     if not lines:
         return ""
@@ -192,33 +217,18 @@ async def build_live_and_learned_context(
 
     recent_text = ""
     if chat_type != "private":
-        recent_msgs = await repository.fetch_recent_messages_for_topic(chat_id, thread_id, limit=25)
+        recent_msgs = await repository.fetch_recent_messages_for_topic(chat_id, thread_id, limit=14)
         for m in reversed(recent_msgs):
             uid = m.get("user_id")
             if isinstance(uid, int) and uid > 0 and uid not in priority_ids:
                 priority_ids.append(uid)
-        recent_text = format_recent_group_messages(recent_msgs, max_chars=2400)
-
-        source = await ensure_memory_source_for_group(mem_chat_id)
-        if source and int(source["thread_id"]) != thread_id:
-            hub_msgs = await repository.fetch_recent_messages_for_topic(
-                mem_chat_id,
-                int(source["thread_id"]),
-                limit=10,
-            )
-            hub_text = format_recent_group_messages(hub_msgs, max_chars=900)
-            if hub_text:
-                hub_label = source.get("topic_name") or "گفتگوی آزاد"
-                if recent_text:
-                    recent_text = f"{recent_text}\n\n[فضای الانِ {hub_label}]\n{hub_text}"
-                else:
-                    recent_text = f"[فضای الانِ {hub_label}]\n{hub_text}"
+        recent_text = format_recent_group_messages(recent_msgs, max_chars=1300)
 
     group_memory = await repository.get_ai_group_memory(mem_chat_id)
     member_profiles = await repository.list_ai_member_profiles(
         mem_chat_id,
         priority_user_ids=priority_ids,
-        limit=20,
+        limit=8,
     )
 
     return {

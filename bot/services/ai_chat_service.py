@@ -1,6 +1,7 @@
 """Interactive AI chat service: persistent toggle cache, trigger matching, and multi-turn Gemini memory."""
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 import logging
 import re
@@ -9,7 +10,8 @@ from aiogram import Bot
 from aiogram.types import Message
 from bot.config import get_settings
 from bot.database import repository
-from bot.services.ai_memory_service import build_live_and_learned_context
+from bot.services.access import is_global_admin
+from bot.services.ai_memory_service import build_live_and_learned_context, reset_ai_memory_caches
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
 from bot.services.timer_service import get_bot_username
@@ -32,21 +34,29 @@ class _ConversationState:
 
 _ai_chat_enabled_cache: bool = False
 _ai_chat_provider_cache: str | None = None
+_ai_chat_access_mode_cache: str = "public"
 _bot_id_cache: int | None = None
 _bot_username_cache: str | None = None
 _conversations: dict[tuple[int, int], _ConversationState] = {}
 _conv_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_user_quota_timestamps: dict[int, deque[float]] = {}
+_user_quota_notice_ts: dict[int, float] = {}
 
 
 def reset_ai_chat_state() -> None:
-    """Reset in-memory AI chat toggle, provider, identity, and conversation caches (for test isolation)."""
-    global _ai_chat_enabled_cache, _ai_chat_provider_cache, _bot_id_cache, _bot_username_cache
+    """Reset in-memory AI chat toggle, provider, access mode, quotas, and conversation caches."""
+    global _ai_chat_enabled_cache, _ai_chat_provider_cache, _ai_chat_access_mode_cache
+    global _bot_id_cache, _bot_username_cache
     _ai_chat_enabled_cache = False
     _ai_chat_provider_cache = None
+    _ai_chat_access_mode_cache = "public"
     _bot_id_cache = None
     _bot_username_cache = None
     _conversations.clear()
     _conv_locks.clear()
+    _user_quota_timestamps.clear()
+    _user_quota_notice_ts.clear()
+    reset_ai_memory_caches()
 
 
 def is_ai_chat_enabled_cached() -> bool:
@@ -62,11 +72,17 @@ def get_effective_ai_chat_provider() -> str:
     return raw if raw in ("gemini", "openai") else "gemini"
 
 
+def get_effective_ai_chat_access_mode() -> str:
+    """Return active AI chat access mode ('public' or 'owner_only')."""
+    return _ai_chat_access_mode_cache if _ai_chat_access_mode_cache in ("public", "owner_only") else "public"
+
+
 async def init_ai_chat_state() -> bool:
-    """Load persisted ai_chat_enabled and ai_chat_provider from SQLite into memory caches."""
-    global _ai_chat_enabled_cache, _ai_chat_provider_cache
+    """Load persisted AI chat toggle, provider, and access mode from SQLite into memory caches."""
+    global _ai_chat_enabled_cache, _ai_chat_provider_cache, _ai_chat_access_mode_cache
     _ai_chat_enabled_cache = await repository.get_ai_chat_enabled()
     _ai_chat_provider_cache = await repository.get_ai_chat_provider()
+    _ai_chat_access_mode_cache = await repository.get_ai_chat_access_mode()
     return _ai_chat_enabled_cache
 
 
@@ -87,6 +103,76 @@ async def set_ai_chat_provider_state(provider: str) -> str:
     await repository.set_ai_chat_provider(cleaned)
     _ai_chat_provider_cache = cleaned
     return cleaned
+
+
+async def set_ai_chat_access_mode_state(mode: str) -> str:
+    """Persist ai_chat_access_mode ('public' or 'owner_only') to SQLite and update cache."""
+    global _ai_chat_access_mode_cache
+    cleaned = mode.strip().lower()
+    if cleaned not in ("public", "owner_only"):
+        raise ValueError(f"Unsupported AI chat access mode: {mode}")
+    await repository.set_ai_chat_access_mode(cleaned)
+    _ai_chat_access_mode_cache = cleaned
+    return cleaned
+
+
+def check_and_consume_user_quota(
+    user_id: int,
+    *,
+    now: float | None = None,
+) -> tuple[bool, int, int]:
+    """Enforce sliding-window AI chat quota (20 msgs / 2h) for non-managers.
+
+    Returns (allowed, remaining_count_or_-1_for_unlimited, wait_minutes_if_blocked).
+    """
+    if is_global_admin(user_id):
+        return True, -1, 0
+
+    settings = get_settings()
+    limit_count = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20)))
+    window_sec = max(60, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)))
+    current = now if now is not None else time.monotonic()
+
+    dq = _user_quota_timestamps.get(user_id)
+    if dq is None:
+        dq = deque()
+        _user_quota_timestamps[user_id] = dq
+
+    cutoff = current - window_sec
+    while dq and dq[0] <= cutoff:
+        dq.popleft()
+
+    if len(dq) >= limit_count:
+        wait_sec = max(1.0, window_sec - (current - dq[0]))
+        wait_mins = max(1, int((wait_sec + 59) // 60))
+        return False, 0, wait_mins
+
+    dq.append(current)
+    return True, limit_count - len(dq), 0
+
+
+def refund_user_quota(user_id: int) -> None:
+    """Refund the most recently consumed quota slot when an LLM reply fails."""
+    if is_global_admin(user_id):
+        return
+    dq = _user_quota_timestamps.get(user_id)
+    if dq:
+        dq.pop()
+
+
+def should_send_quota_notice(
+    user_id: int,
+    *,
+    cooldown_seconds: float = 600.0,
+    now: float | None = None,
+) -> bool:
+    """Allow at most one rate-limit notice per user within cooldown_seconds to avoid spam."""
+    current = now if now is not None else time.monotonic()
+    last_ts = _user_quota_notice_ts.get(user_id)
+    if last_ts is not None and (current - last_ts) < cooldown_seconds:
+        return False
+    _user_quota_notice_ts[user_id] = current
+    return True
 
 
 def set_ai_bot_identity(bot_id: int | None, username: str | None) -> None:
@@ -233,6 +319,9 @@ async def generate_ai_chat_reply(
         prompt_input = user_text.strip()
         if reply_context and reply_context.strip():
             prompt_input = f"[در پاسخ به پیام قبلی: «{reply_context.strip()}»]\n{prompt_input}"
+        if chat_type != "private":
+            clean_speaker = (speaker_name or "عضو").strip() or "عضو"
+            prompt_input = f"{clean_speaker}: {prompt_input}"
 
         history_limit = max(2, int(settings.AI_CHAT_HISTORY_LIMIT))
         pending_turns = _normalize_turns(

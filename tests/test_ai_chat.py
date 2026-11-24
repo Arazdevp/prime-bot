@@ -22,15 +22,20 @@ from bot.handlers.ai_chat import (
 )
 from bot.keyboards.ai_chat import AiChatCB
 from bot.services.ai_chat_service import (
+    check_and_consume_user_quota,
     clear_conversation_history,
     count_active_conversations,
     generate_ai_chat_reply,
+    get_effective_ai_chat_access_mode,
     get_effective_ai_chat_provider,
     init_ai_chat_state,
     is_ai_chat_enabled_cached,
+    refund_user_quota,
     reset_ai_chat_state,
     set_ai_bot_identity,
+    set_ai_chat_access_mode_state,
     set_ai_chat_state,
+    should_send_quota_notice,
 )
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient
 
@@ -51,9 +56,11 @@ def _fake_settings(admin_ids: list[int] | None = None, allowed_chats: list[int] 
         OPENAI_API_KEY="sk-or-test9999",
         OPENAI_MODEL="google/gemini-2.5-flash",
         AI_REASONING_EFFORT=None,
-        AI_CHAT_MAX_OUTPUT_TOKENS=1024,
+        AI_CHAT_MAX_OUTPUT_TOKENS=600,
         AI_CHAT_TEMPERATURE=0.85,
-        AI_CHAT_HISTORY_LIMIT=6,
+        AI_CHAT_HISTORY_LIMIT=8,
+        AI_CHAT_USER_LIMIT_COUNT=20,
+        AI_CHAT_USER_LIMIT_WINDOW_SECONDS=7200,
         TIMEZONE="Asia/Tehran",
         PROXY_URL=None,
     )
@@ -215,7 +222,7 @@ async def test_ai_chat_db_persistence_and_cache_rehydration(tmp_path: Path) -> N
 
 def test_ai_chat_callback_data_under_64_bytes() -> None:
     """Ensure all AiChatCB packed strings fit Telegram's 64-byte callback_data limit."""
-    for action in ("toggle", "clear", "refresh", "viewp", "setp", "resetp", "cancel", "close"):
+    for action in ("toggle", "prov", "acc", "clear", "refresh", "viewp", "setp", "resetp", "learn", "mem", "clrmem", "cancel", "close"):
         packed = AiChatCB(action=action, owner_id=999999999999).pack()
         assert len(packed.encode("utf-8")) <= 64
 
@@ -309,11 +316,17 @@ async def test_manage_ai_command_and_callbacks_strictly_owner_only(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_ai_chat_trigger_filter_rules(tmp_path: Path) -> None:
-    """Verify AiChatTriggerFilter enforces toggle, owner-only access, and group reply/@mention gating."""
+    """Verify AiChatTriggerFilter enforces toggle, strict free-chat topic gating, access mode, and addressing."""
     reset_ai_chat_state()
     await init_db(str(tmp_path / "ai_trigger.db"))
     cfg = _fake_settings(admin_ids=[11111])
     try:
+        chat_id = -100555
+        hub_tid = 3
+        wins_tid = 9
+        await repository.upsert_topic(chat_id, hub_tid, "The Hub | گفتگوی آزاد")
+        await repository.upsert_topic(chat_id, wins_tid, "Wins | بُردها")
+
         bot = _make_bot(bot_id=999999, bot_username="PrimeTestBot")
         set_ai_bot_identity(999999, "PrimeTestBot")
         flt = AiChatTriggerFilter()
@@ -325,57 +338,76 @@ async def test_ai_chat_trigger_filter_rules(tmp_path: Path) -> None:
             owner_pv = _make_message(user_id=11111, text="سلام رفیق", chat_type="private")
             assert await flt(owner_pv, bot) is False
 
-            # Turn ON
+            # Turn ON (default access_mode == 'public')
             await set_ai_chat_state(True)
+            assert get_effective_ai_chat_access_mode() == "public"
 
-            # 2. Owner in PV -> allowed; commands -> blocked
+            # 2. PV is ALWAYS owner-only: owner -> allowed, non-owner -> blocked, commands -> blocked
             assert await flt(owner_pv, bot) is True
             owner_cmd = _make_message(user_id=11111, text="/panel", chat_type="private")
             assert await flt(owner_cmd, bot) is False
-
-            # 3. Non-owner in PV and group -> always blocked
             other_pv = _make_message(user_id=22222, text="سلام", chat_type="private")
             assert await flt(other_pv, bot) is False
-            other_grp_mention = _make_message(
+
+            # 3. Non-owner in گفتگوی آزاد addressing bot -> ALLOWED in public mode!
+            other_hub_mention = _make_message(
                 user_id=22222,
                 text="@PrimeTestBot چطوری؟",
-                chat_id=-100555,
+                chat_id=chat_id,
                 chat_type="supergroup",
-                thread_id=3,
+                thread_id=hub_tid,
             )
-            assert await flt(other_grp_mention, bot) is False
-
-            # 4. Owner in group without reply/mention -> blocked (doesn't interrupt normal chat)
-            owner_grp_plain = _make_message(
-                user_id=11111,
-                text="بچه‌ها جلسه ساعت ۹ شروع می‌شه",
-                chat_id=-100555,
+            assert await flt(other_hub_mention, bot) is True
+            other_hub_reply = _make_message(
+                user_id=22222,
+                text="راست میگی",
+                chat_id=chat_id,
                 chat_type="supergroup",
-                thread_id=3,
-            )
-            assert await flt(owner_grp_plain, bot) is False
-
-            # 5. Owner in group mentioning @PrimeTestBot (case-insensitive) -> allowed
-            owner_grp_mention = _make_message(
-                user_id=11111,
-                text="سلام @primetestbot نظرت چیه؟",
-                chat_id=-100555,
-                chat_type="supergroup",
-                thread_id=3,
-            )
-            assert await flt(owner_grp_mention, bot) is True
-
-            # 6. Owner in group replying to bot's own message -> allowed
-            owner_grp_reply_bot = _make_message(
-                user_id=11111,
-                text="دقیق‌تر بگو",
-                chat_id=-100555,
-                chat_type="supergroup",
-                thread_id=3,
+                thread_id=hub_tid,
                 reply_from_user_id=999999,
                 reply_text="پیام قبلی ربات",
             )
-            assert await flt(owner_grp_reply_bot, bot) is True
+            assert await flt(other_hub_reply, bot) is True
+
+            # 4. Plain message without reply/mention in گفتگوی آزاد -> blocked
+            owner_hub_plain = _make_message(
+                user_id=11111,
+                text="بچه‌ها جلسه ساعت ۹ شروع می‌شه",
+                chat_id=chat_id,
+                chat_type="supergroup",
+                thread_id=hub_tid,
+            )
+            assert await flt(owner_hub_plain, bot) is False
+
+            # 5. Any OTHER topic (e.g., Wins) -> strictly BLOCKED even for owner mentioning @bot
+            owner_wins_mention = _make_message(
+                user_id=11111,
+                text="@PrimeTestBot چطوری؟",
+                chat_id=chat_id,
+                chat_type="supergroup",
+                thread_id=wins_tid,
+            )
+            assert await flt(owner_wins_mention, bot) is False
+            other_wins_mention = _make_message(
+                user_id=22222,
+                text="@PrimeTestBot سلام",
+                chat_id=chat_id,
+                chat_type="supergroup",
+                thread_id=wins_tid,
+            )
+            assert await flt(other_wins_mention, bot) is False
+
+            # 6. Switch to 'owner_only' mode -> non-owner in گفتگوی آزاد blocked, owner allowed
+            await set_ai_chat_access_mode_state("owner_only")
+            assert await flt(other_hub_mention, bot) is False
+            owner_hub_mention = _make_message(
+                user_id=11111,
+                text="سلام @primetestbot نظرت چیه؟",
+                chat_id=chat_id,
+                chat_type="supergroup",
+                thread_id=hub_tid,
+            )
+            assert await flt(owner_hub_mention, bot) is True
     finally:
         await close_db()
         reset_ai_chat_state()
@@ -644,6 +676,91 @@ async def test_ai_chat_provider_switch_via_command_callback_and_reply(tmp_path: 
                 await handle_ai_chat_message(pv_msg, bot)
             err_reply = pv_msg.answer.call_args.kwargs["text"]
             assert "/manage_ai openai" in err_reply
+    finally:
+        await close_db()
+        reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_non_admin_rate_limit_20_per_2_hours_and_refund(tmp_path: Path) -> None:
+    """Verify non-manager 20-msgs/2h sliding window, notice anti-spam, LLMError refund, and manager bypass."""
+    reset_ai_chat_state()
+    await init_db(str(tmp_path / "ai_rate_limit.db"))
+    cfg = _fake_settings(admin_ids=[11111])
+    try:
+        with patch("bot.services.access.get_settings", return_value=cfg), patch(
+            "bot.services.ai_chat_service.get_settings", return_value=cfg
+        ), patch("bot.handlers.ai_chat.get_settings", return_value=cfg):
+            t0 = 10000.0
+            # 1. Non-admin sends 20 messages -> all 20 allowed
+            for i in range(20):
+                ok, rem, wait = check_and_consume_user_quota(22222, now=t0 + i * 10)
+                assert ok is True
+                assert rem == 19 - i
+                assert wait == 0
+
+            # 2. 21st message at t0 + 300 -> blocked (~115 mins wait)
+            ok21, rem21, wait21 = check_and_consume_user_quota(22222, now=t0 + 300)
+            assert ok21 is False
+            assert rem21 == 0
+            assert 110 <= wait21 <= 120
+
+            # Anti-spam notice cooldown (600s)
+            assert should_send_quota_notice(22222, now=t0 + 300) is True
+            assert should_send_quota_notice(22222, now=t0 + 350) is False
+            assert should_send_quota_notice(22222, now=t0 + 901) is True
+
+            # 3. After 2 hours (7201s from first message), oldest slot expires and user can chat again
+            ok_after, rem_after, _ = check_and_consume_user_quota(22222, now=t0 + 7201)
+            assert ok_after is True
+            assert rem_after == 0  # 19 remaining inside window + 1 new = 20
+
+            # 4. Refund restores slot cleanly
+            refund_user_quota(22222)
+            ok_refunded, _, _ = check_and_consume_user_quota(22222, now=t0 + 7202)
+            assert ok_refunded is True
+
+            # 5. Bot manager (ADMIN_IDS) has unlimited quota
+            for i in range(30):
+                ok_mgr, rem_mgr, _ = check_and_consume_user_quota(11111, now=t0 + i)
+                assert ok_mgr is True
+                assert rem_mgr == -1
+
+            # 6. End-to-end handler blocks 21st message for user 33333 without calling LLM,
+            #    and refunds on LLMError for user 44444
+            bot = _make_bot()
+            set_ai_bot_identity(999999, "PrimeTestBot")
+            for i in range(20):
+                assert check_and_consume_user_quota(33333)[0] is True
+
+            blocked_msg = _make_message(
+                user_id=33333,
+                text="@PrimeTestBot سلام",
+                chat_id=-100555,
+                chat_type="supergroup",
+                thread_id=3,
+            )
+            with patch("bot.handlers.ai_chat.generate_ai_chat_reply") as mock_gen:
+                await handle_ai_chat_message(blocked_msg, bot)
+                mock_gen.assert_not_called()
+            assert "سهمیه چت تو" in bot.send_message.call_args.kwargs["text"]
+
+            # LLMError refunds user 44444's slot
+            failing_msg = _make_message(
+                user_id=44444,
+                text="@PrimeTestBot سلام",
+                chat_id=-100555,
+                chat_type="supergroup",
+                thread_id=3,
+            )
+            with patch(
+                "bot.handlers.ai_chat.generate_ai_chat_reply",
+                side_effect=LLMError("temp", status_code=503, is_retryable=True),
+            ):
+                await handle_ai_chat_message(failing_msg, bot)
+            # Slot was refunded, so remaining is still 20 (next call has remaining == 19)
+            ok44, rem44, _ = check_and_consume_user_quota(44444)
+            assert ok44 is True and rem44 == 19
     finally:
         await close_db()
         reset_ai_chat_state()

@@ -22,20 +22,26 @@ from bot.keyboards.ai_chat import (
 )
 from bot.services.access import is_global_admin
 from bot.services.ai_chat_service import (
+    check_and_consume_user_quota,
     clear_conversation_history,
     count_active_conversations,
     ensure_ai_bot_identity,
     generate_ai_chat_reply,
+    get_effective_ai_chat_access_mode,
     get_effective_ai_chat_provider,
     is_ai_chat_enabled_cached,
     is_message_addressing_bot,
+    refund_user_quota,
+    set_ai_chat_access_mode_state,
     set_ai_chat_provider_state,
     set_ai_chat_state,
+    should_send_quota_notice,
     strip_bot_mention,
 )
 from bot.services.ai_memory_service import (
     bind_memory_source_topic,
     ensure_memory_source_for_group,
+    is_allowed_ai_chat_topic,
     learn_from_topic_messages,
     resolve_memory_group,
 )
@@ -266,11 +272,12 @@ async def render_manage_ai_panel(
     settings = get_settings()
     enabled = is_ai_chat_enabled_cached()
     provider = get_effective_ai_chat_provider()
+    access_mode = get_effective_ai_chat_access_mode()
     custom_prompt = await repository.get_ai_chat_custom_prompt()
     conv_count = count_active_conversations()
 
     mem_chat_id, _ = await resolve_memory_group(chat_id, chat_type)
-    source_label = "پیدا نشد (داخل تاپیک <code>/manage_ai bind</code> بزن)"
+    source_label = "پیدا نشد (داخل گفتگوی آزاد <code>/manage_ai bind</code> بزن)"
     learned_count = 0
     if mem_chat_id is not None:
         source = await ensure_memory_source_for_group(mem_chat_id)
@@ -279,8 +286,15 @@ async def render_manage_ai_panel(
             source_label = f"<b>{escape_html(src_name)}</b>"
         learned_count = await repository.count_ai_member_profiles(mem_chat_id)
 
+    limit_count = int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20))
+    window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
     provider_label = "OpenAI / Gateway" if provider == "openai" else "Google Gemini مستقیم"
+    access_badge = (
+        f"👥 <b>همه اعضای گفتگوی آزاد</b> ({limit_count} پیام در {window_hours} ساعت | مدیر نامحدود)"
+        if access_mode == "public"
+        else "🔒 <b>فقط مدیر ربات</b>"
+    )
     active_model = (
         (
             getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
@@ -295,18 +309,19 @@ async def render_manage_ai_panel(
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
 
     text = (
-        "🧠 <b>مدیریت چت هوش مصنوعی (نسخه تستی)</b>\n\n"
+        "🧠 <b>مدیریت چت هوش مصنوعی</b>\n\n"
         f"• وضعیت فعلی: {status_badge}\n"
         f"• سرویس فعال: 🔌 <b>{provider_label}</b>\n"
-        "• سطح دسترسی: 🔒 <b>فقط مدیر ربات</b>\n"
+        f"• سطح دسترسی: {access_badge}\n"
+        "• محدوده گروه: 📍 <b>فقط تاپیک گفتگوی آزاد</b>\n"
         f"• مدل گفتگو: <code>{escape_html(active_model)}</code>\n"
         f"• کلید API: {key_badge}\n"
         f"• پرامپت فعال: {prompt_badge}\n"
         f"• تاپیک یادگیری: 📚 {source_label}\n"
         f"• حافظه بلندمدت: 👥 <b>{learned_count}</b> عضو شناخته‌شده | مکالمه‌های موقت: <b>{conv_count}</b>\n\n"
-        "<b>نحوه تست هنگام روشن بودن:</b>\n"
-        f"• در گروه: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
-        "• در پیوی: مستقیم پیام بفرست\n"
+        "<b>نحوه استفاده هنگام روشن بودن:</b>\n"
+        f"• فقط در گفتگوی آزاد: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
+        "• در پیوی: فقط مدیر ربات\n"
         "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>openai</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
     )
     kb = build_manage_ai_kb(
@@ -314,6 +329,7 @@ async def render_manage_ai_panel(
         has_custom_prompt=bool(custom_prompt),
         owner_id=owner_id,
         provider=provider,
+        access_mode=access_mode,
     )
     return text, kb
 
@@ -418,6 +434,22 @@ async def on_manage_ai_callback(
             "🔌 سرویس گفتگو به OpenAI / Gateway تغییر کرد."
             if next_provider == "openai"
             else "🔌 سرویس گفتگو به Google Gemini تغییر کرد."
+        )
+        await safe_answer_callback(callback, toast)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
+        await safe_edit_message(callback, text, kb)
+        return
+
+    if action == "acc":
+        current_mode = get_effective_ai_chat_access_mode()
+        next_mode = "owner_only" if current_mode == "public" else "public"
+        await set_ai_chat_access_mode_state(next_mode)
+        toast = (
+            "👥 چت برای همه اعضای گفتگوی آزاد باز شد (۲۰ پیام در ۲ ساعت)."
+            if next_mode == "public"
+            else "🔒 دسترسی چت به فقط مدیر ربات محدود شد."
         )
         await safe_answer_callback(callback, toast)
         text, kb = await render_manage_ai_panel(
@@ -583,7 +615,7 @@ async def on_custom_prompt_input(message: Message, bot: Bot, state: FSMContext) 
 
 
 class AiChatTriggerFilter(Filter):
-    """Allow interactive AI chat ONLY when enabled, from a bot owner, and properly addressed."""
+    """Allow interactive AI chat in PV (owner-only) or in the free-chat group topic when addressed."""
 
     async def __call__(self, message: Message, bot: Bot) -> bool:
         if not is_ai_chat_enabled_cached():
@@ -595,20 +627,27 @@ class AiChatTriggerFilter(Filter):
         if message.sender_chat:
             return False
 
-        if not is_global_admin(message.from_user.id):
-            return False
-
         raw_text = (message.text or message.caption or "").strip()
         if not raw_text or raw_text.startswith("/"):
             return False
 
+        is_owner = is_global_admin(message.from_user.id)
+
         if message.chat.type == "private":
-            return True
+            return is_owner
 
         if message.chat.type == "supergroup":
             settings = get_settings()
             if settings.ALLOWED_CHAT_IDS and message.chat.id not in settings.ALLOWED_CHAT_IDS:
                 return False
+
+            if get_effective_ai_chat_access_mode() == "owner_only" and not is_owner:
+                return False
+
+            thread_id = resolve_thread_id(message)
+            if not await is_allowed_ai_chat_topic(message.chat.id, thread_id):
+                return False
+
             bot_id, bot_username = await ensure_ai_bot_identity(bot)
             return is_message_addressing_bot(message, bot_id, bot_username)
 
@@ -617,19 +656,42 @@ class AiChatTriggerFilter(Filter):
 
 @router.message(StateFilter(default_state), AiChatTriggerFilter())
 async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
-    """Respond naturally in Iranian Persian to the bot owner in PV or when addressed in group."""
+    """Respond naturally in Iranian Persian in PV (owner) or free-chat topic (with 20/2h user quota)."""
     chat = message.chat
     user = message.from_user
     if chat is None or user is None:
         return
 
-    _, bot_username = await ensure_ai_bot_identity(bot)
-    raw_text = (message.text or message.caption or "").strip()
-    user_text = strip_bot_mention(raw_text, bot_username) or "سلام"
-
     is_group = chat.type != "private"
     thread_id = resolve_thread_id(message) if is_group else 0
     send_thread_id = to_send_thread_id(thread_id) if is_group else None
+
+    allowed, _remaining, wait_mins = check_and_consume_user_quota(user.id)
+    if not allowed:
+        if should_send_quota_notice(user.id):
+            settings = get_settings()
+            limit_count = int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20))
+            window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+            notice_text = (
+                f"⏳ سهمیه چت تو ({limit_count} پیام در هر {window_hours} ساعت) فعلاً پر شده رفیق! "
+                f"حدود <b>{wait_mins} دقیقه</b> دیگه دوباره می‌تونی باهام حرف بزنی."
+            )
+            try:
+                await bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=send_thread_id,
+                    text=notice_text,
+                    parse_mode="HTML",
+                    reply_to_message_id=message.message_id if is_group else None,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+        return
+
+    _, bot_username = await ensure_ai_bot_identity(bot)
+    raw_text = (message.text or message.caption or "").strip()
+    user_text = strip_bot_mention(raw_text, bot_username) or "سلام"
 
     topic_name: str | None = None
     if is_group:
@@ -668,6 +730,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             reply_context=reply_context,
         )
     except ValueError as exc:
+        refund_user_quota(user.id)
         logger.warning("AI chat configuration error: %s", exc)
         await _send_in_context(
             message,
@@ -676,6 +739,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         )
         return
     except LLMError as exc:
+        refund_user_quota(user.id)
         logger.warning("AI chat LLMError for chat %s [status=%s]: %s", chat.id, exc.status_code, exc)
         err_text = "الان به سرویس هوش مصنوعی وصل نشدم 😅 یه چند لحظه دیگه دوباره پیام بده."
         if is_global_admin(user.id):
@@ -690,6 +754,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         )
         return
     except Exception as exc:
+        refund_user_quota(user.id)
         logger.error("Unexpected error in AI chat handler: %s", exc, exc_info=True)
         await _send_in_context(
             message,

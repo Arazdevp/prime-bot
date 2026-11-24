@@ -343,6 +343,8 @@ async def test_group_chat_reply_injects_group_presence_live_messages_and_member_
         assert "چالش دیپ‌ورک نیمه‌شب" in sys_prompt
         assert "خوش‌اخلاق، خلاق و پیگیر دیزاین" in sys_prompt
         assert "الان دارم روی کاور ویدیوی جدید کار می‌کنم" in sys_prompt
+        # Verify speaker-tagged user turn in multi-member group mode
+        assert mock_client.generate_chat.call_args.kwargs["messages"][-1]["text"].startswith("آرش:")
     finally:
         await close_db()
         reset_ai_chat_state()
