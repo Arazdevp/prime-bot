@@ -27,6 +27,27 @@ _RETRY_DELAY_JSON_RE = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', re.I
 _RETRY_AFTER_JSON_RE = re.compile(r'"retry[_]?after(?:_seconds)?"\s*:\s*"?(\d+(?:\.\d+)?)"?', re.IGNORECASE)
 _RETRY_IN_TEXT_RE = re.compile(r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
 _AFFORDABLE_TOKENS_RE = re.compile(r"can\s+only\s+afford\s+(\d+)", re.IGNORECASE)
+_UNSUPPORTED_THINKING_LEVEL_RE = re.compile(
+    r"(?:thinking[\s_]+level.*not\s+supported|unsupported\s+thinking[\s_]+level|invalid\s+thinking[\s_]+level)",
+    re.IGNORECASE,
+)
+
+
+def _is_unsupported_thinking_level_400(status_code: int | None, error_text: str | None) -> bool:
+    """Return True when HTTP 400 indicates the model rejected the current thinking/reasoning level."""
+    return status_code == 400 and isinstance(error_text, str) and bool(_UNSUPPORTED_THINKING_LEVEL_RE.search(error_text))
+
+
+def _next_fallback_reasoning_effort(current: str | None) -> str | None:
+    """Step up reasoning_effort when a model rejects MINIMAL/none/low thinking levels."""
+    cur = (current or "").strip().lower()
+    if cur in ("", "none", "minimal", "off"):
+        return "low"
+    if cur == "low":
+        return "medium"
+    if cur == "medium":
+        return "high"
+    return None
 
 
 def _clamp_retry_after(seconds: float) -> float | None:
@@ -531,6 +552,7 @@ class OpenAIClient(BaseLLMClient):
         self.model = model
         self.max_output_tokens = max_output_tokens
         self.reasoning_effort = reasoning_effort.strip() if isinstance(reasoning_effort, str) and reasoning_effort.strip() else None
+        self._model_reasoning_override: dict[str, str] = {}
         self._client = http_client
         self._owns_client = http_client is None
 
@@ -559,8 +581,10 @@ class OpenAIClient(BaseLLMClient):
             "Authorization": f"Bearer {self.api_key}",
         }
         effective_max_tokens = int(max_tokens)
+        effective_reasoning_effort = self._model_reasoning_override.get(target_model, self.reasoning_effort)
+        token_clamped = False
 
-        for clamp_attempt in range(2):
+        for _attempt in range(4):
             payload: dict[str, Any] = {
                 "model": target_model,
                 "messages": messages_payload,
@@ -568,11 +592,11 @@ class OpenAIClient(BaseLLMClient):
                 "max_tokens": effective_max_tokens,
                 "stream": False,
             }
-            if self.reasoning_effort:
+            if effective_reasoning_effort:
                 if is_openrouter_base_url(self.base_url):
-                    payload["reasoning"] = {"effort": self.reasoning_effort}
+                    payload["reasoning"] = {"effort": effective_reasoning_effort}
                 else:
-                    payload["reasoning_effort"] = self.reasoning_effort
+                    payload["reasoning_effort"] = effective_reasoning_effort
 
             try:
                 response = await client.post(url, headers=headers, json=payload)
@@ -585,7 +609,7 @@ class OpenAIClient(BaseLLMClient):
                 parsed_err = _safe_parse_json(response)
                 is_in_flight = _is_transient_in_flight_402(response.status_code, parsed_err, response.text)
 
-                if response.status_code == 402 and not is_in_flight and clamp_attempt == 0:
+                if response.status_code == 402 and not is_in_flight and not token_clamped:
                     affordable = _parse_affordable_tokens(parsed_err, response.text)
                     if affordable is not None and affordable >= _MIN_AUTO_CLAMP_TOKENS and affordable < effective_max_tokens:
                         clamped = max(_MIN_AUTO_CLAMP_TOKENS, min(effective_max_tokens - 1, int(affordable * 0.9)))
@@ -597,6 +621,20 @@ class OpenAIClient(BaseLLMClient):
                             clamped,
                         )
                         effective_max_tokens = clamped
+                        token_clamped = True
+                        continue
+
+                if _is_unsupported_thinking_level_400(response.status_code, response.text):
+                    next_effort = _next_fallback_reasoning_effort(effective_reasoning_effort)
+                    if next_effort is not None:
+                        logger.warning(
+                            "Model '%s' rejected thinking level (%r); retrying with reasoning_effort=%r.",
+                            target_model,
+                            effective_reasoning_effort,
+                            next_effort,
+                        )
+                        effective_reasoning_effort = next_effort
+                        self._model_reasoning_override[target_model] = next_effort
                         continue
 
                 retry_after = (
@@ -683,7 +721,7 @@ class OpenAIClient(BaseLLMClient):
                     err_code = 502
 
                 is_in_flight = _is_transient_in_flight_402(err_code, data, err_msg)
-                if err_code == 402 and not is_in_flight and clamp_attempt == 0:
+                if err_code == 402 and not is_in_flight and not token_clamped:
                     affordable = _parse_affordable_tokens(data, err_msg)
                     if affordable is not None and affordable >= _MIN_AUTO_CLAMP_TOKENS and affordable < effective_max_tokens:
                         clamped = max(_MIN_AUTO_CLAMP_TOKENS, min(effective_max_tokens - 1, int(affordable * 0.9)))
@@ -695,6 +733,20 @@ class OpenAIClient(BaseLLMClient):
                             clamped,
                         )
                         effective_max_tokens = clamped
+                        token_clamped = True
+                        continue
+
+                if _is_unsupported_thinking_level_400(err_code, err_msg):
+                    next_effort = _next_fallback_reasoning_effort(effective_reasoning_effort)
+                    if next_effort is not None:
+                        logger.warning(
+                            "Model '%s' rejected thinking level via 200 error (%r); retrying with reasoning_effort=%r.",
+                            target_model,
+                            effective_reasoning_effort,
+                            next_effort,
+                        )
+                        effective_reasoning_effort = next_effort
+                        self._model_reasoning_override[target_model] = next_effort
                         continue
 
                 retry_after = _parse_retry_after(response, data) if err_code in (402, 429, 503) else None

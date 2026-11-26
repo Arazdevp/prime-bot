@@ -365,3 +365,62 @@ async def test_9router_ai_chat_memory_panel_and_status_labels(tmp_path: Path) ->
     finally:
         await close_db()
         reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_9router_unsupported_minimal_thinking_level_auto_retries_and_caches() -> None:
+    """Verify 400 unsupported thinking level auto-steps reasoning_effort (absent -> low -> medium) and caches per model."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.is_closed = False
+
+    err_minimal = MagicMock(spec=httpx.Response)
+    err_minimal.status_code = 400
+    err_minimal.headers = httpx.Headers({})
+    err_minimal.text = (
+        '{"error":{"code":400,"message":"Thinking level MINIMAL is not supported for this model. '
+        'Please retry with other thinking level.","status":"INVALID_ARGUMENT"}}'
+    )
+
+    err_low = MagicMock(spec=httpx.Response)
+    err_low.status_code = 400
+    err_low.headers = httpx.Headers({})
+    err_low.text = (
+        '{"error":{"code":400,"message":"Thinking level LOW is not supported for this model. '
+        'Please retry with other thinking level.","status":"INVALID_ARGUMENT"}}'
+    )
+
+    ok_resp = MagicMock(spec=httpx.Response)
+    ok_resp.status_code = 200
+    ok_resp.headers = httpx.Headers({})
+    ok_resp.json.return_value = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "پاسخ موفق"}}]
+    }
+
+    ok_cached = MagicMock(spec=httpx.Response)
+    ok_cached.status_code = 200
+    ok_cached.headers = httpx.Headers({})
+    ok_cached.json.return_value = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "پاسخ کش‌شده"}}]
+    }
+
+    mock_http.post = AsyncMock(side_effect=[err_minimal, err_low, ok_resp, ok_cached])
+    client = OpenAIClient(
+        base_url="http://localhost:20128/v1",
+        api_key="sk-9r-test",
+        model="ag/gemini-3.8-flash-medium",
+        http_client=mock_http,
+    )
+
+    first = await client.generate("sys", "msg 1")
+    assert first == "پاسخ موفق"
+    assert mock_http.post.call_count == 3
+    assert "reasoning_effort" not in mock_http.post.call_args_list[0].kwargs["json"]
+    assert mock_http.post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "low"
+    assert mock_http.post.call_args_list[2].kwargs["json"]["reasoning_effort"] == "medium"
+
+    # Subsequent call uses cached 'medium' immediately on the first request
+    second = await client.generate("sys", "msg 2")
+    assert second == "پاسخ کش‌شده"
+    assert mock_http.post.call_count == 4
+    assert mock_http.post.call_args_list[3].kwargs["json"]["reasoning_effort"] == "medium"
+
