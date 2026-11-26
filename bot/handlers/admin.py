@@ -527,6 +527,62 @@ async def cmd_morning_off(message: Message) -> None:
     await send_topic_reply(message, "🔴 ارسال روزانه پیام صبح‌بخیر هیلز برای این گروه <b>غیرفعال</b> شد.")
 
 
+@router.message(Command("set_music_topic"), AdminFilter())
+async def cmd_set_music_topic(message: Message) -> None:
+    """Set current topic or given topic link/ID as the Music Downloader source topic."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    chat_id = message.chat.id
+    args = (message.text or "").split()[1:]
+
+    if args:
+        raw_arg = args[0].strip()
+        _, thread_id, error = parse_topic_link(raw_arg, current_chat_id=chat_id)
+        if error or thread_id is None:
+            await send_topic_reply(
+                message,
+                f"⚠️ <b>خطا در تنظیم تاپیک موزیک:</b>\n\n{escape_html(error or 'شناسه تاپیک معتبر نیست.')}",
+            )
+            return
+    else:
+        thread_id = resolve_thread_id(message)
+
+    topic_name = await repository.get_topic_name(chat_id, thread_id)
+    if not topic_name:
+        topic_name = "عمومی" if thread_id == 1 else f"تاپیک {thread_id}"
+
+    await repository.set_music_topic(chat_id, thread_id, auto_enable=True)
+    await send_topic_reply(
+        message,
+        f"🎵 تاپیک دانلودر موزیک روی <b>«{escape_html(topic_name)}»</b> (شناسه: <code>{thread_id}</code>) تنظیم و فعال شد ✅\n\n"
+        "از این به بعد هر موزیک یا فایل صوتی که توی این تاپیک فرستاده بشه ذخیره می‌شه و اعضا می‌تونن با فرستادن لینک پیامش توی پیوی ربات فایل رو دانلود کنن.",
+    )
+
+
+@router.message(Command("music_on"), AdminFilter())
+async def cmd_music_on(message: Message) -> None:
+    """Enable Music Downloader indexing for this group."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    await repository.set_music_enabled(message.chat.id, 1)
+    await send_topic_reply(message, "🟢 دانلودر موزیک برای این گروه <b>فعال</b> شد.")
+
+
+@router.message(Command("music_off"), AdminFilter())
+async def cmd_music_off(message: Message) -> None:
+    """Disable Music Downloader indexing for this group."""
+    if not message.chat:
+        return
+    await try_delete_command(message)
+
+    await repository.set_music_enabled(message.chat.id, 0)
+    await send_topic_reply(message, "🔴 دانلودر موزیک برای این گروه <b>غیرفعال</b> شد.")
+
+
 @router.message(Command("morning_test"), AdminFilter())
 async def cmd_morning_test(message: Message) -> None:
     """Admin-only test trigger sending a real morning greeting into the configured topic."""
@@ -569,7 +625,10 @@ async def cmd_help(message: Message) -> None:
         "🔹 <code>/morning_test</code> — ارسال تستی پیام صبح‌بخیر در تاپیک مقصد (مخصوص ادمین)\n"
         "🔹 <code>/deeptalk</code> — پنل برگزاری و مدیریت جلسات دیپ‌تاک (مخصوص مالک ربات و ادمین‌های دیپ‌تاک)\n"
         "🔹 <code>/set_deeptalk_topic [لینک|شناسه]</code> — تعیین تاپیک پیش‌فرض دیپ‌تاک\n"
+        "🔹 <code>/set_music_topic [لینک|شناسه]</code> — تعیین تاپیک منبع دانلودر موزیک\n"
+        "🔹 <code>/music_on</code> / <code>/music_off</code> — فعال یا غیرفعال کردن دانلودر موزیک\n"
         "🔹 <code>/help</code> — نمایش همین پیام راهنما\n\n"
+        "🎵 <b>دانلودر موزیک (برای همه اعضا):</b> اعضا می‌توانند لینک هر پیامِ موزیک در تاپیک موزیک را در پیوی ربات بفرستند (یا دستور <code>/music</code> را بزنند) تا فایل اصلی را بدون محدودیت ذخیره دریافت کنند.\n\n"
         "⏱ <b>تایمر و یادآور (برای همه اعضا):</b> هر عضو گروه می‌تواند با دستور <code>/timer</code> (یا میانبر <code>/timer 30m متن</code>) تایمر دقیقه‌ای/ساعتی یا تاریخی تنظیم کند تا رأس زمان مقرر در همان تاپیک و پیوی ربات به او یادآوری شود.\n\n"
         "🎛 <b>پنل مدیریتی در پیوی:</b> مدیران می‌توانند در پیوی ربات با دستور <code>/panel</code> تمام تنظیمات، تاپیک‌ها، پیش‌نمایش و اجرای دستی را به صورت دکمه‌ای مدیریت کنند.\n\n"
         "<i>نکته: پارامتر <code>keep</code> در دستورات دستی مانع از حذف پیام‌ها از دیتابیس می‌شود (مناسب تست). در حالت عادی، پس از خلاصه‌سازی موفق پیام‌ها از دیتابیس پاک می‌شوند تا فضا اشغال نشود.</i>"

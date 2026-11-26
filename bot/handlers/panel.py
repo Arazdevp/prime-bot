@@ -31,6 +31,8 @@ from bot.keyboards.panel import (
     build_min_messages_kb,
     build_morning_kb,
     build_morning_topics_kb,
+    build_music_settings_kb,
+    build_music_topics_kb,
     build_preview_topics_kb,
     build_topics_kb,
 )
@@ -91,6 +93,11 @@ _GROUP_ACTIONS = {
     "mrgl",
     "mrgs",
     "mrgtst",
+    "mus",
+    "must",
+    "musl",
+    "muss",
+    "musa",
 }
 _GENERAL_ACTIONS = {"open", "home", "help", "noop"}
 
@@ -212,6 +219,7 @@ def build_admin_help_text(is_global: bool) -> str:
         f"{global_only_cmd}"
         "• <code>/deeptalk</code> — پنل ساخت و مدیریت جلسات دیپ‌تاک (ویژه مالک ربات و ادمین‌های دیپ‌تاک)\n"
         "• <code>/timer</code> — پنل شیشه‌ای تایمر و یادآور (دقیقه‌ای/ساعتی و تقویم شمسی)\n"
+        "• <code>/music</code> — دانلودر موزیک (ارسال لینک پیام موزیک و دریافت فایل بدون محدودیت)\n"
         "• <code>/start</code> — خوش‌آمدگویی و دکمه سریع پنل\n"
         "• <code>/help</code> — نمایش همین راهنما\n"
         "• <code>/about</code> — معرفی ربات و مدیرهاش\n"
@@ -224,7 +232,8 @@ def build_admin_help_text(is_global: bool) -> str:
         "• تنظیم حداقل پیام (با دکمه یا وارد کردن عدد ۱ تا ۱۰۰)\n"
         "• اجرای دستی خلاصه (تک‌تاپیک یا کل گروه، با قابلیت keep)\n"
         "• 👁 پیش‌نمایش خلاصه فقط توی پیوی خودت بدون دست زدن به دیتابیس\n"
-        "• ☀️ مدیریت پیام صبح‌بخیر روزانه هیلز (انتخاب تاپیک مقصد، فعال/غیرفعال و ارسال تستی)\n\n"
+        "• ☀️ مدیریت پیام صبح‌بخیر روزانه هیلز (انتخاب تاپیک مقصد، فعال/غیرفعال و ارسال تستی)\n"
+        "• 🎵 دانلودر موزیک (ثبت خودکار موزیک‌های تاپیک موزیک و دانلود با ارسال لینک در پیوی)\n\n"
         "<i>راستی، تمام دستورات قدیمی توی خود گروه‌ها هم هنوز سر جاشونن و کار می‌کنن!</i>"
     )
 
@@ -532,6 +541,50 @@ async def render_morning_topics(chat_id: int, page: int = 0) -> tuple[str, Inlin
         "<i>(همچنین می‌تونی مستقیم داخل خود تاپیک دستور <code>/set_morning_topic</code> رو بزنی)</i>"
     )
     return text, build_morning_topics_kb(chat_id, topics, page=page)
+
+
+async def render_music_settings(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Render Music Downloader settings screen for a group."""
+    title = await _get_group_title(chat_id)
+    music_cfg = await repository.ensure_music_settings(chat_id)
+
+    is_enabled = int(music_cfg.get("enabled", 1)) == 1
+    status_str = "🟢 فعال" if is_enabled else "🔴 غیرفعال"
+
+    raw_tid = music_cfg.get("thread_id")
+    has_topic = raw_tid is not None
+    if has_topic:
+        tid = int(raw_tid)
+        t_name = await _get_topic_display_name(chat_id, tid)
+        topic_str = f"<b>«{escape_html(t_name)}»</b> (<code>{tid}</code>)"
+    else:
+        topic_str = "🤖 <i>تشخیص خودکار تاپیک موزیک (بر اساس نام تاپیک)</i>"
+
+    track_count = await repository.count_music_tracks(chat_id=chat_id)
+
+    text = (
+        f"🎵 <b>تنظیمات دانلودر موزیک — «{escape_html(title)}»</b>\n\n"
+        f"🔹 <b>وضعیت:</b> {status_str}\n"
+        f"📌 <b>تاپیک موزیک:</b> {topic_str}\n"
+        f"📀 <b>موزیک‌های ثبت‌شده:</b> {to_persian_digits(track_count)} ترک\n\n"
+        "<i>💡 هر موزیک/فایل صوتی که توی تاپیک موزیک فرستاده بشه به صورت خودکار ذخیره می‌شه و اعضا می‌تونن با فرستادن لینک پیامش توی پیوی ربات (یا دستور <code>/music</code>) فایل اصلی رو دریافت و سیو کنن.</i>"
+    )
+    return text, build_music_settings_kb(chat_id, enabled=is_enabled, has_topic=has_topic)
+
+
+async def render_music_topics(chat_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Render paginated topic picker for choosing the dedicated Music Downloader topic."""
+    title = await _get_group_title(chat_id)
+    topics = await repository.list_topics_with_counts_today(chat_id, _get_today_start_utc_iso())
+    if not topics:
+        topics = [{"thread_id": 1, "name": "عمومی", "today_count": 0}]
+
+    text = (
+        f"🎵 <b>انتخاب تاپیک موزیک — «{escape_html(title)}»</b>\n\n"
+        "تاپیکی که بچه‌ها توش موزیک می‌فرستن رو انتخاب کن:\n"
+        "<i>(همچنین می‌تونی مستقیم داخل خود تاپیک دستور <code>/set_music_topic</code> رو بزنی)</i>"
+    )
+    return text, build_music_topics_kb(chat_id, topics, page=page)
 
 
 async def render_global_status() -> tuple[str, InlineKeyboardMarkup]:
@@ -1109,6 +1162,48 @@ async def handle_panel_callback(
             await safe_edit_message(callback, text, kb)
             prefix = "✅ " if ok else "❌ "
             await safe_answer_callback(callback, f"{prefix}{details}", show_alert=True)
+            return
+
+        if action == "mus":
+            text, kb = await render_music_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback)
+            return
+
+        if action == "must":
+            music_cfg = await repository.ensure_music_settings(chat_id)
+            currently_enabled = int(music_cfg.get("enabled", 1)) == 1
+            new_enabled = 0 if currently_enabled else 1
+            await repository.set_music_enabled(chat_id, new_enabled)
+            text, kb = await render_music_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            toast = "🟢 دانلودر موزیک فعال شد!" if new_enabled == 1 else "🔴 دانلودر موزیک غیرفعال شد!"
+            await safe_answer_callback(callback, toast)
+            return
+
+        if action == "musl":
+            text, kb = await render_music_topics(chat_id, page=page)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback)
+            return
+
+        if action == "muss":
+            try:
+                tid = int(arg)
+            except ValueError:
+                await safe_answer_callback(callback, "شناسه تاپیک معتبر نیست 😅", show_alert=True)
+                return
+            await repository.set_music_topic(chat_id, tid, auto_enable=True)
+            text, kb = await render_music_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback, "📌 تاپیک موزیک ذخیره و فعال شد! 🎵")
+            return
+
+        if action == "musa":
+            await repository.set_music_topic(chat_id, None, auto_enable=False)
+            text, kb = await render_music_settings(chat_id)
+            await safe_edit_message(callback, text, kb)
+            await safe_answer_callback(callback, "🔄 حالت تشخیص خودکار تاپیک موزیک فعال شد!")
             return
 
     except Exception as exc:

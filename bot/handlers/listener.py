@@ -9,6 +9,7 @@ from bot.config import get_settings
 from bot.database import repository
 from bot.filters import ForumGroupFilter
 from bot.services.deeptalk_service import get_live_session_id_for_topic
+from bot.services.music_service import maybe_capture_music_message
 from bot.texts.private_texts import pick
 from bot.utils.general_topic import resolve_thread_id
 from bot.utils.noise_filter import is_noise
@@ -217,6 +218,12 @@ async def capture_message(message: Message) -> None:
         # 2. Skip animations, stickers, and purely decorative media
         if message.animation or message.sticker:
             return
+
+        # 2b. Index music/audio files in the configured/detected Music topic (even without captions)
+        try:
+            await maybe_capture_music_message(message)
+        except Exception as music_exc:
+            logger.debug("Failed capturing music message: %s", music_exc)
 
         # 3. Extract text and identify media type
         text: str | None = None

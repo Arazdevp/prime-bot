@@ -2631,3 +2631,278 @@ async def clear_ai_chat_long_term_memory(chat_id: int) -> tuple[int, int]:
         )
         await conn.commit()
     return int(c1.rowcount or 0), int(c2.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# Music Downloader settings & track index
+# ---------------------------------------------------------------------------
+
+
+async def get_music_settings(chat_id: int) -> dict[str, Any] | None:
+    """Read-only lookup of per-group music downloader settings."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT chat_id, enabled, thread_id, updated_at FROM music_settings WHERE chat_id = ?;",
+        (chat_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def ensure_music_settings(chat_id: int) -> dict[str, Any]:
+    """Retrieve music downloader settings for chat_id or initialize defaults (enabled=1, thread_id=None)."""
+    existing = await get_music_settings(chat_id)
+    if existing is not None:
+        return existing
+
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            "SELECT chat_id, enabled, thread_id, updated_at FROM music_settings WHERE chat_id = ?;",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return dict(row)
+
+        await conn.execute(
+            """
+            INSERT INTO music_settings (chat_id, enabled, thread_id, updated_at)
+            VALUES (?, 1, NULL, ?);
+            """,
+            (chat_id, now_iso),
+        )
+        await conn.commit()
+
+    return {
+        "chat_id": chat_id,
+        "enabled": 1,
+        "thread_id": None,
+        "updated_at": now_iso,
+    }
+
+
+async def set_music_enabled(chat_id: int, enabled: int) -> None:
+    """Enable (1) or disable (0) music track indexing for chat_id."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    val = 1 if int(enabled) else 0
+    async with lock:
+        await conn.execute(
+            """
+            INSERT INTO music_settings (chat_id, enabled, thread_id, updated_at)
+            VALUES (?, ?, NULL, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at;
+            """,
+            (chat_id, val, now_iso),
+        )
+        await conn.commit()
+
+
+async def set_music_topic(
+    chat_id: int,
+    thread_id: int | None,
+    *,
+    auto_enable: bool = True,
+) -> None:
+    """Set (or clear with None) the dedicated music topic thread_id for chat_id."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with lock:
+        if auto_enable:
+            await conn.execute(
+                """
+                INSERT INTO music_settings (chat_id, enabled, thread_id, updated_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    enabled = 1,
+                    thread_id = excluded.thread_id,
+                    updated_at = excluded.updated_at;
+                """,
+                (chat_id, thread_id, now_iso),
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO music_settings (chat_id, enabled, thread_id, updated_at)
+                VALUES (?, 1, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    thread_id = excluded.thread_id,
+                    updated_at = excluded.updated_at;
+                """,
+                (chat_id, thread_id, now_iso),
+            )
+        await conn.commit()
+
+
+async def insert_music_track(
+    *,
+    chat_id: int,
+    thread_id: int,
+    message_id: int,
+    file_id: str,
+    file_unique_id: str | None = None,
+    media_type: str = "audio",
+    title: str | None = None,
+    performer: str | None = None,
+    file_name: str | None = None,
+    caption: str | None = None,
+    duration: int | None = None,
+    file_size: int | None = None,
+    mime_type: str | None = None,
+    sender_user_id: int | None = None,
+    sender_name: str = "کاربر",
+    created_at: str | None = None,
+) -> int | None:
+    """Insert an indexed music track (ignoring duplicates on (chat_id, message_id))."""
+    conn = get_db()
+    lock = get_write_lock()
+    ts = created_at or datetime.now(timezone.utc).isoformat()
+    async with lock:
+        cursor = await conn.execute(
+            """
+            INSERT OR IGNORE INTO music_tracks (
+                chat_id, thread_id, message_id, file_id, file_unique_id,
+                media_type, title, performer, file_name, caption,
+                duration, file_size, mime_type, sender_user_id, sender_name,
+                created_at, download_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0);
+            """,
+            (
+                chat_id,
+                thread_id,
+                message_id,
+                file_id,
+                file_unique_id,
+                media_type,
+                title,
+                performer,
+                file_name,
+                caption,
+                duration,
+                file_size,
+                mime_type,
+                sender_user_id,
+                sender_name,
+                ts,
+            ),
+        )
+        await conn.commit()
+        if cursor.rowcount and cursor.rowcount > 0:
+            return int(cursor.lastrowid)
+        return None
+
+
+async def get_music_track_by_id(track_id: int) -> dict[str, Any] | None:
+    """Fetch a music track by its primary key id."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT * FROM music_tracks WHERE id = ?;",
+        (track_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def get_music_track_by_chat_and_message(
+    chat_id: int,
+    message_id: int,
+) -> dict[str, Any] | None:
+    """Fetch a music track by exact (chat_id, message_id)."""
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT * FROM music_tracks WHERE chat_id = ? AND message_id = ?;",
+        (chat_id, message_id),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def get_music_track_by_message_id_in_chats(
+    message_id: int,
+    chat_ids: list[int],
+) -> dict[str, Any] | None:
+    """Fetch the most recent matching music track for message_id across allowed chat_ids."""
+    if not chat_ids:
+        return None
+    conn = get_db()
+    placeholders = ",".join("?" for _ in chat_ids)
+    cursor = await conn.execute(
+        f"""
+        SELECT * FROM music_tracks
+        WHERE message_id = ? AND chat_id IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT 1;
+        """,
+        (message_id, *chat_ids),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def list_recent_music_tracks(
+    chat_ids: list[int],
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """List recently indexed music tracks across chat_ids ordered newest first."""
+    if not chat_ids:
+        return []
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 200))
+    safe_offset = max(0, int(offset))
+    placeholders = ",".join("?" for _ in chat_ids)
+    cursor = await conn.execute(
+        f"""
+        SELECT * FROM music_tracks
+        WHERE chat_id IN ({placeholders})
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?;
+        """,
+        (*chat_ids, safe_limit, safe_offset),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def count_music_tracks(
+    chat_id: int | None = None,
+    chat_ids: list[int] | None = None,
+) -> int:
+    """Count indexed music tracks for a single chat_id, a list of chat_ids, or all chats."""
+    conn = get_db()
+    if chat_id is not None:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM music_tracks WHERE chat_id = ?;",
+            (chat_id,),
+        )
+    elif chat_ids is not None:
+        if not chat_ids:
+            return 0
+        placeholders = ",".join("?" for _ in chat_ids)
+        cursor = await conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM music_tracks WHERE chat_id IN ({placeholders});",
+            tuple(chat_ids),
+        )
+    else:
+        cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM music_tracks;")
+    row = await cursor.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def increment_music_download_count(track_id: int) -> None:
+    """Atomically increment download_count for a track."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        await conn.execute(
+            "UPDATE music_tracks SET download_count = download_count + 1 WHERE id = ?;",
+            (track_id,),
+        )
+        await conn.commit()

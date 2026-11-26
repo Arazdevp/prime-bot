@@ -195,6 +195,12 @@ def build_dashboard_kb(chat_id: int, enabled: bool, mode: str) -> InlineKeyboard
             ],
             [
                 InlineKeyboardButton(
+                    text="🎵 دانلودر موزیک",
+                    callback_data=PanelCB(action="mus", chat_id=chat_id).pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="🔙 بازگشت",
                     callback_data=PanelCB(action="home").pack(),
                 ),
@@ -610,6 +616,90 @@ def build_morning_topics_kb(
             InlineKeyboardButton(
                 text="🔙 بازگشت",
                 callback_data=PanelCB(action="mrg", chat_id=chat_id).pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_music_settings_kb(
+    chat_id: int,
+    *,
+    enabled: bool,
+    has_topic: bool,
+) -> InlineKeyboardMarkup:
+    """Music Downloader settings keyboard with toggle and topic picker."""
+    toggle_label = "🔴 غیرفعال کردن دانلودر موزیک" if enabled else "🟢 فعال کردن دانلودر موزیک"
+    topic_label = "📌 تغییر تاپیک موزیک" if has_topic else "📌 انتخاب تاپیک موزیک"
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=toggle_label,
+                callback_data=PanelCB(action="must", chat_id=chat_id).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=topic_label,
+                callback_data=PanelCB(action="musl", chat_id=chat_id, page=0).pack(),
+            )
+        ],
+    ]
+    if has_topic:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔄 بازگشت به تشخیص خودکار تاپیک",
+                    callback_data=PanelCB(action="musa", chat_id=chat_id).pack(),
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت به داشبورد",
+                callback_data=PanelCB(action="grp", chat_id=chat_id).pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_music_topics_kb(
+    chat_id: int,
+    topics: list[dict[str, Any]],
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """Paginated topic picker for choosing the dedicated Music Downloader topic."""
+    rows: list[list[InlineKeyboardButton]] = []
+    page_topics, safe_page, total_pages = paginate(topics, page, PAGE_SIZE)
+
+    for t in page_topics:
+        tid = int(t["thread_id"])
+        label = f"🎵 {_truncate(str(t.get('name', tid)), 28)}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=PanelCB(
+                        action="muss",
+                        chat_id=chat_id,
+                        arg=str(tid),
+                        page=safe_page,
+                    ).pack(),
+                )
+            ]
+        )
+
+    nav = _pagination_row("musl", chat_id, safe_page, total_pages)
+    if nav:
+        rows.append(nav)
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت",
+                callback_data=PanelCB(action="mus", chat_id=chat_id).pack(),
             )
         ]
     )

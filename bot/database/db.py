@@ -227,6 +227,41 @@ CREATE TABLE IF NOT EXISTS ai_group_memory (
     ongoing_topics TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS music_settings (
+    chat_id INTEGER PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    thread_id INTEGER,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS music_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    thread_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    file_unique_id TEXT,
+    media_type TEXT NOT NULL DEFAULT 'audio',
+    title TEXT,
+    performer TEXT,
+    file_name TEXT,
+    caption TEXT,
+    duration INTEGER,
+    file_size INTEGER,
+    mime_type TEXT,
+    sender_user_id INTEGER,
+    sender_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    download_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(chat_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_created
+    ON music_tracks(chat_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_msg
+    ON music_tracks(chat_id, message_id);
 """
 
 
@@ -471,6 +506,43 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
             );
         """)
         await conn.execute("PRAGMA user_version = 8;")
+        await conn.commit()
+
+    if current_version < 9:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS music_settings (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                thread_id INTEGER,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS music_tracks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT,
+                media_type TEXT NOT NULL DEFAULT 'audio',
+                title TEXT,
+                performer TEXT,
+                file_name TEXT,
+                caption TEXT,
+                duration INTEGER,
+                file_size INTEGER,
+                mime_type TEXT,
+                sender_user_id INTEGER,
+                sender_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                download_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_created
+                ON music_tracks(chat_id, created_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_msg
+                ON music_tracks(chat_id, message_id);
+        """)
+        await conn.execute("PRAGMA user_version = 9;")
         await conn.commit()
 
 

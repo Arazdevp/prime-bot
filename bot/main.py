@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import get_settings
 from bot.database.db import close_db, init_db
-from bot.handlers import admin, ai_chat, deeptalk, listener, panel, private, timer
+from bot.handlers import admin, ai_chat, deeptalk, listener, music, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
 from bot.scheduler.jobs import build_scheduler, run_catchup_if_needed, set_scheduler
 from bot.services.ai_chat_service import init_ai_chat_state, set_ai_bot_identity
@@ -127,6 +127,7 @@ async def main() -> None:
     dp.include_router(admin.router)
     dp.include_router(timer.router)
     dp.include_router(deeptalk.router)
+    dp.include_router(music.router)
     dp.include_router(ai_chat.router)
     dp.include_router(listener.router)
     dp.include_router(private.router)

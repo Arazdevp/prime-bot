@@ -14,8 +14,9 @@ from bot.database import repository
 from bot.filters import PrivateChatFilter
 from bot.handlers.panel import build_admin_help_text, render_home_or_dashboard
 from bot.keyboards.deeptalk import DeepTalkCB
+from bot.keyboards.music import MusicCB
 from bot.keyboards.panel import PanelCB, build_open_panel_kb
-from bot.keyboards.timer import TimerCB, build_dm_timer_entry_kb
+from bot.keyboards.timer import TimerCB
 from bot.services.access import (
     UserRole,
     can_manage_deeptalk,
@@ -79,6 +80,34 @@ def _build_deeptalk_admin_entry_kb(user_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="⏱ پنل تایمر شخصی",
                     callback_data=TimerCB(action="home", owner_id=user_id).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="🎵 دانلودر موزیک",
+                    callback_data=MusicCB(action="home").pack(),
+                ),
+            ],
+        ]
+    )
+
+
+def _build_member_entry_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Quick entry keyboard for regular active group members in private chat."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⏱ باز کردن پنل تایمر",
+                    callback_data=TimerCB(action="home", owner_id=user_id).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="📋 تایمرهای فعال من",
+                    callback_data=TimerCB(action="list", owner_id=user_id, arg="0").pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎵 دانلودر موزیک",
+                    callback_data=MusicCB(action="home").pack(),
                 )
             ],
         ]
@@ -275,8 +304,8 @@ async def cmd_private_cancel(message: Message, bot: Bot, state: FSMContext) -> N
             if await is_active_group_member(bot, user.id):
                 await _safe_answer(
                     message,
-                    "الان هیچ عملیاتی در جریان نیست 😄 برای تایمرهات <code>/timer</code> رو بزن.",
-                    reply_markup=build_dm_timer_entry_kb(user.id),
+                    "الان هیچ عملیاتی در جریان نیست 😄 برای تایمرهات <code>/timer</code> یا برای دانلود موزیک <code>/music</code> رو بزن.",
+                    reply_markup=_build_member_entry_kb(user.id),
                 )
                 return
             await handle_stranger_contact(message, bot, is_start=False)
@@ -378,10 +407,11 @@ async def cmd_private_start(message: Message, bot: Bot, state: FSMContext) -> No
                     "🔔 <b>اعلان‌های تایمر توی پیوی برات فعال شد ✅</b>\n"
                     "از این به بعد هر تایمری توی تاپیک‌های گروه بذاری، علاوه بر خود تاپیک، "
                     "همزمان همینجا هم بهت یادآوری می‌کنم!\n\n"
+                    "🎵 <b>دانلودر موزیک:</b> کافیه لینک هر موزیکِ توی تاپیک موزیک گروه رو کپی کنی و مستقیم همینجا برام بفرستی (یا <code>/music</code> رو بزنی) تا فایل اصلی رو برات بفرستم و راحت سیوش کنی!\n\n"
                     "همچنین می‌تونی با دستور <code>/timer</code> همینجا تایمرهای فعالت رو ببینی، "
                     "لغو کنی یا یادآور شخصی بذاری ⏱"
                 )
-                await _safe_answer(message, member_text, reply_markup=build_dm_timer_entry_kb(user.id))
+                await _safe_answer(message, member_text, reply_markup=_build_member_entry_kb(user.id))
                 return
 
             await handle_stranger_contact(message, bot, is_start=True)
@@ -497,13 +527,17 @@ async def cmd_private_help(message: Message, bot: Bot) -> None:
                 return
             if await is_active_group_member(bot, user.id):
                 member_help = (
-                    "⏱ <b>راهنمای تایمر و یادآور</b>\n\n"
+                    "📖 <b>راهنمای امکانات اعضا</b>\n\n"
+                    "🎵 <b>دانلودر موزیک:</b>\n"
+                    "• لینک هر پیام موزیک داخل تاپیک موزیک گروه رو کپی کن و همینجا بفرست تا فایل اصلی رو برات بفرستم و سیو کنی!\n"
+                    "• یا دستور <code>/music</code> رو بزن تا لیست آخرین موزیک‌ها رو ببینی.\n\n"
+                    "⏱ <b>تایمر و یادآور:</b>\n"
                     "• در هر تاپیک گروه یا همینجا <code>/timer</code> رو بزن تا پنل شیشه‌ای تایمر باز بشه.\n"
                     "• می‌تونی <b>تایمر دقیقه‌ای / ساعتی</b> یا <b>تایمر روزی (تقویم شمسی)</b> تنظیم کنی و یادداشت بذاری.\n"
                     "• میانبر سریع: <code>/timer 30m برم شام</code> یا <code>/timer فردا 09:00 جلسه</code>\n"
                     "• وقتی تایمر به صدا در بیاد، هم توی همون تاپیک تگ می‌شی و هم همزمان همینجا بهت خبر میدم! 🔔"
                 )
-                await _safe_answer(message, member_help, reply_markup=build_dm_timer_entry_kb(user.id))
+                await _safe_answer(message, member_help, reply_markup=_build_member_entry_kb(user.id))
                 return
             await handle_stranger_contact(message, bot, is_start=False)
             return
@@ -566,8 +600,9 @@ async def handle_private_fallback(message: Message, bot: Bot) -> None:
             if await is_active_group_member(bot, user.id):
                 await _safe_answer(
                     message,
-                    "برای تنظیم یا دیدن تایمرهات دستور <code>/timer</code> رو بزن یا از دکمه‌های زیر استفاده کن ⏱",
-                    reply_markup=build_dm_timer_entry_kb(user.id),
+                    "برای دانلود موزیک، لینک پیام موزیک رو همینجا بفرست یا <code>/music</code> رو بزن 🎵\n"
+                    "برای تایمرهات هم می‌تونی <code>/timer</code> رو بزنی ⏱",
+                    reply_markup=_build_member_entry_kb(user.id),
                 )
                 return
             await handle_stranger_contact(message, bot, is_start=False)
