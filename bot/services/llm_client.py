@@ -9,7 +9,14 @@ import re
 import time
 from typing import Any
 import httpx
-from bot.config import Settings, get_settings
+from bot.config import (
+    Settings,
+    get_settings,
+    is_local_base_url,
+    is_openrouter_base_url,
+    normalize_ai_provider,
+    resolve_openai_compat_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +198,65 @@ def _extract_openai_message_text(raw_content: Any) -> str:
                     pieces.append(item["text"])
         return "".join(pieces).strip()
     return ""
+
+
+def _extract_sse_text_piece(raw_content: Any) -> str:
+    """Extract raw text fragment from an SSE delta/message content without stripping token spaces."""
+    if isinstance(raw_content, str):
+        return raw_content
+    if isinstance(raw_content, list):
+        pieces: list[str] = []
+        for item in raw_content:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict):
+                item_type = str(item.get("type") or "").lower()
+                if item_type in ("", "text", "output_text") and isinstance(item.get("text"), str):
+                    pieces.append(item["text"])
+        return "".join(pieces)
+    return ""
+
+
+def _resolve_json_error_code(err_obj: dict[str, Any]) -> int:
+    """Map numeric or string JSON error codes (e.g. from 9Router / upstream providers) to HTTP status codes."""
+    raw_code = err_obj.get("code")
+    if raw_code is not None and not isinstance(raw_code, bool):
+        try:
+            code_int = int(raw_code)
+            if 100 <= code_int <= 599:
+                return code_int
+        except (TypeError, ValueError):
+            pass
+
+    combined = " ".join(
+        str(err_obj.get(k) or "")
+        for k in ("code", "type", "status", "message")
+    ).lower()
+    if any(tok in combined for tok in ("rate_limit", "too_many_requests", "resource_exhausted", "429")):
+        return 429
+    if any(tok in combined for tok in ("invalid_api_key", "authentication_error", "unauthorized", "permission_denied", "401")):
+        return 401
+    if any(tok in combined for tok in ("forbidden", "403")):
+        return 403
+    if any(tok in combined for tok in ("not_found", "model_not_found", "404")):
+        return 404
+    if any(tok in combined for tok in ("invalid_request", "invalid_argument", "bad_request", "400")):
+        return 400
+    return 502
+
+
+def _build_httpx_client(
+    timeout: httpx.Timeout,
+    proxy_url: str | None,
+    base_url: str | None = None,
+) -> httpx.AsyncClient:
+    """Create httpx.AsyncClient, automatically bypassing outbound proxies for local 9Router URLs."""
+    client_kwargs: dict[str, Any] = {"timeout": timeout}
+    if is_local_base_url(base_url):
+        client_kwargs["trust_env"] = False
+    elif proxy_url:
+        client_kwargs["proxy"] = proxy_url
+    return httpx.AsyncClient(**client_kwargs)
 
 
 class LLMError(Exception):
@@ -503,7 +569,10 @@ class OpenAIClient(BaseLLMClient):
                 "stream": False,
             }
             if self.reasoning_effort:
-                payload["reasoning"] = {"effort": self.reasoning_effort}
+                if is_openrouter_base_url(self.base_url):
+                    payload["reasoning"] = {"effort": self.reasoning_effort}
+                else:
+                    payload["reasoning_effort"] = self.reasoning_effort
 
             try:
                 response = await client.post(url, headers=headers, json=payload)
@@ -556,28 +625,43 @@ class OpenAIClient(BaseLLMClient):
             try:
                 data = response.json()
             except Exception:
-                # Fallback: provider might have returned SSE streaming lines (data: {...})
+                # Fallback: provider (or 9Router upstream) may emit SSE streaming lines without trailing [DONE]
                 accumulated: list[str] = []
                 sse_finish_reason: str | None = None
                 for line in response.text.splitlines():
                     line = line.strip()
-                    if line.startswith("data:"):
-                        payload_str = line[5:].strip()
-                        if not payload_str or payload_str == "[DONE]":
-                            continue
-                        try:
-                            chunk = json.loads(payload_str)
-                            choices_chunk = chunk.get("choices", [])
-                            if choices_chunk:
-                                first_choice = choices_chunk[0]
-                                if first_choice.get("finish_reason"):
-                                    sse_finish_reason = str(first_choice["finish_reason"])
-                                delta = first_choice.get("delta", {})
-                                chunk_content = delta.get("content") or first_choice.get("message", {}).get("content")
-                                if isinstance(chunk_content, str) and chunk_content:
-                                    accumulated.append(chunk_content)
-                        except Exception:
-                            pass
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(payload_str)
+                    except Exception:
+                        continue
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        err_obj = chunk["error"]
+                        err_msg = str(err_obj.get("message") or err_obj) if isinstance(err_obj, dict) else str(err_obj)
+                        err_code = _resolve_json_error_code(err_obj) if isinstance(err_obj, dict) else 502
+                        retry_after = _parse_retry_after(response, chunk) if err_code in (402, 429, 503) else None
+                        raise LLMError(
+                            f"OpenAI SSE returned error {err_code}: {err_msg[:400]}",
+                            status_code=err_code,
+                            body_excerpt=err_msg[:400],
+                            retry_after=retry_after,
+                        )
+                    choices_chunk = chunk.get("choices", []) if isinstance(chunk, dict) else []
+                    if choices_chunk:
+                        first_choice = choices_chunk[0]
+                        if first_choice.get("finish_reason"):
+                            sse_finish_reason = str(first_choice["finish_reason"])
+                        delta = first_choice.get("delta") or {}
+                        raw_frag = delta.get("content")
+                        if raw_frag is None:
+                            raw_frag = (first_choice.get("message") or {}).get("content")
+                        piece = _extract_sse_text_piece(raw_frag)
+                        if piece:
+                            accumulated.append(piece)
                 if accumulated:
                     sse_text = "".join(accumulated).strip()
                     if sse_finish_reason == "length" and not allow_truncated:
@@ -588,16 +672,12 @@ class OpenAIClient(BaseLLMClient):
                     return sse_text
                 raise LLMError(f"Failed to decode OpenAI JSON response: {response.text[:400]}", status_code=200)
 
-            # OpenRouter / compatible gateways may return HTTP 200 with a JSON error object
+            # 9Router / OpenRouter / compatible gateways may return HTTP 200 with a JSON error object
             if isinstance(data, dict) and data.get("error"):
                 err_obj = data["error"]
                 if isinstance(err_obj, dict):
                     err_msg = str(err_obj.get("message") or err_obj)
-                    raw_code = err_obj.get("code")
-                    try:
-                        err_code = int(raw_code) if raw_code is not None else 502
-                    except (TypeError, ValueError):
-                        err_code = 502
+                    err_code = _resolve_json_error_code(err_obj)
                 else:
                     err_msg = str(err_obj)
                     err_code = 502
@@ -743,31 +823,31 @@ def get_llm_client(settings: Settings | None = None) -> BaseLLMClient:
     if settings is None:
         settings = get_settings()
 
-    # Configure httpx client with proxy if specified
-    client_kwargs: dict[str, Any] = {"timeout": _DEFAULT_HTTP_TIMEOUT}
-    if settings.PROXY_URL:
-        client_kwargs["proxy"] = settings.PROXY_URL
+    provider = normalize_ai_provider(getattr(settings, "AI_PROVIDER", "9router"), default="9router")
 
-    _shared_http_client = httpx.AsyncClient(**client_kwargs)
-
-    if settings.AI_PROVIDER == "gemini":
+    if provider == "gemini":
         if not settings.GEMINI_API_KEY:
             raise ValueError("GEMINI_API_KEY is required for Gemini provider")
+        _shared_http_client = _build_httpx_client(_DEFAULT_HTTP_TIMEOUT, settings.PROXY_URL, base_url=None)
         _shared_llm_client = GeminiClient(
             api_key=settings.GEMINI_API_KEY,
             model=settings.GEMINI_MODEL,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS,
             http_client=_shared_http_client,
         )
-    elif settings.AI_PROVIDER == "openai":
-        if not settings.OPENAI_BASE_URL or not settings.OPENAI_API_KEY or not settings.OPENAI_MODEL:
-            raise ValueError("OPENAI_BASE_URL, OPENAI_API_KEY, and OPENAI_MODEL are required")
+    elif provider in ("9router", "openai"):
+        base_url, api_key, model, _ = resolve_openai_compat_config(settings, for_chat=False, provider=provider)
+        if not base_url or not api_key or not model:
+            raise ValueError(
+                f"Base URL, API key, and model are required for AI_PROVIDER='{provider}'"
+            )
+        _shared_http_client = _build_httpx_client(_DEFAULT_HTTP_TIMEOUT, settings.PROXY_URL, base_url=base_url)
         raw_effort = getattr(settings, "AI_REASONING_EFFORT", None)
         reasoning_effort = raw_effort if isinstance(raw_effort, str) and raw_effort.strip() else None
         _shared_llm_client = OpenAIClient(
-            base_url=settings.OPENAI_BASE_URL,
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.OPENAI_MODEL,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
             max_output_tokens=settings.AI_MAX_OUTPUT_TOKENS,
             http_client=_shared_http_client,
             reasoning_effort=reasoning_effort,
@@ -796,37 +876,57 @@ async def close_llm_client() -> None:
 
 _shared_ai_chat_gemini_client: GeminiClient | None = None
 _shared_ai_chat_openai_client: OpenAIClient | None = None
-_shared_ai_chat_http_client: httpx.AsyncClient | None = None
+_shared_ai_chat_gemini_http_client: httpx.AsyncClient | None = None
+_shared_ai_chat_openai_http_client: httpx.AsyncClient | None = None
 
 
-def _get_ai_chat_http_client(settings: Settings) -> httpx.AsyncClient:
-    """Return shared httpx.AsyncClient for interactive AI chat clients."""
-    global _shared_ai_chat_http_client
-    if _shared_ai_chat_http_client is None or _shared_ai_chat_http_client.is_closed:
-        client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(60.0, connect=20.0)}
-        if settings.PROXY_URL:
-            client_kwargs["proxy"] = settings.PROXY_URL
-        _shared_ai_chat_http_client = httpx.AsyncClient(**client_kwargs)
-    return _shared_ai_chat_http_client
+def _get_ai_chat_gemini_http_client(settings: Settings) -> httpx.AsyncClient:
+    """Return shared httpx.AsyncClient for remote Google Gemini AI chat."""
+    global _shared_ai_chat_gemini_http_client
+    if _shared_ai_chat_gemini_http_client is None or _shared_ai_chat_gemini_http_client.is_closed:
+        _shared_ai_chat_gemini_http_client = _build_httpx_client(
+            httpx.Timeout(60.0, connect=20.0),
+            settings.PROXY_URL,
+            base_url=None,
+        )
+    return _shared_ai_chat_gemini_http_client
+
+
+def _get_ai_chat_openai_http_client(settings: Settings, base_url: str) -> httpx.AsyncClient:
+    """Return shared httpx.AsyncClient for 9Router / OpenAI-compatible AI chat."""
+    global _shared_ai_chat_openai_http_client
+    want_local = is_local_base_url(base_url)
+    cur = _shared_ai_chat_openai_http_client
+    if cur is None or cur.is_closed or getattr(cur, "_tg_is_local_bypass", None) != want_local:
+        _shared_ai_chat_openai_http_client = _build_httpx_client(
+            httpx.Timeout(60.0, connect=20.0),
+            settings.PROXY_URL,
+            base_url=base_url,
+        )
+        setattr(_shared_ai_chat_openai_http_client, "_tg_is_local_bypass", want_local)
+    return _shared_ai_chat_openai_http_client
 
 
 def get_ai_chat_client(
     settings: Settings | None = None,
     provider: str | None = None,
 ) -> GeminiClient | OpenAIClient:
-    """Return dedicated interactive AI chat client singleton for 'gemini' or 'openai'."""
+    """Return dedicated interactive AI chat client singleton for '9router', 'openai', or 'gemini'."""
     global _shared_ai_chat_gemini_client, _shared_ai_chat_openai_client
     if settings is None:
         settings = get_settings()
 
-    target = (provider or getattr(settings, "AI_CHAT_PROVIDER", "gemini") or "gemini").strip().lower()
+    target = normalize_ai_provider(
+        provider or getattr(settings, "AI_CHAT_PROVIDER", "9router"),
+        default="9router",
+    )
     if target == "gemini":
         if _shared_ai_chat_gemini_client is not None:
             return _shared_ai_chat_gemini_client
         api_key = (settings.AI_CHAT_API_KEY or settings.GEMINI_API_KEY or "").strip()
         if not api_key:
             raise ValueError("AI_CHAT_API_KEY (or GEMINI_API_KEY) is required for Gemini AI chat")
-        http_client = _get_ai_chat_http_client(settings)
+        http_client = _get_ai_chat_gemini_http_client(settings)
         _shared_ai_chat_gemini_client = GeminiClient(
             api_key=api_key,
             model=settings.AI_CHAT_MODEL,
@@ -835,19 +935,23 @@ def get_ai_chat_client(
         )
         return _shared_ai_chat_gemini_client
 
-    if target == "openai":
-        if _shared_ai_chat_openai_client is not None:
-            return _shared_ai_chat_openai_client
-        base_url = (getattr(settings, "AI_CHAT_OPENAI_BASE_URL", None) or settings.OPENAI_BASE_URL or "").strip()
-        api_key = (getattr(settings, "AI_CHAT_OPENAI_API_KEY", None) or settings.OPENAI_API_KEY or "").strip()
-        model = (getattr(settings, "AI_CHAT_OPENAI_MODEL", None) or settings.OPENAI_MODEL or "").strip()
+    if target in ("9router", "openai"):
+        base_url, api_key, model, _ = resolve_openai_compat_config(settings, for_chat=True, provider=target)
         if not base_url or not api_key or not model:
             raise ValueError(
-                "AI_CHAT_OPENAI_BASE_URL/OPENAI_BASE_URL, API_KEY, and MODEL are required for OpenAI AI chat"
+                f"Base URL, API key, and model are required for AI chat provider '{target}'"
             )
+        normalized_url = base_url.rstrip("/")
+        if (
+            _shared_ai_chat_openai_client is not None
+            and _shared_ai_chat_openai_client.base_url == normalized_url
+            and _shared_ai_chat_openai_client.api_key == api_key
+            and _shared_ai_chat_openai_client.model == model
+        ):
+            return _shared_ai_chat_openai_client
         raw_effort = getattr(settings, "AI_REASONING_EFFORT", None)
         reasoning_effort = raw_effort if isinstance(raw_effort, str) and raw_effort.strip() else None
-        http_client = _get_ai_chat_http_client(settings)
+        http_client = _get_ai_chat_openai_http_client(settings, base_url=base_url)
         _shared_ai_chat_openai_client = OpenAIClient(
             base_url=base_url,
             api_key=api_key,
@@ -862,8 +966,9 @@ def get_ai_chat_client(
 
 
 async def close_ai_chat_client() -> None:
-    """Close dedicated AI chat clients and shared HTTP client."""
-    global _shared_ai_chat_gemini_client, _shared_ai_chat_openai_client, _shared_ai_chat_http_client
+    """Close dedicated AI chat clients and shared HTTP clients."""
+    global _shared_ai_chat_gemini_client, _shared_ai_chat_openai_client
+    global _shared_ai_chat_gemini_http_client, _shared_ai_chat_openai_http_client
     for attr_name, client_obj in (
         ("gemini", _shared_ai_chat_gemini_client),
         ("openai", _shared_ai_chat_openai_client),
@@ -878,8 +983,16 @@ async def close_ai_chat_client() -> None:
             else:
                 _shared_ai_chat_openai_client = None
 
-    if _shared_ai_chat_http_client is not None and not _shared_ai_chat_http_client.is_closed:
-        try:
-            await _shared_ai_chat_http_client.aclose()
-        finally:
-            _shared_ai_chat_http_client = None
+    for attr_name, http_obj in (
+        ("gemini_http", _shared_ai_chat_gemini_http_client),
+        ("openai_http", _shared_ai_chat_openai_http_client),
+    ):
+        if http_obj is not None and not http_obj.is_closed:
+            try:
+                await http_obj.aclose()
+            except Exception:
+                pass
+        if attr_name == "gemini_http":
+            _shared_ai_chat_gemini_http_client = None
+        else:
+            _shared_ai_chat_openai_http_client = None

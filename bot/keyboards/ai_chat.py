@@ -15,13 +15,14 @@ def build_manage_ai_kb(
     enabled: bool,
     has_custom_prompt: bool,
     owner_id: int,
-    provider: str = "gemini",
+    provider: str = "9router",
     access_mode: str = "public",
+    gateway_label: str = "9Router",
 ) -> InlineKeyboardMarkup:
     """Build main inline keyboard for /manage_ai panel."""
     toggle_label = "🔴 خاموش کردن هوش مصنوعی" if enabled else "🟢 روشن کردن هوش مصنوعی"
     provider_label = (
-        "🔄 تغییر سرویس به OpenAI"
+        f"🔄 تغییر سرویس به {gateway_label}"
         if provider == "gemini"
         else "🔄 تغییر سرویس به Gemini"
     )

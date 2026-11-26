@@ -10,7 +10,13 @@ from aiogram.filters import Command, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
-from bot.config import get_settings
+from bot.config import (
+    format_ai_provider_label,
+    get_settings,
+    is_9router_base_url,
+    is_openai_compatible_provider,
+    resolve_openai_compat_config,
+)
 from bot.database import repository
 from bot.handlers.panel import safe_answer_callback, safe_edit_message
 from bot.keyboards.ai_chat import (
@@ -66,7 +72,7 @@ class AiChatStates(StatesGroup):
 
 
 def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, str | None]:
-    """Parse optional shorthand argument from '/manage_ai on|off|openai|gemini|bind|learn|memory'."""
+    """Parse optional shorthand argument from '/manage_ai on|off|9router|openai|gemini|bind|learn|memory'."""
     if not raw_text:
         return None, None, None
     parts = raw_text.strip().split(maxsplit=1)
@@ -77,6 +83,8 @@ def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, st
         return True, None, None
     if arg in ("off", "disable", "disabled", "0", "false", "خاموش", "غیرفعال"):
         return False, None, None
+    if arg in ("9router", "ninerouter", "9-router"):
+        return None, "9router", None
     if arg in ("openai", "openrouter", "gateway"):
         return None, "openai", None
     if arg in ("gemini", "google", "aistudio"):
@@ -123,24 +131,32 @@ async def _send_in_context(
 _SECRET_REDACT_RE = re.compile(r"(?:AQ\.[A-Za-z0-9._-]+|AIza[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+)")
 
 
+def _pick_preferred_gateway_provider(settings: object) -> str:
+    """Return '9router' when 9Router is configured or active, otherwise 'openai'."""
+    if (
+        str(getattr(settings, "AI_CHAT_PROVIDER", "") or "").strip().lower() == "9router"
+        or str(getattr(settings, "AI_PROVIDER", "") or "").strip().lower() == "9router"
+        or getattr(settings, "NINEROUTER_API_KEY", None)
+        or getattr(settings, "AI_CHAT_NINEROUTER_API_KEY", None)
+    ):
+        return "9router"
+    base_url, _, _, _ = resolve_openai_compat_config(settings, for_chat=True, provider="openai")
+    if is_9router_base_url(base_url):
+        return "9router"
+    return "openai"
+
+
 def _format_key_status(settings: object, provider: str) -> str:
     """Format masked API key source label (last 4 chars only, never exposing secret)."""
-    if provider == "openai":
-        base_url = (
-            getattr(settings, "AI_CHAT_OPENAI_BASE_URL", None)
-            or getattr(settings, "OPENAI_BASE_URL", None)
-            or ""
-        ).strip()
-        api_key = (
-            getattr(settings, "AI_CHAT_OPENAI_API_KEY", None)
-            or getattr(settings, "OPENAI_API_KEY", None)
-            or ""
-        ).strip()
-        key_src = "AI_CHAT_OPENAI_API_KEY" if getattr(settings, "AI_CHAT_OPENAI_API_KEY", None) else "OPENAI_API_KEY"
+    if is_openai_compatible_provider(provider):
+        base_url, api_key, _model, key_src = resolve_openai_compat_config(
+            settings, for_chat=True, provider=provider
+        )
         if base_url and api_key:
             suffix = api_key[-4:] if len(api_key) >= 4 else "****"
             return f"✅ متصل (<code>{key_src}: ...{escape_html(suffix)}</code>)"
-        return "❌ تنظیمات OpenAI کامل نیست"
+        label = "9Router" if provider == "9router" else "OpenAI"
+        return f"❌ تنظیمات {label} کامل نیست"
 
     chat_key = (getattr(settings, "AI_CHAT_API_KEY", None) or "").strip()
     if chat_key:
@@ -289,29 +305,27 @@ async def render_manage_ai_panel(
     limit_count = int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20))
     window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
-    provider_label = "OpenAI / Gateway" if provider == "openai" else "Google Gemini مستقیم"
+    provider_label = format_ai_provider_label(settings, for_chat=True, provider=provider)
     access_badge = (
         f"👥 <b>همه اعضای گفتگوی آزاد</b> ({limit_count} پیام در {window_hours} ساعت | مدیر نامحدود)"
         if access_mode == "public"
         else "🔒 <b>فقط مدیر ربات</b>"
     )
-    active_model = (
-        (
-            getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
-            or getattr(settings, "OPENAI_MODEL", None)
-            or "تنظیم‌نشده"
-        )
-        if provider == "openai"
-        else settings.AI_CHAT_MODEL
-    )
+    if is_openai_compatible_provider(provider):
+        _, _, resolved_model, _ = resolve_openai_compat_config(settings, for_chat=True, provider=provider)
+        active_model = resolved_model or "تنظیم‌نشده"
+    else:
+        active_model = settings.AI_CHAT_MODEL
     key_badge = _format_key_status(settings, provider)
     prompt_badge = "✏️ سفارشی" if custom_prompt else "🇮🇷 پیش‌فرض (لحن طبیعی ایرانی)"
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
+    preferred_gateway = _pick_preferred_gateway_provider(settings)
+    gateway_label = "9Router" if preferred_gateway == "9router" else "OpenAI"
 
     text = (
         "🧠 <b>مدیریت چت هوش مصنوعی</b>\n\n"
         f"• وضعیت فعلی: {status_badge}\n"
-        f"• سرویس فعال: 🔌 <b>{provider_label}</b>\n"
+        f"• سرویس فعال: 🔌 <b>{escape_html(provider_label)}</b>\n"
         f"• سطح دسترسی: {access_badge}\n"
         "• محدوده گروه: 📍 <b>فقط تاپیک گفتگوی آزاد</b>\n"
         f"• مدل گفتگو: <code>{escape_html(active_model)}</code>\n"
@@ -322,7 +336,7 @@ async def render_manage_ai_panel(
         "<b>نحوه استفاده هنگام روشن بودن:</b>\n"
         f"• فقط در گفتگوی آزاد: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
         "• در پیوی: فقط مدیر ربات\n"
-        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>openai</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
+        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>9router</code> | <code>gemini</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
     )
     kb = build_manage_ai_kb(
         enabled=enabled,
@@ -330,6 +344,7 @@ async def render_manage_ai_panel(
         owner_id=owner_id,
         provider=provider,
         access_mode=access_mode,
+        gateway_label=gateway_label,
     )
     return text, kb
 
@@ -428,13 +443,15 @@ async def on_manage_ai_callback(
 
     if action == "prov":
         current_provider = get_effective_ai_chat_provider()
-        next_provider = "openai" if current_provider == "gemini" else "gemini"
-        await set_ai_chat_provider_state(next_provider)
-        toast = (
-            "🔌 سرویس گفتگو به OpenAI / Gateway تغییر کرد."
-            if next_provider == "openai"
-            else "🔌 سرویس گفتگو به Google Gemini تغییر کرد."
+        settings = get_settings()
+        next_provider = (
+            "gemini"
+            if is_openai_compatible_provider(current_provider)
+            else _pick_preferred_gateway_provider(settings)
         )
+        await set_ai_chat_provider_state(next_provider)
+        next_label = format_ai_provider_label(settings, for_chat=True, provider=next_provider)
+        toast = f"🔌 سرویس گفتگو به {next_label} تغییر کرد."
         await safe_answer_callback(callback, toast)
         text, kb = await render_manage_ai_panel(
             owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
@@ -746,7 +763,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             safe_err = _format_safe_llm_error(exc)
             err_text += f"\n\n🔍 <b>علت خطا:</b> <code>{escape_html(safe_err)}</code>"
             if "location is not supported" in safe_err.lower():
-                err_text += "\n💡 آی‌پی سرور در Google AI Studio محدود است؛ از <code>/manage_ai openai</code> استفاده کن."
+                err_text += "\n💡 آی‌پی سرور در Google AI Studio محدود است؛ از <code>/manage_ai 9router</code> (یا <code>/manage_ai openai</code>) استفاده کن."
         await _send_in_context(
             message,
             err_text,

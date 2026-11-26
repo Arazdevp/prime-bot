@@ -90,17 +90,23 @@ ALLOWED_CHAT_IDS=-100123456789
 # پروکسی اختیاری (HTTP یا SOCKS5)
 PROXY_URL=
 
-# ارائه‌دهنده هوش مصنوعی: gemini یا openai
-AI_PROVIDER=gemini
+# ارائه‌دهنده هوش مصنوعی: 9router (پیشنهادی)، openai یا gemini
+AI_PROVIDER=9router
 
-# تنظیمات گوگل جمینای
-GEMINI_API_KEY=AIzaSyYourGeminiApiKeyHere
+# تنظیمات 9Router (آدرس محلی به صورت خودکار پروکسی را دور می‌زند)
+NINEROUTER_BASE_URL=http://localhost:20128/v1
+NINEROUTER_API_KEY=sk-Your9RouterApiKeyHere
+NINEROUTER_MODEL=antigravity/gemini-2.5-flash
+AI_CHAT_PROVIDER=9router
+
+# تنظیمات گوگل جمینای (اختیاری - در صورت استفاده از AI_PROVIDER=gemini)
+GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
 
-# تنظیمات OpenAI (در صورت استفاده از AI_PROVIDER=openai)
-OPENAI_BASE_URL=https://api.openai.com/v1
+# تنظیمات OpenAI سازگار (اختیاری - در صورت استفاده از AI_PROVIDER=openai)
+OPENAI_BASE_URL=
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=
 
 # سقف توکن‌های خروجی هوش مصنوعی (پیش‌فرض 8192)
 AI_MAX_OUTPUT_TOKENS=8192

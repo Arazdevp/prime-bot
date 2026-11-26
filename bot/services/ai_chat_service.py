@@ -8,7 +8,13 @@ import re
 import time
 from aiogram import Bot
 from aiogram.types import Message
-from bot.config import get_settings
+from bot.config import (
+    get_settings,
+    is_openai_compatible_provider,
+    normalize_ai_provider,
+    resolve_openai_chat_fallback_models,
+    resolve_openai_compat_config,
+)
 from bot.database import repository
 from bot.services.access import is_global_admin
 from bot.services.ai_memory_service import build_live_and_learned_context, reset_ai_memory_caches
@@ -65,11 +71,12 @@ def is_ai_chat_enabled_cached() -> bool:
 
 
 def get_effective_ai_chat_provider() -> str:
-    """Return active interactive AI chat provider ('gemini' or 'openai')."""
-    if _ai_chat_provider_cache in ("gemini", "openai"):
+    """Return active interactive AI chat provider ('9router', 'openai', or 'gemini')."""
+    if _ai_chat_provider_cache in ("9router", "openai", "gemini"):
         return _ai_chat_provider_cache
-    raw = str(getattr(get_settings(), "AI_CHAT_PROVIDER", "gemini") or "gemini").strip().lower()
-    return raw if raw in ("gemini", "openai") else "gemini"
+    raw = getattr(get_settings(), "AI_CHAT_PROVIDER", "9router")
+    normalized = normalize_ai_provider(raw, default="9router")
+    return normalized if normalized in ("9router", "openai", "gemini") else "9router"
 
 
 def get_effective_ai_chat_access_mode() -> str:
@@ -95,10 +102,10 @@ async def set_ai_chat_state(enabled: bool) -> bool:
 
 
 async def set_ai_chat_provider_state(provider: str) -> str:
-    """Persist ai_chat_provider ('gemini' or 'openai') to SQLite and update cache."""
+    """Persist ai_chat_provider ('9router', 'openai', or 'gemini') to SQLite and update cache."""
     global _ai_chat_provider_cache
-    cleaned = provider.strip().lower()
-    if cleaned not in ("gemini", "openai"):
+    cleaned = normalize_ai_provider(provider, default="")
+    if cleaned not in ("9router", "openai", "gemini"):
         raise ValueError(f"Unsupported AI chat provider: {provider}")
     await repository.set_ai_chat_provider(cleaned)
     _ai_chat_provider_cache = cleaned
@@ -356,21 +363,50 @@ async def generate_ai_chat_reply(
 
         raw_reply: str | None = None
         if isinstance(active_client, OpenAIClient):
-            openai_model = (
-                getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
-                or getattr(settings, "OPENAI_MODEL", None)
-                or ""
-            ).strip() or None
-            raw_reply = await async_retry(
-                lambda: active_client.generate_chat(
-                    system_prompt=runtime_system,
-                    messages=pending_turns,
-                    temperature=settings.AI_CHAT_TEMPERATURE,
-                    max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
-                    model=openai_model,
-                ),
-                retries=1,
-            )
+            _, _, primary_model, _ = resolve_openai_compat_config(settings, for_chat=True, provider=provider)
+            fallbacks = resolve_openai_chat_fallback_models(settings)
+            candidate_models: list[str] = []
+            for candidate in [primary_model, *fallbacks]:
+                cleaned = str(candidate or "").strip()
+                if cleaned and cleaned not in candidate_models:
+                    candidate_models.append(cleaned)
+
+            if len(candidate_models) <= 1:
+                target_model = candidate_models[0] if candidate_models else None
+                raw_reply = await async_retry(
+                    lambda: active_client.generate_chat(
+                        system_prompt=runtime_system,
+                        messages=pending_turns,
+                        temperature=settings.AI_CHAT_TEMPERATURE,
+                        max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+                        model=target_model,
+                    ),
+                    retries=1,
+                )
+            else:
+                for idx, candidate_model in enumerate(candidate_models):
+                    is_last = idx == len(candidate_models) - 1
+                    try:
+                        raw_reply = await async_retry(
+                            lambda m=candidate_model: active_client.generate_chat(
+                                system_prompt=runtime_system,
+                                messages=pending_turns,
+                                temperature=settings.AI_CHAT_TEMPERATURE,
+                                max_output_tokens=settings.AI_CHAT_MAX_OUTPUT_TOKENS,
+                                model=m,
+                            ),
+                            retries=1 if is_last else 0,
+                        )
+                        break
+                    except LLMError as exc:
+                        if not is_last and exc.status_code in (404, 429, 503):
+                            logger.warning(
+                                "9Router/OpenAI chat model '%s' failed (status=%s); falling back to next model...",
+                                candidate_model,
+                                exc.status_code,
+                            )
+                            continue
+                        raise
         else:
             raw_fallbacks = getattr(settings, "AI_CHAT_FALLBACK_MODELS", None) or []
             candidate_models: list[str] = []

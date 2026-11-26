@@ -2,13 +2,167 @@
 
 from datetime import date
 from functools import lru_cache
+import ipaddress
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_FILE_PATH = _PROJECT_ROOT / ".env"
+
+DEFAULT_NINEROUTER_BASE_URL = "http://localhost:20128/v1"
+
+
+def normalize_ai_provider(value: Any, *, default: str = "9router") -> str:
+    """Normalize provider aliases ('9router', 'ninerouter', 'openai', 'openrouter', 'gemini')."""
+    if value is None:
+        return default
+    cleaned = str(value).strip().lower()
+    if not cleaned:
+        return default
+    if cleaned in ("9router", "ninerouter", "9-router"):
+        return "9router"
+    if cleaned in ("openai", "openrouter", "gateway"):
+        return "openai"
+    if cleaned in ("gemini", "google", "aistudio"):
+        return "gemini"
+    return cleaned
+
+
+def is_openai_compatible_provider(provider: str | None) -> bool:
+    """Return True for OpenAI-compatible gateway providers ('9router' or 'openai')."""
+    return (provider or "").strip().lower() in ("9router", "openai")
+
+
+def is_9router_base_url(base_url: str | None) -> bool:
+    """Return True when base_url points to a 9Router endpoint (by name or default port 20128)."""
+    if not base_url or not str(base_url).strip():
+        return False
+    raw = str(base_url).strip()
+    if "9router" in raw.lower():
+        return True
+    try:
+        return urlparse(raw).port == 20128
+    except ValueError:
+        return False
+
+
+def is_openrouter_base_url(base_url: str | None) -> bool:
+    """Return True when base_url targets OpenRouter."""
+    return "openrouter.ai" in str(base_url or "").lower()
+
+
+def is_local_base_url(base_url: str | None) -> bool:
+    """Return True when base_url targets localhost / loopback (must bypass outbound proxies)."""
+    if not base_url or not str(base_url).strip():
+        return False
+    try:
+        parsed = urlparse(str(base_url).strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _first_non_empty(*pairs: tuple[str, Any]) -> tuple[str, str]:
+    """Return (stripped_value, field_name) for the first non-empty candidate."""
+    for name, raw in pairs:
+        if raw is None:
+            continue
+        val = raw.strip() if isinstance(raw, str) else str(raw).strip()
+        if val:
+            return val, name
+    return "", ""
+
+
+def resolve_openai_compat_config(
+    settings: Any,
+    *,
+    for_chat: bool = False,
+    provider: str | None = None,
+) -> tuple[str, str, str, str]:
+    """Resolve (base_url, api_key, model, key_source_name) for 9Router or OpenAI-compatible settings."""
+    fallback_provider = getattr(settings, "AI_CHAT_PROVIDER" if for_chat else "AI_PROVIDER", None)
+    eff = (provider or fallback_provider or "9router").strip().lower()
+
+    if for_chat:
+        base_url, _ = _first_non_empty(
+            ("AI_CHAT_NINEROUTER_BASE_URL", getattr(settings, "AI_CHAT_NINEROUTER_BASE_URL", None)),
+            ("AI_CHAT_OPENAI_BASE_URL", getattr(settings, "AI_CHAT_OPENAI_BASE_URL", None)),
+            ("NINEROUTER_BASE_URL", getattr(settings, "NINEROUTER_BASE_URL", None)),
+            ("OPENAI_BASE_URL", getattr(settings, "OPENAI_BASE_URL", None)),
+        )
+        api_key, key_src = _first_non_empty(
+            ("AI_CHAT_NINEROUTER_API_KEY", getattr(settings, "AI_CHAT_NINEROUTER_API_KEY", None)),
+            ("AI_CHAT_OPENAI_API_KEY", getattr(settings, "AI_CHAT_OPENAI_API_KEY", None)),
+            ("NINEROUTER_API_KEY", getattr(settings, "NINEROUTER_API_KEY", None)),
+            ("OPENAI_API_KEY", getattr(settings, "OPENAI_API_KEY", None)),
+        )
+        model, _ = _first_non_empty(
+            ("AI_CHAT_NINEROUTER_MODEL", getattr(settings, "AI_CHAT_NINEROUTER_MODEL", None)),
+            ("AI_CHAT_OPENAI_MODEL", getattr(settings, "AI_CHAT_OPENAI_MODEL", None)),
+            ("NINEROUTER_MODEL", getattr(settings, "NINEROUTER_MODEL", None)),
+            ("OPENAI_MODEL", getattr(settings, "OPENAI_MODEL", None)),
+        )
+    else:
+        base_url, _ = _first_non_empty(
+            ("NINEROUTER_BASE_URL", getattr(settings, "NINEROUTER_BASE_URL", None)),
+            ("OPENAI_BASE_URL", getattr(settings, "OPENAI_BASE_URL", None)),
+        )
+        api_key, key_src = _first_non_empty(
+            ("NINEROUTER_API_KEY", getattr(settings, "NINEROUTER_API_KEY", None)),
+            ("OPENAI_API_KEY", getattr(settings, "OPENAI_API_KEY", None)),
+        )
+        model, _ = _first_non_empty(
+            ("NINEROUTER_MODEL", getattr(settings, "NINEROUTER_MODEL", None)),
+            ("OPENAI_MODEL", getattr(settings, "OPENAI_MODEL", None)),
+        )
+
+    if not base_url and eff == "9router":
+        base_url = DEFAULT_NINEROUTER_BASE_URL
+
+    return base_url, api_key, model, key_src
+
+
+def resolve_openai_chat_fallback_models(settings: Any) -> list[str]:
+    """Return deduplicated fallback model IDs for 9Router / OpenAI-compatible AI chat."""
+    result: list[str] = []
+    for attr in ("AI_CHAT_NINEROUTER_FALLBACK_MODELS", "AI_CHAT_OPENAI_FALLBACK_MODELS"):
+        raw = getattr(settings, attr, None)
+        if not raw:
+            continue
+        items = raw.split(",") if isinstance(raw, str) else list(raw)
+        for item in items:
+            cleaned = str(item).strip()
+            if cleaned and cleaned not in result:
+                result.append(cleaned)
+    return result
+
+
+def format_ai_provider_label(
+    settings: Any,
+    *,
+    for_chat: bool = False,
+    provider: str | None = None,
+) -> str:
+    """Return human-readable provider label ('9Router', 'OpenAI / Gateway', or 'Google Gemini')."""
+    fallback_provider = getattr(settings, "AI_CHAT_PROVIDER" if for_chat else "AI_PROVIDER", None)
+    eff = (provider or fallback_provider or "9router").strip().lower()
+    if eff == "gemini":
+        return "Google Gemini مستقیم" if for_chat else "Google Gemini"
+    base_url, _, _, _ = resolve_openai_compat_config(settings, for_chat=for_chat, provider=eff)
+    if eff == "9router" or is_9router_base_url(base_url):
+        return "9Router"
+    return "OpenAI / Gateway" if for_chat else "OpenAI"
 
 
 class Settings(BaseSettings):
@@ -38,9 +192,9 @@ class Settings(BaseSettings):
     )
 
     # AI Provider Configuration
-    AI_PROVIDER: Literal["gemini", "openai"] = Field(
-        default="gemini",
-        description="Active AI provider: 'gemini' or 'openai'",
+    AI_PROVIDER: Literal["9router", "openai", "gemini"] = Field(
+        default="9router",
+        description="Active AI provider: '9router', 'openai', or 'gemini'",
     )
 
     # Google Gemini Settings
@@ -53,7 +207,21 @@ class Settings(BaseSettings):
         description="Google Gemini model identifier",
     )
 
-    # OpenAI-compatible Settings
+    # 9Router Settings (primary OpenAI-compatible routing proxy)
+    NINEROUTER_BASE_URL: str | None = Field(
+        default=None,
+        description="Base URL for 9Router endpoint (defaults to http://localhost:20128/v1)",
+    )
+    NINEROUTER_API_KEY: str | None = Field(
+        default=None,
+        description="API key for 9Router endpoint",
+    )
+    NINEROUTER_MODEL: str | None = Field(
+        default=None,
+        description="Model or combo name for 9Router endpoint",
+    )
+
+    # OpenAI-compatible Settings (optional fallback / legacy gateway)
     OPENAI_BASE_URL: str | None = Field(
         default=None,
         description="Base URL for OpenAI-compatible endpoint",
@@ -73,29 +241,49 @@ class Settings(BaseSettings):
     )
     AI_REASONING_EFFORT: str | None = Field(
         default=None,
-        description="Optional OpenRouter reasoning effort (e.g. 'none', 'minimal', 'low', 'medium', 'high')",
+        description="Optional reasoning effort for 9Router / OpenAI-compatible gateways (e.g. 'none', 'minimal', 'low', 'medium', 'high')",
     )
 
-    # Interactive AI Chat Settings (Independent Google Gemini / OpenAI Client)
-    AI_CHAT_PROVIDER: Literal["gemini", "openai"] = Field(
-        default="gemini",
-        description="Default AI provider for interactive AI chat: 'gemini' or 'openai'",
+    # Interactive AI Chat Settings (Independent 9Router / OpenAI / Google Gemini Client)
+    AI_CHAT_PROVIDER: Literal["9router", "openai", "gemini"] = Field(
+        default="9router",
+        description="Default AI provider for interactive AI chat: '9router', 'openai', or 'gemini'",
     )
     AI_CHAT_API_KEY: str | None = Field(
         default=None,
         description="Dedicated Google Gemini API key for interactive AI chat (falls back to GEMINI_API_KEY)",
     )
+    AI_CHAT_NINEROUTER_BASE_URL: str | None = Field(
+        default=None,
+        description="Optional 9Router base URL for AI chat (falls back to NINEROUTER_BASE_URL / http://localhost:20128/v1)",
+    )
+    AI_CHAT_NINEROUTER_API_KEY: str | None = Field(
+        default=None,
+        description="Optional 9Router API key for AI chat (falls back to NINEROUTER_API_KEY)",
+    )
+    AI_CHAT_NINEROUTER_MODEL: str | None = Field(
+        default=None,
+        description="Optional 9Router model or combo for AI chat (falls back to NINEROUTER_MODEL)",
+    )
+    AI_CHAT_NINEROUTER_FALLBACK_MODELS: Any = Field(
+        default_factory=list,
+        description="Comma-separated or list of fallback 9Router models used if primary chat model hits 404/429/503",
+    )
     AI_CHAT_OPENAI_BASE_URL: str | None = Field(
         default=None,
-        description="Optional OpenAI-compatible base URL for AI chat (falls back to OPENAI_BASE_URL)",
+        description="Optional OpenAI-compatible base URL for AI chat (falls back to NINEROUTER_BASE_URL / OPENAI_BASE_URL)",
     )
     AI_CHAT_OPENAI_API_KEY: str | None = Field(
         default=None,
-        description="Optional OpenAI-compatible API key for AI chat (falls back to OPENAI_API_KEY)",
+        description="Optional OpenAI-compatible API key for AI chat (falls back to NINEROUTER_API_KEY / OPENAI_API_KEY)",
     )
     AI_CHAT_OPENAI_MODEL: str | None = Field(
         default=None,
-        description="Optional OpenAI-compatible model for AI chat (falls back to OPENAI_MODEL)",
+        description="Optional OpenAI-compatible model for AI chat (falls back to NINEROUTER_MODEL / OPENAI_MODEL)",
+    )
+    AI_CHAT_OPENAI_FALLBACK_MODELS: Any = Field(
+        default_factory=list,
+        description="Comma-separated or list of fallback OpenAI-compatible models used if primary chat model hits 404/429/503",
     )
     AI_CHAT_MODEL: str = Field(
         default="gemini-3.5-flash-lite",
@@ -197,9 +385,9 @@ class Settings(BaseSettings):
         description="Maximum retry attempts on transient rate-limit (429) or OpenRouter in-flight budget (402) errors",
     )
     AI_CHUNK_DELAY_SECONDS: float = Field(
-        default=6.0,
+        default=2.0,
         ge=0.0,
-        description="Delay in seconds after each LLM call before sending the next request to let OpenRouter in-flight holds settle and prevent RPM/TPM bursts",
+        description="Delay in seconds after each LLM call before sending the next request to pace RPM/TPM across 9Router and upstream providers",
     )
 
     # Storage & Paths
@@ -301,10 +489,25 @@ class Settings(BaseSettings):
             return [value]
         return [int(value)]
 
+    @field_validator("AI_PROVIDER", "AI_CHAT_PROVIDER", mode="before")
+    @classmethod
+    def normalize_provider_fields(cls, value: Any) -> str:
+        """Normalize provider aliases ('9router', 'ninerouter', 'openai', 'openrouter', 'gemini')."""
+        return normalize_ai_provider(value, default="9router")
+
     @field_validator(
         "PROXY_URL",
+        "NINEROUTER_BASE_URL",
+        "NINEROUTER_API_KEY",
+        "NINEROUTER_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
         "AI_REASONING_EFFORT",
         "AI_CHAT_API_KEY",
+        "AI_CHAT_NINEROUTER_BASE_URL",
+        "AI_CHAT_NINEROUTER_API_KEY",
+        "AI_CHAT_NINEROUTER_MODEL",
         "AI_CHAT_OPENAI_BASE_URL",
         "AI_CHAT_OPENAI_API_KEY",
         "AI_CHAT_OPENAI_MODEL",
@@ -318,7 +521,12 @@ class Settings(BaseSettings):
             return stripped if stripped else None
         return value
 
-    @field_validator("AI_CHAT_FALLBACK_MODELS", mode="after")
+    @field_validator(
+        "AI_CHAT_FALLBACK_MODELS",
+        "AI_CHAT_NINEROUTER_FALLBACK_MODELS",
+        "AI_CHAT_OPENAI_FALLBACK_MODELS",
+        mode="after",
+    )
     @classmethod
     def parse_str_list(cls, value: Any) -> list[str]:
         """Parse comma-separated strings or lists into clean non-empty model names."""
@@ -337,13 +545,24 @@ class Settings(BaseSettings):
         if self.AI_PROVIDER == "gemini":
             if not self.GEMINI_API_KEY or not self.GEMINI_API_KEY.strip():
                 raise ValueError("GEMINI_API_KEY must be provided when AI_PROVIDER='gemini'")
-        elif self.AI_PROVIDER == "openai":
-            if not self.OPENAI_BASE_URL or not self.OPENAI_BASE_URL.strip():
-                raise ValueError("OPENAI_BASE_URL must be provided when AI_PROVIDER='openai'")
-            if not self.OPENAI_API_KEY or not self.OPENAI_API_KEY.strip():
-                raise ValueError("OPENAI_API_KEY must be provided when AI_PROVIDER='openai'")
-            if not self.OPENAI_MODEL or not self.OPENAI_MODEL.strip():
-                raise ValueError("OPENAI_MODEL must be provided when AI_PROVIDER='openai'")
+        elif is_openai_compatible_provider(self.AI_PROVIDER):
+            base_url, api_key, model, _ = resolve_openai_compat_config(
+                self, for_chat=False, provider=self.AI_PROVIDER
+            )
+            if self.AI_PROVIDER == "9router":
+                if not base_url:
+                    raise ValueError("NINEROUTER_BASE_URL (or OPENAI_BASE_URL) must be provided when AI_PROVIDER='9router'")
+                if not api_key:
+                    raise ValueError("NINEROUTER_API_KEY (or OPENAI_API_KEY) must be provided when AI_PROVIDER='9router'")
+                if not model:
+                    raise ValueError("NINEROUTER_MODEL (or OPENAI_MODEL) must be provided when AI_PROVIDER='9router'")
+            else:
+                if not base_url:
+                    raise ValueError("OPENAI_BASE_URL must be provided when AI_PROVIDER='openai'")
+                if not api_key:
+                    raise ValueError("OPENAI_API_KEY must be provided when AI_PROVIDER='openai'")
+                if not model:
+                    raise ValueError("OPENAI_MODEL must be provided when AI_PROVIDER='openai'")
         return self
 
 

@@ -572,16 +572,18 @@ async def set_ai_chat_custom_prompt(prompt: str | None) -> None:
 
 
 async def get_ai_chat_provider() -> str | None:
-    """Return persisted AI chat provider override ('gemini' or 'openai'), or None if unset."""
+    """Return persisted AI chat provider override ('9router', 'openai', or 'gemini'), or None if unset."""
     val = await get_meta_value("ai_chat_provider")
     if val is None:
         return None
     cleaned = val.strip().lower()
-    return cleaned if cleaned in ("gemini", "openai") else None
+    if cleaned in ("9router", "ninerouter", "9-router"):
+        return "9router"
+    return cleaned if cleaned in ("openai", "gemini") else None
 
 
 async def set_ai_chat_provider(provider: str | None) -> None:
-    """Persist AI chat provider override ('gemini'/'openai') or clear it when None."""
+    """Persist AI chat provider override ('9router'/'openai'/'gemini') or clear it when None."""
     if provider is None:
         conn = get_db()
         lock = get_write_lock()
@@ -591,7 +593,9 @@ async def set_ai_chat_provider(provider: str | None) -> None:
         return
 
     cleaned = provider.strip().lower()
-    if cleaned not in ("gemini", "openai"):
+    if cleaned in ("ninerouter", "9-router"):
+        cleaned = "9router"
+    if cleaned not in ("9router", "openai", "gemini"):
         raise ValueError(f"Unsupported AI chat provider: {provider}")
     await set_meta_value("ai_chat_provider", cleaned)
 

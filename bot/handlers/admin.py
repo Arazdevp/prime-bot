@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.types import Message
-from bot.config import get_settings
+from bot.config import format_ai_provider_label, get_settings, resolve_openai_compat_config
 from bot.database import repository
 from bot.filters import AdminFilter, ForumGroupFilter
 from bot.scheduler.jobs import (
@@ -190,11 +190,13 @@ async def cmd_status(message: Message) -> None:
         f"{target_time.strftime('%H:%M')} (تهران)"
     )
 
-    ai_info = (
-        f"Google Gemini ({escape_html(cfg.GEMINI_MODEL)})"
+    ai_label = format_ai_provider_label(cfg, for_chat=False)
+    model_name = (
+        cfg.GEMINI_MODEL
         if cfg.AI_PROVIDER == "gemini"
-        else f"OpenAI ({escape_html(cfg.OPENAI_MODEL or 'نامشخص')})"
+        else (resolve_openai_compat_config(cfg, for_chat=False, provider=cfg.AI_PROVIDER)[2] or "نامشخص")
     )
+    ai_info = f"{escape_html(ai_label)} ({escape_html(model_name)})"
 
     text = (
         f"⚙️ <b>وضعیت ربات خلاصه‌ساز:</b>\n\n"

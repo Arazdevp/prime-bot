@@ -7,7 +7,7 @@ This file provides architectural context, commands, and operational guidelines f
 ## 1. Project Overview
 
 A production-ready Telegram bot tailored for **Forum Supergroups (topic-enabled groups)**.
-Telegram Bot API does not permit querying past message history, so this bot listens to messages **in real time**, stores them in an async SQLite database, and every night at **00:01 Asia/Tehran** (or via manual admin trigger), summarizes each topic's discussions in fluent **Persian** using LLM providers (Google Gemini or OpenAI-compatible gateways like OpenRouter).
+Telegram Bot API does not permit querying past message history, so this bot listens to messages **in real time**, stores them in an async SQLite database, and every night at **00:01 Asia/Tehran** (or via manual admin trigger), summarizes each topic's discussions in fluent **Persian** using LLM providers (**9Router** as primary gateway, OpenAI-compatible gateways, or Google Gemini).
 
 - **Repository:** [https://github.com/Arazdevp/prime-bot](https://github.com/Arazdevp/prime-bot)
 - **Primary Language:** Python 3.11+
@@ -71,7 +71,7 @@ tg-daily-summarizer/
 │   │   ├── morning_service.py # Daily 05:01 Hills morning greeting job, catch-up & admin test sender
 │   │   ├── timer_service.py # APScheduler DateTrigger scheduling, rehydration, atomic claim & group+DM firing
 │   │   ├── deeptalk_service.py # DeepTalk scheduling, live start/end cards, DM reminders, extensions & rehydration
-│   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (OpenRouter / OpenAI-compatible)
+│   │   ├── llm_client.py    # BaseLLMClient, GeminiClient (REST) & OpenAIClient (9Router / OpenAI-compatible)
 │   │   ├── summarizer.py    # Transcript formatting, map-reduce chunking, Telegram HTML sanitize
 │   │   └── publisher.py     # Safe sender with smart tag-aware splitting, destination override & parse error recovery
 │   ├── scheduler/
@@ -117,19 +117,28 @@ tg-daily-summarizer/
 - `PROXY_URL`: If running in Iran or behind a firewall, set `PROXY_URL` (e.g. `socks5://127.0.0.1:10808` or `http://127.0.0.1:7890`). This is automatically passed to both `AiohttpSession` (via `aiohttp-socks`) and `httpx.AsyncClient`.
 
 ### AI Providers:
+- **9Router (Primary Gateway, local 9Router automatically bypasses `PROXY_URL`):**
+  ```ini
+  AI_PROVIDER=9router
+  NINEROUTER_BASE_URL=http://localhost:20128/v1
+  NINEROUTER_API_KEY=sk-...
+  NINEROUTER_MODEL=antigravity/gemini-2.5-flash
+  AI_CHAT_PROVIDER=9router
+  ```
 - **Google Gemini (Direct API):**
   ```ini
   AI_PROVIDER=gemini
   GEMINI_API_KEY=AIzaSy...
   GEMINI_MODEL=gemini-2.5-flash
   ```
-- **OpenRouter / OpenAI-Compatible:**
+- **Generic OpenAI-Compatible:**
   ```ini
   AI_PROVIDER=openai
-  OPENAI_BASE_URL=https://openrouter.ai/api/v1
-  OPENAI_API_KEY=sk-or-v1-...
-  OPENAI_MODEL=google/gemini-2.5-flash
+  OPENAI_BASE_URL=https://api.openai.com/v1
+  OPENAI_API_KEY=sk-...
+  OPENAI_MODEL=gpt-4o-mini
   ```
+- Use `/manage_ai 9router` (or `/manage_ai gemini`) in Telegram to switch interactive AI chat providers dynamically.
 
 ---
 

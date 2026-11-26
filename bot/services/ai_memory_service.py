@@ -6,7 +6,11 @@ import logging
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
-from bot.config import get_settings
+from bot.config import (
+    get_settings,
+    resolve_openai_chat_fallback_models,
+    resolve_openai_compat_config,
+)
 from bot.database import repository
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.texts.ai_chat_texts import SYSTEM_PROMPT_LEARN_MEMORY
@@ -279,21 +283,46 @@ async def _call_memory_learner(
     """Invoke the active chat LLM provider with low temperature to extract structured JSON memory."""
     settings = get_settings()
     if isinstance(active_client, OpenAIClient):
-        openai_model = (
-            getattr(settings, "AI_CHAT_OPENAI_MODEL", None)
-            or getattr(settings, "OPENAI_MODEL", None)
-            or ""
-        ).strip() or None
-        return await async_retry(
-            lambda: active_client.generate_chat(
-                system_prompt=SYSTEM_PROMPT_LEARN_MEMORY,
-                messages=[{"role": "user", "text": user_content}],
-                temperature=0.3,
-                max_output_tokens=2048,
-                model=openai_model,
-            ),
-            retries=1,
-        )
+        _, _, primary_model, _ = resolve_openai_compat_config(settings, for_chat=True)
+        fallbacks = resolve_openai_chat_fallback_models(settings)
+        candidate_models: list[str] = []
+        for candidate in [primary_model, *fallbacks]:
+            cleaned = str(candidate or "").strip()
+            if cleaned and cleaned not in candidate_models:
+                candidate_models.append(cleaned)
+
+        if len(candidate_models) <= 1:
+            target_model = candidate_models[0] if candidate_models else None
+            return await async_retry(
+                lambda: active_client.generate_chat(
+                    system_prompt=SYSTEM_PROMPT_LEARN_MEMORY,
+                    messages=[{"role": "user", "text": user_content}],
+                    temperature=0.3,
+                    max_output_tokens=2048,
+                    model=target_model,
+                ),
+                retries=1,
+            )
+
+        for idx, candidate_model in enumerate(candidate_models):
+            is_last = idx == len(candidate_models) - 1
+            try:
+                return await async_retry(
+                    lambda m=candidate_model: active_client.generate_chat(
+                        system_prompt=SYSTEM_PROMPT_LEARN_MEMORY,
+                        messages=[{"role": "user", "text": user_content}],
+                        temperature=0.3,
+                        max_output_tokens=2048,
+                        model=m,
+                    ),
+                    retries=1 if is_last else 0,
+                )
+            except LLMError as exc:
+                if not is_last and exc.status_code in (404, 429, 503):
+                    continue
+                raise
+
+        raise LLMError("All AI memory learning model candidates failed", status_code=503, is_retryable=True)
 
     raw_fallbacks = getattr(settings, "AI_CHAT_FALLBACK_MODELS", None) or []
     candidate_models: list[str] = []

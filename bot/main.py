@@ -11,7 +11,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
-from bot.config import get_settings
+from bot.config import format_ai_provider_label, get_settings, resolve_openai_compat_config
 from bot.database.db import close_db, init_db
 from bot.handlers import admin, ai_chat, deeptalk, listener, music, panel, private, timer
 from bot.middlewares.throttle import PrivateThrottleMiddleware
@@ -51,13 +51,18 @@ async def notify_admins_startup(bot: Bot) -> None:
     persian_now = format_persian_date(tehran_now)
     time_str = tehran_now.strftime("%H:%M")
 
-    model_name = settings.GEMINI_MODEL if settings.AI_PROVIDER == "gemini" else (settings.OPENAI_MODEL or "نامشخص")
+    ai_label = format_ai_provider_label(settings, for_chat=False)
+    model_name = (
+        settings.GEMINI_MODEL
+        if settings.AI_PROVIDER == "gemini"
+        else (resolve_openai_compat_config(settings, for_chat=False, provider=settings.AI_PROVIDER)[2] or "نامشخص")
+    )
     text = (
         "🟢 <b>ربات خلاصه‌ساز روزانه تلگرام روشن شد.</b>\n\n"
         f"📅 تاریخ: {persian_now}\n"
         f"⏰ ساعت شروع به کار: {time_str} (تهران)\n"
         f"🌙 ساعت اجرای شبانه: {settings.SUMMARY_TIME_HOUR:02d}:{settings.SUMMARY_TIME_MINUTE:02d}\n"
-        f"🧠 مدل فعال: <code>{escape_html(settings.AI_PROVIDER)} ({escape_html(model_name)})</code>\n"
+        f"🧠 مدل فعال: <code>{escape_html(ai_label)} ({escape_html(model_name)})</code>\n"
         f"📊 وضعیت نظارت: آماده دریافت و پردازش پیام‌ها."
     )
 

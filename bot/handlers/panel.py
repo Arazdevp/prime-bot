@@ -13,7 +13,7 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
-from bot.config import get_settings
+from bot.config import format_ai_provider_label, get_settings, resolve_openai_compat_config
 from bot.database import repository
 from bot.filters import PrivateChatFilter
 from bot.keyboards.panel import (
@@ -156,9 +156,13 @@ def _format_next_nightly_run() -> str:
 def _format_ai_provider() -> str:
     """Return escaped display label for the configured AI provider and model."""
     cfg = get_settings()
-    if cfg.AI_PROVIDER == "gemini":
-        return f"Google Gemini ({escape_html(cfg.GEMINI_MODEL)})"
-    return f"OpenAI ({escape_html(cfg.OPENAI_MODEL or 'نامشخص')})"
+    ai_label = format_ai_provider_label(cfg, for_chat=False)
+    model_name = (
+        cfg.GEMINI_MODEL
+        if cfg.AI_PROVIDER == "gemini"
+        else (resolve_openai_compat_config(cfg, for_chat=False, provider=cfg.AI_PROVIDER)[2] or "نامشخص")
+    )
+    return f"{escape_html(ai_label)} ({escape_html(model_name)})"
 
 
 def _get_db_size_bytes(db_path: str) -> int:
