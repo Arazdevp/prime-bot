@@ -41,6 +41,7 @@ class _ConversationState:
 _ai_chat_enabled_cache: bool = False
 _ai_chat_provider_cache: str | None = None
 _ai_chat_access_mode_cache: str = "public"
+_ai_chat_user_limit_cache: int | None = None
 _bot_id_cache: int | None = None
 _bot_username_cache: str | None = None
 _conversations: dict[tuple[int, int], _ConversationState] = {}
@@ -52,10 +53,11 @@ _user_quota_notice_ts: dict[int, float] = {}
 def reset_ai_chat_state() -> None:
     """Reset in-memory AI chat toggle, provider, access mode, quotas, and conversation caches."""
     global _ai_chat_enabled_cache, _ai_chat_provider_cache, _ai_chat_access_mode_cache
-    global _bot_id_cache, _bot_username_cache
+    global _ai_chat_user_limit_cache, _bot_id_cache, _bot_username_cache
     _ai_chat_enabled_cache = False
     _ai_chat_provider_cache = None
     _ai_chat_access_mode_cache = "public"
+    _ai_chat_user_limit_cache = None
     _bot_id_cache = None
     _bot_username_cache = None
     _conversations.clear()
@@ -85,11 +87,13 @@ def get_effective_ai_chat_access_mode() -> str:
 
 
 async def init_ai_chat_state() -> bool:
-    """Load persisted AI chat toggle, provider, and access mode from SQLite into memory caches."""
+    """Load persisted AI chat toggle, provider, access mode, and user quota limit from SQLite."""
     global _ai_chat_enabled_cache, _ai_chat_provider_cache, _ai_chat_access_mode_cache
+    global _ai_chat_user_limit_cache
     _ai_chat_enabled_cache = await repository.get_ai_chat_enabled()
     _ai_chat_provider_cache = await repository.get_ai_chat_provider()
     _ai_chat_access_mode_cache = await repository.get_ai_chat_access_mode()
+    _ai_chat_user_limit_cache = await repository.get_ai_chat_user_limit()
     return _ai_chat_enabled_cache
 
 
@@ -123,20 +127,71 @@ async def set_ai_chat_access_mode_state(mode: str) -> str:
     return cleaned
 
 
+def get_effective_ai_chat_user_limit() -> int:
+    """Return active regular-user AI chat limit (-1=unlimited, 0=closed, >=1=per-window cap)."""
+    if _ai_chat_user_limit_cache is not None:
+        return _ai_chat_user_limit_cache
+    return max(1, int(getattr(get_settings(), "AI_CHAT_USER_LIMIT_COUNT", 20)))
+
+
+async def set_ai_chat_user_limit_state(limit: int | None) -> int:
+    """Persist regular-user AI chat quota limit (-1=unlimited, 0=closed, 1..10000) and update cache."""
+    global _ai_chat_user_limit_cache
+    if limit is not None:
+        parsed = int(limit)
+        if not (parsed == -1 or 0 <= parsed <= repository.AI_CHAT_USER_LIMIT_MAX):
+            raise ValueError(f"Unsupported AI chat user limit: {limit}")
+        limit = parsed
+    await repository.set_ai_chat_user_limit(limit)
+    _ai_chat_user_limit_cache = limit
+    _user_quota_notice_ts.clear()
+    return get_effective_ai_chat_user_limit()
+
+
+def count_active_quota_users(*, now: float | None = None) -> int:
+    """Prune expired quota timestamps and return count of regular users with active usage."""
+    settings = get_settings()
+    window_sec = max(60, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)))
+    current = now if now is not None else time.monotonic()
+    cutoff = current - window_sec
+    stale_users: list[int] = []
+    for uid, dq in _user_quota_timestamps.items():
+        while dq and dq[0] <= cutoff:
+            dq.popleft()
+        if not dq:
+            stale_users.append(uid)
+    for uid in stale_users:
+        _user_quota_timestamps.pop(uid, None)
+    return len(_user_quota_timestamps)
+
+
+def reset_all_user_quotas(*, now: float | None = None) -> int:
+    """Clear all non-manager AI chat sliding-window quotas and notice cooldowns."""
+    active_count = count_active_quota_users(now=now)
+    _user_quota_timestamps.clear()
+    _user_quota_notice_ts.clear()
+    return active_count
+
+
 def check_and_consume_user_quota(
     user_id: int,
     *,
     now: float | None = None,
 ) -> tuple[bool, int, int]:
-    """Enforce sliding-window AI chat quota (20 msgs / 2h) for non-managers.
+    """Enforce sliding-window AI chat quota for non-managers.
 
-    Returns (allowed, remaining_count_or_-1_for_unlimited, wait_minutes_if_blocked).
+    Returns (allowed, remaining_count_or_-1_for_unlimited, wait_minutes_if_blocked_or_-1_if_closed).
     """
     if is_global_admin(user_id):
         return True, -1, 0
 
+    limit_count = get_effective_ai_chat_user_limit()
+    if limit_count < 0:
+        return True, -1, 0
+    if limit_count == 0:
+        return False, 0, -1
+
     settings = get_settings()
-    limit_count = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20)))
     window_sec = max(60, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)))
     current = now if now is not None else time.monotonic()
 
@@ -160,7 +215,7 @@ def check_and_consume_user_quota(
 
 def refund_user_quota(user_id: int) -> None:
     """Refund the most recently consumed quota slot when an LLM reply fails."""
-    if is_global_admin(user_id):
+    if is_global_admin(user_id) or get_effective_ai_chat_user_limit() <= 0:
         return
     dq = _user_quota_timestamps.get(user_id)
     if dq:

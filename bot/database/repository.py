@@ -616,6 +616,39 @@ async def set_ai_chat_access_mode(mode: str) -> None:
     await set_meta_value("ai_chat_access_mode", cleaned)
 
 
+AI_CHAT_USER_LIMIT_MAX = 10000
+
+
+async def get_ai_chat_user_limit() -> int | None:
+    """Return persisted regular-user AI chat quota limit (-1=unlimited, 0=closed, 1..10000), or None."""
+    val = await get_meta_value("ai_chat_user_limit")
+    if val is None:
+        return None
+    try:
+        parsed = int(val.strip())
+    except (ValueError, AttributeError):
+        return None
+    if parsed == -1 or (0 <= parsed <= AI_CHAT_USER_LIMIT_MAX):
+        return parsed
+    return None
+
+
+async def set_ai_chat_user_limit(limit: int | None) -> None:
+    """Persist regular-user AI chat quota limit (-1=unlimited, 0=closed, 1..10000) or clear if None."""
+    if limit is None:
+        conn = get_db()
+        lock = get_write_lock()
+        async with lock:
+            await conn.execute("DELETE FROM meta WHERE key = ?;", ("ai_chat_user_limit",))
+            await conn.commit()
+        return
+
+    parsed = int(limit)
+    if not (parsed == -1 or 0 <= parsed <= AI_CHAT_USER_LIMIT_MAX):
+        raise ValueError(f"AI chat user limit out of range: {limit}")
+    await set_meta_value("ai_chat_user_limit", str(parsed))
+
+
 # ---------------- Summaries Table Operations ----------------
 
 
@@ -2587,6 +2620,32 @@ async def list_ai_member_profiles(
                 break
 
     return ordered
+
+
+async def list_ai_member_profiles_page(
+    chat_id: int,
+    *,
+    limit: int = 5,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Return a deterministic page of learned member profiles ordered by activity."""
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 50))
+    safe_offset = max(0, int(offset))
+    cursor = await conn.execute(
+        """
+        SELECT chat_id, user_id, display_name, personality_summary,
+               speaking_style, interests_and_topics, notable_facts,
+               message_count, last_seen_at, updated_at
+        FROM ai_member_profiles
+        WHERE chat_id = ?
+        ORDER BY message_count DESC, updated_at DESC, user_id ASC
+        LIMIT ? OFFSET ?;
+        """,
+        (chat_id, safe_limit, safe_offset),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def count_ai_member_profiles(chat_id: int) -> int:

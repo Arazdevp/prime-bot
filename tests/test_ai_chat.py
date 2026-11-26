@@ -17,6 +17,7 @@ from bot.handlers.ai_chat import (
     cmd_manage_ai,
     handle_ai_chat_message,
     on_custom_prompt_input,
+    on_custom_quota_input,
     on_manage_ai_callback,
     render_manage_ai_panel,
 )
@@ -25,16 +26,20 @@ from bot.services.ai_chat_service import (
     check_and_consume_user_quota,
     clear_conversation_history,
     count_active_conversations,
+    count_active_quota_users,
     generate_ai_chat_reply,
     get_effective_ai_chat_access_mode,
     get_effective_ai_chat_provider,
+    get_effective_ai_chat_user_limit,
     init_ai_chat_state,
     is_ai_chat_enabled_cached,
     refund_user_quota,
     reset_ai_chat_state,
+    reset_all_user_quotas,
     set_ai_bot_identity,
     set_ai_chat_access_mode_state,
     set_ai_chat_state,
+    set_ai_chat_user_limit_state,
     should_send_quota_notice,
 )
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient
@@ -222,8 +227,28 @@ async def test_ai_chat_db_persistence_and_cache_rehydration(tmp_path: Path) -> N
 
 def test_ai_chat_callback_data_under_64_bytes() -> None:
     """Ensure all AiChatCB packed strings fit Telegram's 64-byte callback_data limit."""
-    for action in ("toggle", "prov", "acc", "clear", "refresh", "viewp", "setp", "resetp", "learn", "mem", "clrmem", "cancel", "close"):
-        packed = AiChatCB(action=action, owner_id=999999999999).pack()
+    for action in (
+        "toggle",
+        "prov",
+        "acc",
+        "quota",
+        "qset",
+        "qreset",
+        "qcustom",
+        "qcancel",
+        "clear",
+        "refresh",
+        "viewp",
+        "setp",
+        "resetp",
+        "learn",
+        "mem",
+        "clrmem",
+        "noop",
+        "cancel",
+        "close",
+    ):
+        packed = AiChatCB(action=action, owner_id=999999999999, arg="10000", page=999).pack()
         assert len(packed.encode("utf-8")) <= 64
 
 
@@ -761,6 +786,111 @@ async def test_ai_chat_non_admin_rate_limit_20_per_2_hours_and_refund(tmp_path: 
             # Slot was refunded, so remaining is still 20 (next call has remaining == 19)
             ok44, rem44, _ = check_and_consume_user_quota(44444)
             assert ok44 is True and rem44 == 19
+    finally:
+        await close_db()
+        reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_dynamic_quota_set_reset_close_unlimited_and_fsm(tmp_path: Path) -> None:
+    """Verify dynamic quota limit persistence, presets, custom FSM input, reset all, close (0), and unlimited (-1)."""
+    reset_ai_chat_state()
+    await init_db(str(tmp_path / "ai_dynamic_quota.db"))
+    cfg = _fake_settings(admin_ids=[11111])
+    try:
+        bot = _make_bot(bot_id=999999, bot_username="PrimeTestBot")
+        set_ai_bot_identity(999999, "PrimeTestBot")
+        fsm = _make_fsm()
+
+        with patch("bot.services.access.get_settings", return_value=cfg), patch(
+            "bot.services.ai_chat_service.get_settings", return_value=cfg
+        ), patch("bot.handlers.ai_chat.get_settings", return_value=cfg):
+            # 1. Default limit from settings (20), then DB persistence & cache rehydration for 50
+            assert get_effective_ai_chat_user_limit() == 20
+            await set_ai_chat_user_limit_state(50)
+            assert get_effective_ai_chat_user_limit() == 50
+            assert await repository.get_ai_chat_user_limit() == 50
+
+            reset_ai_chat_state()
+            assert get_effective_ai_chat_user_limit() == 20
+            await init_ai_chat_state()
+            assert get_effective_ai_chat_user_limit() == 50
+
+            # 2. Regular user can consume 50 slots; 51st is blocked
+            for _ in range(50):
+                assert check_and_consume_user_quota(22222)[0] is True
+            assert check_and_consume_user_quota(22222)[0] is False
+            assert count_active_quota_users() == 1
+
+            # 3. Reset all quotas via callback 'qreset' -> unblocks user immediately
+            cb = MagicMock(spec=CallbackQuery)
+            cb.from_user = SimpleNamespace(id=11111)
+            cb.answer = AsyncMock()
+            cb.message = MagicMock(spec=Message)
+            cb.message.chat = SimpleNamespace(id=11111, type="private")
+            cb.message.message_id = 301
+            cb.message.edit_text = AsyncMock()
+
+            await on_manage_ai_callback(cb, AiChatCB(action="qreset", owner_id=11111), bot, fsm)
+            reset_toast = cb.answer.call_args.kwargs.get("text") or cb.answer.call_args.args[0]
+            assert "ریست شد" in reset_toast
+            assert count_active_quota_users() == 0
+            assert check_and_consume_user_quota(22222)[0] is True
+
+            # 4. Callback 'qset' arg='0' closes regular-user quota, while manager remains unlimited
+            await on_manage_ai_callback(cb, AiChatCB(action="qset", owner_id=11111, arg="0"), bot, fsm)
+            assert get_effective_ai_chat_user_limit() == 0
+            ok_closed, rem_closed, wait_closed = check_and_consume_user_quota(33333)
+            assert (ok_closed, rem_closed, wait_closed) == (False, 0, -1)
+            assert check_and_consume_user_quota(11111) == (True, -1, 0)
+
+            closed_msg = _make_message(
+                user_id=33333,
+                text="@PrimeTestBot سلام",
+                chat_id=-100555,
+                chat_type="supergroup",
+                thread_id=3,
+            )
+            with patch("bot.handlers.ai_chat.generate_ai_chat_reply") as mock_gen:
+                await handle_ai_chat_message(closed_msg, bot)
+                mock_gen.assert_not_called()
+            assert "بسته شده" in bot.send_message.call_args.kwargs["text"]
+
+            # 5. Shorthand '/manage_ai quota ۵۰' and '/manage_ai quota reset'
+            cmd_set = _make_message(user_id=11111, text="/manage_ai quota ۵۰", chat_type="private")
+            await cmd_manage_ai(cmd_set, bot, fsm)
+            assert get_effective_ai_chat_user_limit() == 50
+            assert "50 پیام" in cmd_set.answer.call_args.kwargs["text"]
+
+            check_and_consume_user_quota(44444)
+            cmd_reset = _make_message(user_id=11111, text="/manage_ai quota reset", chat_type="private")
+            await cmd_manage_ai(cmd_reset, bot, fsm)
+            assert count_active_quota_users() == 0
+
+            # 6. Custom FSM input: invalid -> warning, valid Persian digits -> sets limit, '/cancel' -> clears state
+            await on_manage_ai_callback(cb, AiChatCB(action="qcustom", owner_id=11111), bot, fsm)
+            fsm.set_state.assert_awaited_with(AiChatStates.waiting_quota_limit)
+
+            bad_msg = _make_message(user_id=11111, text="abc", chat_type="private")
+            await on_custom_quota_input(bad_msg, bot, fsm)
+            assert "بین ۱ تا ۱۰۰۰۰" in bad_msg.answer.call_args.kwargs["text"]
+            assert get_effective_ai_chat_user_limit() == 50
+
+            good_msg = _make_message(user_id=11111, text="۷۵", chat_type="private")
+            await on_custom_quota_input(good_msg, bot, fsm)
+            assert get_effective_ai_chat_user_limit() == 75
+            fsm.clear.assert_awaited()
+
+            cancel_msg = _make_message(user_id=11111, text="/cancel", chat_type="private")
+            await on_custom_quota_input(cancel_msg, bot, fsm)
+            assert "لغو شد" in cancel_msg.answer.call_args.kwargs["text"]
+
+            # 7. Unlimited mode (-1) via callback allows unlimited messages
+            await on_manage_ai_callback(cb, AiChatCB(action="qset", owner_id=11111, arg="-1"), bot, fsm)
+            assert get_effective_ai_chat_user_limit() == -1
+            for _ in range(120):
+                assert check_and_consume_user_quota(55555) == (True, -1, 0)
+            assert reset_all_user_quotas() == 0
     finally:
         await close_db()
         reset_ai_chat_state()

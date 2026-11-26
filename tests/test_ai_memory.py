@@ -458,3 +458,110 @@ async def test_maybe_learn_before_purge_and_manage_ai_memory_commands(tmp_path: 
     finally:
         await close_db()
         reset_ai_chat_state()
+
+
+@pytest.mark.asyncio
+async def test_ai_memory_paginated_member_profiles_view(tmp_path: Path) -> None:
+    """Verify /manage_ai memory paginates ALL learned member profiles with full traits and safe message size."""
+    reset_ai_chat_state()
+    await init_db(str(tmp_path / "ai_mem_paginated.db"))
+    cfg = _fake_settings(admin_ids=[11111])
+    try:
+        chat_id = -100777
+        hub_tid = 3
+        await repository.upsert_known_group(chat_id, "Prime Paginated Group")
+        await repository.upsert_topic(chat_id, hub_tid, "The Hub | گفتگوی آزاد", is_active=1)
+        await repository.upsert_ai_memory_source(chat_id, hub_tid, "The Hub | گفتگوی آزاد")
+        await repository.upsert_ai_group_memory(
+            chat_id=chat_id,
+            group_title="Prime Paginated Group",
+            culture_summary="فرهنگ حمایتی و شوخ‌طبع.",
+            inside_jokes="شوخی تایمر سحر",
+            ongoing_topics="تولید محتوای یوتیوب",
+        )
+
+        # Insert 13 members (more than old 12-member cap) with all personality fields
+        for i in range(1, 14):
+            await repository.upsert_ai_member_profile(
+                chat_id=chat_id,
+                user_id=1000 + i,
+                display_name=f"عضو شماره {i}",
+                personality_summary=f"خلاصه شخصیت عضو {i} با روحیه پیگیر و خلاق " + ("توضیح اضافه " * 12),
+                speaking_style=f"لحن صمیمی و باحال {i}",
+                interests_and_topics=f"تدوین، یوتیوب و طراحی {i}",
+                notable_facts=f"روی پروژه {i} کار می‌کند",
+                add_message_count=100 - i,
+            )
+
+        bot = _make_bot()
+        fsm = _make_fsm()
+        cb = MagicMock(spec=CallbackQuery)
+        cb.from_user = SimpleNamespace(id=11111)
+        cb.answer = AsyncMock()
+        cb.message = MagicMock(spec=Message)
+        cb.message.chat = SimpleNamespace(id=chat_id, type="supergroup")
+        cb.message.message_id = 555
+        cb.message.edit_text = AsyncMock()
+
+        with patch("bot.services.access.get_settings", return_value=cfg), patch(
+            "bot.handlers.ai_chat.get_settings", return_value=cfg
+        ), patch("bot.services.ai_chat_service.get_settings", return_value=cfg), patch(
+            "bot.services.ai_memory_service.get_settings", return_value=cfg
+        ):
+            # Page 0: group culture + members 1..5, Next button, no Prev button
+            await on_manage_ai_callback(cb, AiChatCB(action="mem", owner_id=11111, page=0), bot, fsm)
+            p0_kwargs = cb.message.edit_text.call_args.kwargs
+            p0_text = p0_kwargs["text"]
+            p0_buttons = [btn for row in p0_kwargs["reply_markup"].inline_keyboard for btn in row]
+            assert len(p0_text) <= 4096
+            assert "13 نفر" in p0_text
+            assert "صفحه 1/3" in p0_text
+            assert "فرهنگ حمایتی" in p0_text
+            assert "عضو شماره 1" in p0_text
+            assert "عضو شماره 5" in p0_text
+            assert "عضو شماره 6" not in p0_text
+            assert "لحن صمیمی و باحال 1" in p0_text
+            assert "تدوین، یوتیوب و طراحی 1" in p0_text
+            assert "روی پروژه 1 کار می‌کند" in p0_text
+            assert any(b.text == "بعدی ➡️" for b in p0_buttons)
+            assert not any("قبلی" in b.text for b in p0_buttons)
+
+            # Page 1: members 6..10, both Prev and Next buttons
+            await on_manage_ai_callback(cb, AiChatCB(action="mem", owner_id=11111, page=1), bot, fsm)
+            p1_kwargs = cb.message.edit_text.call_args.kwargs
+            p1_text = p1_kwargs["text"]
+            p1_buttons = [btn for row in p1_kwargs["reply_markup"].inline_keyboard for btn in row]
+            assert len(p1_text) <= 4096
+            assert "صفحه 2/3" in p1_text
+            assert "عضو شماره 6" in p1_text
+            assert "عضو شماره 10" in p1_text
+            assert "عضو شماره 5" not in p1_text
+            assert "عضو شماره 11" not in p1_text
+            assert any("قبلی" in b.text for b in p1_buttons)
+            assert any("بعدی" in b.text for b in p1_buttons)
+
+            # Page 2: members 11..13 (beyond old 12-member cap!), Prev button, no Next button
+            await on_manage_ai_callback(cb, AiChatCB(action="mem", owner_id=11111, page=2), bot, fsm)
+            p2_kwargs = cb.message.edit_text.call_args.kwargs
+            p2_text = p2_kwargs["text"]
+            p2_buttons = [btn for row in p2_kwargs["reply_markup"].inline_keyboard for btn in row]
+            assert len(p2_text) <= 4096
+            assert "صفحه 3/3" in p2_text
+            assert "عضو شماره 11" in p2_text
+            assert "عضو شماره 13" in p2_text
+            assert any("قبلی" in b.text for b in p2_buttons)
+            assert not any("بعدی" in b.text for b in p2_buttons)
+
+            # Out-of-range page clamps safely to last page (page 3/3)
+            await on_manage_ai_callback(cb, AiChatCB(action="mem", owner_id=11111, page=99), bot, fsm)
+            assert "صفحه 3/3" in cb.message.edit_text.call_args.kwargs["text"]
+            assert "عضو شماره 13" in cb.message.edit_text.call_args.kwargs["text"]
+
+            # Shorthand '/manage_ai memory 2' opens 1-based page 2 (0-based index 1)
+            cmd_mem2 = _make_group_msg(11111, "/manage_ai memory 2", chat_id=chat_id, thread_id=hub_tid)
+            await cmd_manage_ai(cmd_mem2, bot, fsm)
+            assert "صفحه 2/3" in bot.send_message.call_args.kwargs["text"]
+            assert "عضو شماره 6" in bot.send_message.call_args.kwargs["text"]
+    finally:
+        await close_db()
+        reset_ai_chat_state()

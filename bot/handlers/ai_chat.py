@@ -24,6 +24,8 @@ from bot.keyboards.ai_chat import (
     build_ai_memory_view_kb,
     build_ai_prompt_cancel_kb,
     build_ai_prompt_view_kb,
+    build_ai_quota_cancel_kb,
+    build_ai_quota_kb,
     build_manage_ai_kb,
 )
 from bot.services.access import is_global_admin
@@ -31,16 +33,20 @@ from bot.services.ai_chat_service import (
     check_and_consume_user_quota,
     clear_conversation_history,
     count_active_conversations,
+    count_active_quota_users,
     ensure_ai_bot_identity,
     generate_ai_chat_reply,
     get_effective_ai_chat_access_mode,
     get_effective_ai_chat_provider,
+    get_effective_ai_chat_user_limit,
     is_ai_chat_enabled_cached,
     is_message_addressing_bot,
     refund_user_quota,
+    reset_all_user_quotas,
     set_ai_chat_access_mode_state,
     set_ai_chat_provider_state,
     set_ai_chat_state,
+    set_ai_chat_user_limit_state,
     should_send_quota_notice,
     strip_bot_mention,
 )
@@ -63,39 +69,92 @@ logger = logging.getLogger(__name__)
 router = Router(name="ai_chat_router")
 
 FSM_PROMPT_TTL_SECONDS = 180.0
+AI_MEMORY_PAGE_SIZE = 5
+_DIGIT_TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
 class AiChatStates(StatesGroup):
-    """FSM state for entering a custom system prompt in /manage_ai."""
+    """FSM states for entering custom system prompt or quota limit in /manage_ai."""
 
     waiting_custom_prompt = State()
+    waiting_quota_limit = State()
 
 
-def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, str | None]:
-    """Parse optional shorthand argument from '/manage_ai on|off|9router|openai|gemini|bind|learn|memory'."""
+def _parse_quota_value(raw: str | None) -> int | None:
+    """Parse regular-user quota limit ('0'/'off'->0, '-1'/'unlimited'->-1, '1..10000'->int)."""
+    if not raw:
+        return None
+    cleaned = raw.translate(_DIGIT_TRANS).strip().lower()
+    if not cleaned:
+        return None
+    if cleaned in ("0", "off", "close", "closed", "disable", "lock", "locked", "بسته", "بستن", "قفل", "خاموش"):
+        return 0
+    if cleaned in ("-1", "unlimited", "unlim", "inf", "open", "نامحدود", "باز", "بدون محدودیت"):
+        return -1
+    if cleaned.isdigit():
+        val = int(cleaned)
+        if 1 <= val <= repository.AI_CHAT_USER_LIMIT_MAX:
+            return val
+    return None
+
+
+def _format_quota_summary(limit_count: int, window_hours: int) -> str:
+    """Format human-readable Persian summary of the active regular-user quota."""
+    if limit_count < 0:
+        return "♾️ نامحدود"
+    if limit_count == 0:
+        return "🔒 سهمیه بسته (۰ پیام)"
+    return f"{limit_count} پیام در {window_hours} ساعت"
+
+
+def _clip_text(value: str | None, max_len: int) -> str:
+    """Normalize whitespace and trim text to max_len characters."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, str | None, str]:
+    """Parse optional shorthand arguments from '/manage_ai ...'."""
     if not raw_text:
-        return None, None, None
+        return None, None, None, ""
     parts = raw_text.strip().split(maxsplit=1)
     if len(parts) < 2:
-        return None, None, None
-    arg = parts[1].strip().lower()
-    if arg in ("on", "enable", "enabled", "1", "true", "روشن", "فعال"):
-        return True, None, None
-    if arg in ("off", "disable", "disabled", "0", "false", "خاموش", "غیرفعال"):
-        return False, None, None
-    if arg in ("9router", "ninerouter", "9-router"):
-        return None, "9router", None
-    if arg in ("openai", "openrouter", "gateway"):
-        return None, "openai", None
-    if arg in ("gemini", "google", "aistudio"):
-        return None, "gemini", None
-    if arg in ("bind", "اتصال"):
-        return None, None, "bind"
-    if arg in ("learn", "یادگیری"):
-        return None, None, "learn"
-    if arg in ("memory", "mem", "حافظه"):
-        return None, None, "memory"
-    return None, None, None
+        return None, None, None, ""
+    arg_full = parts[1].strip()
+    tokens = arg_full.split(maxsplit=1)
+    cmd = tokens[0].strip().lower()
+    rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+    if cmd in ("on", "enable", "enabled", "1", "true", "روشن", "فعال") and not rest:
+        return True, None, None, ""
+    if cmd in ("off", "disable", "disabled", "0", "false", "خاموش", "غیرفعال") and not rest:
+        return False, None, None, ""
+    if cmd in ("9router", "ninerouter", "9-router"):
+        return None, "9router", None, ""
+    if cmd in ("openai", "openrouter", "gateway"):
+        return None, "openai", None, ""
+    if cmd in ("gemini", "google", "aistudio"):
+        return None, "gemini", None, ""
+    if cmd in ("bind", "اتصال"):
+        return None, None, "bind", ""
+    if cmd in ("learn", "یادگیری"):
+        return None, None, "learn", ""
+    if cmd in ("memory", "mem", "حافظه"):
+        page_idx = 0
+        if rest:
+            norm_page = rest.translate(_DIGIT_TRANS).strip()
+            if norm_page.isdigit():
+                page_idx = max(0, int(norm_page) - 1)
+        return None, None, "memory", str(page_idx)
+    if cmd in ("quota", "limit", "سهمیه"):
+        if not rest:
+            return None, None, "quota", ""
+        if rest.lower() in ("reset", "clear", "ریست", "پاک"):
+            return None, None, "quota", "reset"
+        return None, None, "quota", rest
+    return None, None, None, ""
 
 
 async def _send_in_context(
@@ -203,8 +262,9 @@ async def _render_memory_overview(
     owner_id: int,
     chat_id: int | None = None,
     chat_type: str = "private",
+    page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Render learned group culture and member personalities overview."""
+    """Render paginated learned group culture and full member personalities overview."""
     mem_chat_id, group_title = await resolve_memory_group(chat_id, chat_type)
     if mem_chat_id is None:
         return (
@@ -214,42 +274,116 @@ async def _render_memory_overview(
 
     source = await ensure_memory_source_for_group(mem_chat_id)
     group_mem = await repository.get_ai_group_memory(mem_chat_id)
-    profiles = await repository.list_ai_member_profiles(mem_chat_id, limit=12)
     total_profiles = await repository.count_ai_member_profiles(mem_chat_id)
+    total_pages = max(1, (total_profiles + AI_MEMORY_PAGE_SIZE - 1) // AI_MEMORY_PAGE_SIZE)
+    safe_page = max(0, min(int(page), total_pages - 1))
+    profiles = await repository.list_ai_member_profiles_page(
+        mem_chat_id,
+        limit=AI_MEMORY_PAGE_SIZE,
+        offset=safe_page * AI_MEMORY_PAGE_SIZE,
+    )
 
-    lines = [f"👥 <b>حافظه بلندمدت گروه {escape_html(group_title or str(mem_chat_id))}</b>\n"]
-    if source:
-        src_name = source.get("topic_name") or f"تاپیک {source['thread_id']}"
-        lines.append(f"📚 تاپیک یادگیری: <b>{escape_html(src_name)}</b>")
-    else:
-        lines.append("📚 تاپیک یادگیری: <i>تنظیم نشده (/manage_ai bind داخل گفتگوی آزاد)</i>")
+    def _build_text(
+        summary_cap: int,
+        style_cap: int,
+        interests_cap: int,
+        facts_cap: int,
+    ) -> str:
+        group_label = escape_html(group_title or str(mem_chat_id))
+        if safe_page == 0:
+            lines = [f"👥 <b>حافظه بلندمدت گروه {group_label}</b>\n"]
+            if source:
+                src_name = source.get("topic_name") or f"تاپیک {source['thread_id']}"
+                lines.append(f"📚 تاپیک یادگیری: <b>{escape_html(src_name)}</b>")
+            else:
+                lines.append("📚 تاپیک یادگیری: <i>تنظیم نشده (/manage_ai bind داخل گفتگوی آزاد)</i>")
 
-    if group_mem and (
-        group_mem.get("culture_summary") or group_mem.get("inside_jokes") or group_mem.get("ongoing_topics")
-    ):
-        lines.append("\n🌐 <b>شناخت از فضای گروه:</b>")
-        if group_mem.get("culture_summary"):
-            lines.append(f"• حال‌وهوا: {escape_html(group_mem['culture_summary'])}")
-        if group_mem.get("inside_jokes"):
-            lines.append(f"• شوخی‌ها و اصطلاحات: {escape_html(group_mem['inside_jokes'])}")
-        if group_mem.get("ongoing_topics"):
-            lines.append(f"• بحث‌های فعلی: {escape_html(group_mem['ongoing_topics'])}")
+            if group_mem and (
+                group_mem.get("culture_summary")
+                or group_mem.get("inside_jokes")
+                or group_mem.get("ongoing_topics")
+            ):
+                lines.append("\n🌐 <b>شناخت از فضای گروه:</b>")
+                if group_mem.get("culture_summary"):
+                    lines.append(f"• حال‌وهوا: {escape_html(_clip_text(group_mem['culture_summary'], 220))}")
+                if group_mem.get("inside_jokes"):
+                    lines.append(f"• شوخی‌ها و اصطلاحات: {escape_html(_clip_text(group_mem['inside_jokes'], 220))}")
+                if group_mem.get("ongoing_topics"):
+                    lines.append(f"• بحث‌های فعلی: {escape_html(_clip_text(group_mem['ongoing_topics'], 220))}")
+        else:
+            lines = [f"👥 <b>حافظه بلندمدت گروه {group_label}</b>"]
 
-    if profiles:
-        lines.append(f"\n🧑 <b>اعضای شناخته‌شده ({total_profiles} نفر):</b>")
-        for prof in profiles:
-            name = escape_html(str(prof.get("display_name") or "عضو"))
-            summary = escape_html(str(prof.get("personality_summary") or ""))
-            entry = f"• <b>{name}</b>: {summary}"
-            if len("\n".join(lines)) + len(entry) + 2 > 3600:
-                lines.append("<i>… و اعضای بیشتر در دیتابیس</i>")
-                break
-            lines.append(entry)
-    else:
-        lines.append("\n<i>هنوز پروفایلی یادگیری نشده؛ دکمه «🧠 یادگیری الان» رو بزن.</i>")
+        if profiles:
+            start_idx = safe_page * AI_MEMORY_PAGE_SIZE + 1
+            end_idx = start_idx + len(profiles) - 1
+            lines.append(
+                f"\n🧑 <b>اعضای شناخته‌شده ({total_profiles} نفر — نمایش {start_idx} تا {end_idx} | صفحه {safe_page + 1}/{total_pages}):</b>"
+            )
+            for idx_offset, prof in enumerate(profiles):
+                num = start_idx + idx_offset
+                name = escape_html(_clip_text(prof.get("display_name") or "عضو", 50))
+                msg_count = int(prof.get("message_count") or 0)
+                lines.append(f"\n{num}. <b>{name}</b> ({msg_count} پیام)")
 
-    has_memory = bool(profiles or group_mem)
-    return "\n".join(lines), build_ai_memory_view_kb(owner_id=owner_id, has_memory=has_memory)
+                summary = _clip_text(prof.get("personality_summary"), summary_cap)
+                style = _clip_text(prof.get("speaking_style"), style_cap)
+                interests = _clip_text(prof.get("interests_and_topics"), interests_cap)
+                facts = _clip_text(prof.get("notable_facts"), facts_cap)
+
+                if summary:
+                    lines.append(f"   • شخصیت: {escape_html(summary)}")
+                if style:
+                    lines.append(f"   • لحن: {escape_html(style)}")
+                if interests:
+                    lines.append(f"   • علایق: {escape_html(interests)}")
+                if facts:
+                    lines.append(f"   • نکات: {escape_html(facts)}")
+        else:
+            lines.append("\n<i>هنوز پروفایلی یادگیری نشده؛ دکمه «🧠 یادگیری الان» رو بزن.</i>")
+
+        return "\n".join(lines)
+
+    rendered = _build_text(260, 120, 140, 140)
+    if len(rendered) > 3950:
+        rendered = _build_text(140, 70, 80, 80)
+    if len(rendered) > 4000:
+        rendered = rendered[:3990].rstrip() + "…"
+
+    has_memory = bool(total_profiles > 0 or group_mem)
+    return rendered, build_ai_memory_view_kb(
+        owner_id=owner_id,
+        has_memory=has_memory,
+        page=safe_page,
+        total_pages=total_pages,
+    )
+
+
+async def _render_quota_panel(owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Render regular-user AI chat quota management view and inline controls."""
+    settings = get_settings()
+    access_mode = get_effective_ai_chat_access_mode()
+    limit_count = get_effective_ai_chat_user_limit()
+    window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+    active_users = count_active_quota_users()
+
+    access_status = (
+        "👥 <b>باز برای همه اعضای گفتگوی آزاد</b>"
+        if access_mode == "public"
+        else "🔒 <b>محدود به مدیر ربات</b> (فعلاً کاربران معمولی دسترسی ندارند)"
+    )
+    quota_status = _format_quota_summary(limit_count, window_hours)
+
+    text = (
+        "📊 <b>مدیریت سهمیه چت کاربران معمولی</b>\n\n"
+        f"• سطح دسترسی گروه: {access_status}\n"
+        f"• سهمیه فعلی کاربران معمولی: <b>{quota_status}</b>\n"
+        f"• کاربران دارای مصرف فعال در پنجره اخیر: <b>{active_users}</b> نفر\n"
+        "• سهمیه مدیران ربات: ♾️ <b>همیشه نامحدود</b>\n\n"
+        "می‌تونی عدد سهمیه رو روی ۱۰/۲۰/۵۰/۱۰۰ یا هر عدد دلخواه بذاری، سهمیه همه رو الان ریست کنی، "
+        "سهمیه رو ببندی (۰)، یا نامحدودش کنی.\n"
+        "• میانبر سریع: <code>/manage_ai quota 50</code> | <code>off</code> | <code>unlimited</code> | <code>reset</code>"
+    )
+    return text, build_ai_quota_kb(owner_id=owner_id, current_limit=limit_count)
 
 
 async def _run_manual_memory_learn(
@@ -302,12 +436,13 @@ async def render_manage_ai_panel(
             source_label = f"<b>{escape_html(src_name)}</b>"
         learned_count = await repository.count_ai_member_profiles(mem_chat_id)
 
-    limit_count = int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20))
+    limit_count = get_effective_ai_chat_user_limit()
     window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
     status_badge = "🟢 <b>روشن</b>" if enabled else "🔴 <b>خاموش</b>"
     provider_label = format_ai_provider_label(settings, for_chat=True, provider=provider)
+    quota_summary = _format_quota_summary(limit_count, window_hours)
     access_badge = (
-        f"👥 <b>همه اعضای گفتگوی آزاد</b> ({limit_count} پیام در {window_hours} ساعت | مدیر نامحدود)"
+        f"👥 <b>همه اعضای گفتگوی آزاد</b> ({quota_summary} | مدیر نامحدود)"
         if access_mode == "public"
         else "🔒 <b>فقط مدیر ربات</b>"
     )
@@ -336,7 +471,7 @@ async def render_manage_ai_panel(
         "<b>نحوه استفاده هنگام روشن بودن:</b>\n"
         f"• فقط در گفتگوی آزاد: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
         "• در پیوی: فقط مدیر ربات\n"
-        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>9router</code> | <code>gemini</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
+        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>9router</code> | <code>gemini</code> | <code>quota</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
     )
     kb = build_manage_ai_kb(
         enabled=enabled,
@@ -345,6 +480,8 @@ async def render_manage_ai_panel(
         provider=provider,
         access_mode=access_mode,
         gateway_label=gateway_label,
+        quota_limit=limit_count,
+        window_hours=window_hours,
     )
     return text, kb
 
@@ -373,7 +510,7 @@ async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
 
     chat_id = message.chat.id if message.chat else None
     chat_type = message.chat.type if message.chat else "private"
-    desired_toggle, desired_provider, memory_action = _parse_manage_arg(message.text)
+    desired_toggle, desired_provider, sub_action, sub_arg = _parse_manage_arg(message.text)
 
     if desired_toggle is not None:
         await set_ai_chat_state(desired_toggle)
@@ -381,23 +518,46 @@ async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
         await set_ai_chat_provider_state(desired_provider)
 
     notice = ""
-    if memory_action == "bind":
+    if sub_action == "bind":
         if chat_type == "private" or chat_id is None:
             notice = "⚠️ دستور <code>/manage_ai bind</code> رو باید داخل خودِ تاپیک موردنظر (مثلاً گفتگوی آزاد) بزنی.\n\n"
         else:
             tid = resolve_thread_id(message)
             src = await bind_memory_source_topic(chat_id, tid)
             notice = f"✅ تاپیک <b>«{escape_html(src.get('topic_name') or str(tid))}»</b> برای یادگیری شخصیت اعضا متصل شد.\n\n"
-    elif memory_action == "learn":
+    elif sub_action == "learn":
         try:
             ok_learn, learn_msg = await _run_manual_memory_learn(chat_id, chat_type)
             prefix = "✅" if ok_learn else "⚠️"
             notice = f"{prefix} {escape_html(learn_msg)}\n\n"
         except LLMError as exc:
             notice = f"⚠️ خطا در یادگیری از پیام‌ها: <code>{escape_html(_format_safe_llm_error(exc))}</code>\n\n"
-    elif memory_action == "memory":
-        mem_text, mem_kb = await _render_memory_overview(owner_id=user.id, chat_id=chat_id, chat_type=chat_type)
+    elif sub_action == "memory":
+        page_idx = int(sub_arg) if sub_arg.isdigit() else 0
+        mem_text, mem_kb = await _render_memory_overview(
+            owner_id=user.id, chat_id=chat_id, chat_type=chat_type, page=page_idx
+        )
         await _send_in_context(message, mem_text, reply_markup=mem_kb, bot=bot)
+        return
+    elif sub_action == "quota":
+        q_notice = ""
+        if sub_arg == "reset":
+            cleared = reset_all_user_quotas()
+            q_notice = (
+                f"♻️ سهمیه همه کاربران ریست شد ({cleared} کاربر فعال).\n\n"
+                if cleared > 0
+                else "♻️ سهمیه همه کاربران ریست شد.\n\n"
+            )
+        elif sub_arg:
+            parsed_limit = _parse_quota_value(sub_arg)
+            if parsed_limit is None:
+                q_notice = "⚠️ مقدار سهمیه نامعتبره. از <code>0</code> (بستن)، <code>unlimited</code> (نامحدود) یا عدد ۱ تا ۱۰۰۰۰ استفاده کن.\n\n"
+            else:
+                effective = await set_ai_chat_user_limit_state(parsed_limit)
+                window_hours = max(1, int(getattr(get_settings(), "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+                q_notice = f"✅ سهمیه کاربران معمولی روی <b>{_format_quota_summary(effective, window_hours)}</b> تنظیم شد.\n\n"
+        q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+        await _send_in_context(message, f"{q_notice}{q_text}", reply_markup=q_kb, bot=bot)
         return
 
     _, bot_username = await ensure_ai_bot_identity(bot)
@@ -463,8 +623,11 @@ async def on_manage_ai_callback(
         current_mode = get_effective_ai_chat_access_mode()
         next_mode = "owner_only" if current_mode == "public" else "public"
         await set_ai_chat_access_mode_state(next_mode)
+        settings = get_settings()
+        window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+        quota_summary = _format_quota_summary(get_effective_ai_chat_user_limit(), window_hours)
         toast = (
-            "👥 چت برای همه اعضای گفتگوی آزاد باز شد (۲۰ پیام در ۲ ساعت)."
+            f"👥 چت برای همه اعضای گفتگوی آزاد باز شد ({quota_summary})."
             if next_mode == "public"
             else "🔒 دسترسی چت به فقط مدیر ربات محدود شد."
         )
@@ -473,6 +636,65 @@ async def on_manage_ai_callback(
             owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
         )
         await safe_edit_message(callback, text, kb)
+        return
+
+    if action == "quota":
+        await state.clear()
+        await safe_answer_callback(callback)
+        q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+        await safe_edit_message(callback, q_text, q_kb)
+        return
+
+    if action == "qset":
+        parsed_limit = _parse_quota_value(callback_data.arg)
+        if parsed_limit is None:
+            await safe_answer_callback(callback, "⚠️ مقدار سهمیه نامعتبر است.", show_alert=True)
+            return
+        effective = await set_ai_chat_user_limit_state(parsed_limit)
+        window_hours = max(1, int(getattr(get_settings(), "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+        await safe_answer_callback(
+            callback,
+            f"✅ سهمیه کاربران: {_format_quota_summary(effective, window_hours)}",
+        )
+        q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+        await safe_edit_message(callback, q_text, q_kb)
+        return
+
+    if action == "qreset":
+        cleared = reset_all_user_quotas()
+        toast = (
+            f"♻️ سهمیه همه کاربران ریست شد ({cleared} کاربر فعال)."
+            if cleared > 0
+            else "♻️ سهمیه همه کاربران ریست شد."
+        )
+        await safe_answer_callback(callback, toast)
+        q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+        await safe_edit_message(callback, q_text, q_kb)
+        return
+
+    if action == "qcustom":
+        await safe_answer_callback(callback)
+        await state.set_state(AiChatStates.waiting_quota_limit)
+        await state.update_data(
+            fsm_started_at=time.monotonic(),
+            panel_chat_id=callback.message.chat.id if callback.message else None,
+            panel_message_id=callback.message.message_id if callback.message else None,
+        )
+        prompt_text = (
+            "✏️ <b>تنظیم سهمیه دلخواه کاربران معمولی</b>\n\n"
+            "عدد مورد نظرت رو بفرست (بین ۱ تا ۱۰۰۰۰):\n"
+            "• برای بستن سهمیه کاربران معمولی: <code>0</code>\n"
+            "• برای نامحدود کردن: <code>-1</code> یا <code>نامحدود</code>\n"
+            "<i>برای لغو دکمه زیر یا دستور /cancel رو بزن.</i>"
+        )
+        await safe_edit_message(callback, prompt_text, build_ai_quota_cancel_kb(owner_id=user.id))
+        return
+
+    if action == "qcancel":
+        await state.clear()
+        await safe_answer_callback(callback, "لغو شد.")
+        q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+        await safe_edit_message(callback, q_text, q_kb)
         return
 
     if action == "clear":
@@ -504,9 +726,16 @@ async def on_manage_ai_callback(
     if action == "mem":
         await safe_answer_callback(callback)
         mem_text, mem_kb = await _render_memory_overview(
-            owner_id=user.id, chat_id=cb_chat_id, chat_type=cb_chat_type
+            owner_id=user.id,
+            chat_id=cb_chat_id,
+            chat_type=cb_chat_type,
+            page=callback_data.page,
         )
         await safe_edit_message(callback, mem_text, mem_kb)
+        return
+
+    if action == "noop":
+        await safe_answer_callback(callback)
         return
 
     if action == "clrmem":
@@ -564,14 +793,18 @@ async def on_manage_ai_callback(
         await repository.set_ai_chat_custom_prompt(None)
         clear_conversation_history()
         await safe_answer_callback(callback, "♻️ پرامپت به حالت پیش‌فرض ایرانی برگشت.")
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
         return
 
     if action == "cancel":
         await state.clear()
         await safe_answer_callback(callback, "لغو شد.")
-        text, kb = await render_manage_ai_panel(owner_id=user.id, bot_username=bot_username)
+        text, kb = await render_manage_ai_panel(
+            owner_id=user.id, bot_username=bot_username, chat_id=cb_chat_id, chat_type=cb_chat_type
+        )
         await safe_edit_message(callback, text, kb)
         return
 
@@ -627,6 +860,52 @@ async def on_custom_prompt_input(message: Message, bot: Bot, state: FSMContext) 
         message,
         f"✅ پرامپت جدید ذخیره شد و حافظه مکالمه تازه‌سازی شد.\n\n{panel_text}",
         reply_markup=kb,
+        bot=bot,
+    )
+
+
+@router.message(StateFilter(AiChatStates.waiting_quota_limit))
+async def on_custom_quota_input(message: Message, bot: Bot, state: FSMContext) -> None:
+    """Receive custom regular-user AI chat quota limit from the bot owner."""
+    user = message.from_user
+    if user is None or not is_global_admin(user.id):
+        return
+
+    data = await state.get_data()
+    started_at = data.get("fsm_started_at")
+    if isinstance(started_at, (int, float)) and (time.monotonic() - started_at) > FSM_PROMPT_TTL_SECONDS:
+        await state.clear()
+        await _send_in_context(
+            message,
+            "⏰ زمان وارد کردن سهمیه تموم شد. دوباره <code>/manage_ai quota</code> رو بزن.",
+            bot=bot,
+        )
+        return
+
+    raw_text = (message.text or "").strip()
+    if raw_text.lower().startswith("/cancel"):
+        await state.clear()
+        await _send_in_context(message, "❌ تنظیم سهمیه لغو شد.", bot=bot)
+        return
+
+    parsed = _parse_quota_value(raw_text)
+    if parsed is None:
+        await _send_in_context(
+            message,
+            "⚠️ لطفاً یک عدد بین ۱ تا ۱۰۰۰۰، یا <code>0</code> (بستن)، یا <code>-1</code> / <code>نامحدود</code> بفرست (یا /cancel بزن).",
+            bot=bot,
+        )
+        return
+
+    effective = await set_ai_chat_user_limit_state(parsed)
+    await state.clear()
+
+    window_hours = max(1, int(getattr(get_settings(), "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
+    q_text, q_kb = await _render_quota_panel(owner_id=user.id)
+    await _send_in_context(
+        message,
+        f"✅ سهمیه کاربران معمولی روی <b>{_format_quota_summary(effective, window_hours)}</b> تنظیم شد.\n\n{q_text}",
+        reply_markup=q_kb,
         bot=bot,
     )
 
@@ -687,12 +966,15 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
     if not allowed:
         if should_send_quota_notice(user.id):
             settings = get_settings()
-            limit_count = int(getattr(settings, "AI_CHAT_USER_LIMIT_COUNT", 20))
+            limit_count = get_effective_ai_chat_user_limit()
             window_hours = max(1, int(getattr(settings, "AI_CHAT_USER_LIMIT_WINDOW_SECONDS", 7200)) // 3600)
-            notice_text = (
-                f"⏳ سهمیه چت تو ({limit_count} پیام در هر {window_hours} ساعت) فعلاً پر شده رفیق! "
-                f"حدود <b>{wait_mins} دقیقه</b> دیگه دوباره می‌تونی باهام حرف بزنی."
-            )
+            if limit_count == 0 or wait_mins < 0:
+                notice_text = "🔒 سهمیه چت کاربران معمولی فعلاً توسط مدیر بسته شده."
+            else:
+                notice_text = (
+                    f"⏳ سهمیه چت تو ({limit_count} پیام در هر {window_hours} ساعت) فعلاً پر شده رفیق! "
+                    f"حدود <b>{wait_mins} دقیقه</b> دیگه دوباره می‌تونی باهام حرف بزنی."
+                )
             try:
                 await bot.send_message(
                     chat_id=chat.id,
