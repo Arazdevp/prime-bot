@@ -51,11 +51,9 @@ from bot.services.deeptalk_service import (
     refresh_announcement_card,
     refresh_start_card,
     render_pv_participants_view,
-    send_deeptalk_topic_message,
     start_deeptalk_session,
 )
 from bot.services.timer_service import build_topic_deep_link, ensure_bot_username
-from bot.texts.deeptalk_texts import format_checkin_announcement
 from bot.utils.dates import format_persian_short_date, get_tehran_now
 from bot.utils.general_topic import resolve_thread_id, to_send_thread_id
 from bot.utils.html_utils import escape_html
@@ -975,7 +973,7 @@ async def handle_deeptalk_callback(
                 return
 
             if action == "chk":
-                res = await repository.checkin_deeptalk_participant_and_draw(
+                res = await repository.checkin_deeptalk_participant(
                     session_id=sid,
                     user_id=user.id,
                     username=user.username,
@@ -989,7 +987,7 @@ async def handle_deeptalk_callback(
                     )
                     return
 
-                is_first, chosen_idx, total_chk = res
+                is_first, total_chk = res
                 if not is_first:
                     await safe_answer_callback(
                         callback,
@@ -997,20 +995,8 @@ async def handle_deeptalk_callback(
                     )
                     return
 
-                checkin_text = format_checkin_announcement(
-                    chosen_idx,
-                    user_id=user.id,
-                    username=user.username,
-                    full_name=display_name,
-                )
-                await send_deeptalk_topic_message(
-                    bot,
-                    chat_id=int(session["chat_id"]),
-                    thread_id=int(session["thread_id"]),
-                    text=checkin_text,
-                )
                 await refresh_start_card(bot, sid, checked_in_count=total_chk)
-                await safe_answer_callback(callback, "🔥 اعلام حضورت ثبت شد! بپر وسط بحث!")
+                await safe_answer_callback(callback, "✅ اعلام حضورت ثبت شد! بپر وسط بحث! 🔥")
                 return
 
             if action in ("pref", "plist"):
@@ -1045,7 +1031,7 @@ async def handle_deeptalk_callback(
                         username=user.username,
                         full_name=user.full_name,
                     )
-                    await safe_answer_callback(callback, "📬 لیست شرکت‌کنندگان به پیوی ربات فرستاده شد!")
+                    await safe_answer_callback(callback, "📬 لیست حاضرین و غایبین به پیوی ربات فرستاده شد!")
                 except Exception:
                     await safe_answer_callback(
                         callback,

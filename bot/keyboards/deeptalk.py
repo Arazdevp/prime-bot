@@ -40,7 +40,7 @@ def _truncate(text: str, max_len: int = 28) -> str:
 def _participants_pv_button(
     session_id: int,
     bot_username: str | None,
-    label: str = "👀 مشاهده افراد (در پیوی)",
+    label: str = "📋 لیست حاضرین و غایبین",
 ) -> InlineKeyboardButton:
     """Build deep-link URL button opening the bot PV participant list (with callback fallback)."""
     clean_u = (bot_username or "").strip().lstrip("@")
@@ -83,12 +83,17 @@ def build_announcement_card_kb(
         )
 
     if status != "cancelled":
+        pv_label = (
+            "📋 لیست حاضرین و غایبین"
+            if status in ("live", "completed")
+            else "👀 مشاهده افراد ثبت‌نام‌شده (در پیوی)"
+        )
         rows.append(
             [
                 _participants_pv_button(
                     session_id,
                     bot_username,
-                    label="👀 مشاهده افراد ثبت‌نام‌شده (در پیوی)",
+                    label=pv_label,
                 )
             ]
         )
@@ -129,7 +134,7 @@ def build_start_card_kb(
             _participants_pv_button(
                 session_id,
                 bot_username,
-                label="👀 مشاهده لیست حاضرین و ثبت‌نامی‌ها (در پیوی)",
+                label="📋 لیست حاضرین و غایبین",
             )
         ]
     )
@@ -148,7 +153,7 @@ def build_end_card_kb(
                 _participants_pv_button(
                     session_id,
                     bot_username,
-                    label="👀 لیست کامل شرکت‌کنندگان (در پیوی)",
+                    label="📋 لیست حاضرین و غایبین",
                 )
             ]
         ]
@@ -864,7 +869,7 @@ def build_deeptalk_session_manage_kb(
             ]
         )
 
-    rows.append([_participants_pv_button(session_id, bot_username, label="👀 لیست شرکت‌کنندگان (در پیوی)")])
+    rows.append([_participants_pv_button(session_id, bot_username, label="📋 لیست حاضرین و غایبین")])
     rows.append(
         [
             InlineKeyboardButton(

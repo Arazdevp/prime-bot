@@ -2057,23 +2057,21 @@ async def unregister_deeptalk_participant(
     return True, total
 
 
-async def checkin_deeptalk_participant_and_draw(
+async def checkin_deeptalk_participant(
     *,
     session_id: int,
     user_id: int,
     username: str | None,
     full_name: str,
     now_iso: str | None = None,
-) -> tuple[bool, int, int] | None:
-    """Atomically check in a user to a 'live' DeepTalk and draw a unique check-in template index.
+) -> tuple[bool, int] | None:
+    """Atomically check in a user to a 'live' DeepTalk silently.
 
     Returns:
       - None if the session does not exist or is not currently 'live'.
-      - (False, -1, total_checked_in) if user already checked in earlier.
-      - (True, chosen_template_idx, total_checked_in) on first check-in.
+      - (False, total_checked_in) if user already checked in earlier.
+      - (True, total_checked_in) on first check-in.
     """
-    from bot.texts.deeptalk_texts import draw_next_checkin_index
-
     conn = get_db()
     lock = get_write_lock()
     ts = now_iso or datetime.now(timezone.utc).isoformat()
@@ -2082,7 +2080,7 @@ async def checkin_deeptalk_participant_and_draw(
 
     async with lock:
         sess_cur = await conn.execute(
-            "SELECT status, checkin_deck_json, last_checkin_idx FROM deeptalk_sessions WHERE id = ?;",
+            "SELECT status FROM deeptalk_sessions WHERE id = ?;",
             (session_id,),
         )
         sess_row = await sess_cur.fetchone()
@@ -2106,23 +2104,7 @@ async def checkin_deeptalk_participant_and_draw(
             )
             cnt_row = await cnt_cur.fetchone()
             await conn.commit()
-            return False, -1, (int(cnt_row["cnt"]) if cnt_row else 1)
-
-        raw_deck = sess_row["checkin_deck_json"]
-        deck: list[int] | None = None
-        if raw_deck:
-            try:
-                parsed = json.loads(raw_deck)
-                if isinstance(parsed, list):
-                    deck = parsed
-            except Exception:
-                deck = None
-
-        last_idx = sess_row["last_checkin_idx"]
-        chosen_idx, remaining_deck = draw_next_checkin_index(
-            deck,
-            int(last_idx) if last_idx is not None else None,
-        )
+            return False, (int(cnt_row["cnt"]) if cnt_row else 1)
 
         await conn.execute(
             """
@@ -2138,10 +2120,6 @@ async def checkin_deeptalk_participant_and_draw(
             """,
             (session_id, user_id, clean_u, clean_name, ts),
         )
-        await conn.execute(
-            "UPDATE deeptalk_sessions SET checkin_deck_json = ?, last_checkin_idx = ? WHERE id = ?;",
-            (json.dumps(remaining_deck), chosen_idx, session_id),
-        )
         cnt_cur = await conn.execute(
             "SELECT COUNT(*) AS cnt FROM deeptalk_participants WHERE session_id = ? AND checked_in = 1;",
             (session_id,),
@@ -2150,7 +2128,7 @@ async def checkin_deeptalk_participant_and_draw(
         total_checked_in = int(cnt_row["cnt"]) if cnt_row else 1
         await conn.commit()
 
-    return True, chosen_idx, total_checked_in
+    return True, total_checked_in
 
 
 async def increment_deeptalk_message_count(

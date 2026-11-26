@@ -24,7 +24,13 @@ from bot.handlers.deeptalk import (
 )
 from bot.handlers.listener import capture_message, clear_known_group_cache
 from bot.handlers.private import clear_stranger_cooldowns, cmd_private_start
-from bot.keyboards.deeptalk import DeepTalkCB
+from bot.keyboards.deeptalk import (
+    DeepTalkCB,
+    build_announcement_card_kb,
+    build_deeptalk_session_manage_kb,
+    build_end_card_kb,
+    build_start_card_kb,
+)
 from bot.scheduler.jobs import build_scheduler, set_scheduler
 from bot.services.access import clear_member_cache
 from bot.services.deeptalk_service import (
@@ -36,11 +42,7 @@ from bot.services.deeptalk_service import (
     sweep_due_deeptalks,
 )
 from bot.services.timer_service import set_bot_username
-from bot.texts.deeptalk_texts import (
-    DEEPTALK_CHECKIN_MESSAGES,
-    draw_next_checkin_index,
-    format_checkin_announcement,
-)
+from bot.texts.deeptalk_texts import format_deeptalk_participants_pv
 from bot.texts.private_texts import clear_last_picked_cache
 from bot.utils.timer_parser import to_utc_iso
 
@@ -177,47 +179,61 @@ def _make_cb(
     return cb
 
 
-def test_deeptalk_checkin_pool_has_20_unique_valid_html_templates():
-    """Verify exactly 20 unique Persian check-in templates with valid balanced HTML and escaping."""
-    assert len(DEEPTALK_CHECKIN_MESSAGES) == 20
-    assert len(set(DEEPTALK_CHECKIN_MESSAGES)) == 20
+def test_deeptalk_attendance_button_labels_and_present_absent_pv_formatting():
+    """Verify '📋 لیست حاضرین و غایبین' button labels and balanced present/absent PV rendering."""
+    live_start_kb = build_start_card_kb(12, checked_in_count=3, bot_username="prime_bot", status="live")
+    completed_start_kb = build_start_card_kb(12, checked_in_count=3, bot_username="prime_bot", status="completed")
+    end_kb = build_end_card_kb(12, bot_username="prime_bot")
+    manage_kb = build_deeptalk_session_manage_kb(1001, 12, status="live", bot_username="prime_bot")
+    live_ann_kb = build_announcement_card_kb(12, registered_count=4, bot_username="prime_bot", status="live")
+    sched_ann_kb = build_announcement_card_kb(12, registered_count=4, bot_username="prime_bot", status="scheduled")
 
-    rendered_set: set[str] = set()
-    for idx, tpl in enumerate(DEEPTALK_CHECKIN_MESSAGES):
-        assert "{user}" in tpl, f"Template #{idx} missing {{user}}"
-        rendered = format_checkin_announcement(
-            idx,
-            user_id=777,
-            username="dev_user",
-            full_name="Ali <R&D>",
-        )
-        assert "Ali &lt;R&amp;D&gt;" in rendered
-        assert "Ali <R&D>" not in rendered
-        assert "@dev_user" in rendered
-        assert _is_html_balanced(rendered), f"Unbalanced HTML in #{idx}: {rendered}"
-        rendered_set.add(rendered)
+    assert live_start_kb.inline_keyboard[-1][0].text == "📋 لیست حاضرین و غایبین"
+    assert completed_start_kb.inline_keyboard[-1][0].text == "📋 لیست حاضرین و غایبین"
+    assert end_kb.inline_keyboard[-1][0].text == "📋 لیست حاضرین و غایبین"
+    assert manage_kb.inline_keyboard[-2][0].text == "📋 لیست حاضرین و غایبین"
+    assert live_ann_kb.inline_keyboard[-1][0].text == "📋 لیست حاضرین و غایبین"
+    assert sched_ann_kb.inline_keyboard[-1][0].text == "👀 مشاهده افراد ثبت‌نام‌شده (در پیوی)"
 
-    assert len(rendered_set) == 20
+    session = {
+        "id": 12,
+        "subject": "تولید محتوای <ویژه>",
+        "start_at": "2026-11-24T18:30:00+00:00",
+        "status": "live",
+    }
 
+    # Case 1: Both present and absent users
+    both_text = format_deeptalk_participants_pv(
+        session,
+        [
+            {"user_id": 1, "username": "ali", "full_name": "Ali <R&D>", "registered": 1, "checked_in": 1, "message_count": 2},
+            {"user_id": 2, "username": "sara", "full_name": "سارا", "registered": 1, "checked_in": 0, "message_count": 0},
+        ],
+        group_title="Prime",
+        topic_name="Deep Work",
+    )
+    assert "لیست حاضرین و غایبین دیپ‌تاک" in both_text
+    assert "Ali &lt;R&amp;D&gt;" in both_text
+    assert "✅ <b>حاضرین (۱ نفر):</b>" in both_text
+    assert "❌ <b>غایبین — منتظر اعلام حضور (۱ نفر):</b>" in both_text
+    assert _is_html_balanced(both_text)
 
-def test_deeptalk_shuffle_bag_guarantees_20_unique_per_cycle_and_no_boundary_repeat():
-    """Verify 40 sequential check-in draws yield two full 20-item duplicate-free cycles with no boundary repeat."""
-    deck: list[int] | None = None
-    last_idx: int | None = None
-    draws: list[int] = []
+    # Case 2: No one checked in yet, only absent pre-registered users
+    no_present_text = format_deeptalk_participants_pv(
+        session,
+        [{"user_id": 2, "username": "sara", "full_name": "سارا", "registered": 1, "checked_in": 0, "message_count": 0}],
+    )
+    assert "هنوز کسی اعلام حضور نکرده است" in no_present_text
+    assert "@sara" in no_present_text
+    assert _is_html_balanced(no_present_text)
 
-    for _ in range(40):
-        chosen, deck = draw_next_checkin_index(deck, last_idx)
-        draws.append(chosen)
-        last_idx = chosen
-
-    c1 = draws[:20]
-    c2 = draws[20:40]
-    assert len(set(c1)) == 20
-    assert set(c1) == set(range(20))
-    assert len(set(c2)) == 20
-    assert set(c2) == set(range(20))
-    assert c1[-1] != c2[0]
+    # Case 3: Completed session where every registered user checked in
+    all_present_text = format_deeptalk_participants_pv(
+        {**session, "status": "completed"},
+        [{"user_id": 1, "username": "ali", "full_name": "علی", "registered": 1, "checked_in": 1, "message_count": 4}],
+    )
+    assert "همه ثبت‌نام‌شدگان حاضر شدند" in all_present_text
+    assert _is_html_balanced(all_present_text)
 
 
 def test_deeptalk_callback_data_under_64_bytes_worst_case():
@@ -648,25 +664,31 @@ async def test_end_to_end_deeptalk_lifecycle_group_pv_checkins_extension_and_sta
             assert "بحث دیپ‌تاک رسماً شروع شد" in topic_starts[0]["text"]
             assert "@ali_creator" in topic_starts[0]["text"]
             assert "@sara_editor" in topic_starts[0]["text"]
+            start_kb_labels = [btn.text for row in topic_starts[0]["reply_markup"].inline_keyboard for btn in row]
+            assert "📋 لیست حاضرین و غایبین" in start_kb_labels
             assert len(dm_pings) == 1
             assert "دیپ‌تاکی که توش ثبت‌نام کرده بودی شروع شد" in dm_pings[0]["text"]
 
-            # 5. Live Check-ins: User A (first responder, خوش‌قول) and User D (walk-in, ورود یهویی)
+            # 5. Live Check-ins: silent (NO group message, NO DM/notification to DeepTalk admin or owner)
             sent_messages.clear()
+            bot.edit_message_text.reset_mock()
             await handle_deeptalk_callback(cb_a, DeepTalkCB(action="chk", sid=sid), bot, fsm)
-            assert len(sent_messages) == 1
-            first_checkin_msg = sent_messages[0]["text"]
-            assert "@ali_creator" in first_checkin_msg
+            assert len(sent_messages) == 0
 
-            # Duplicate check-in tap by User A must NOT post another topic message!
+            # Duplicate check-in tap by User A must NOT post or edit anything extra!
             await handle_deeptalk_callback(cb_a, DeepTalkCB(action="chk", sid=sid), bot, fsm)
-            assert len(sent_messages) == 1
+            assert len(sent_messages) == 0
 
             cb_d = _make_cb(user_id=user_d, username="omid_walkin", full_name="امید یهویی", chat_id=chat_id)
             await handle_deeptalk_callback(cb_d, DeepTalkCB(action="chk", sid=sid), bot, fsm)
-            assert len(sent_messages) == 2
-            second_checkin_msg = sent_messages[1]["text"]
-            assert "@omid_walkin" in second_checkin_msg
+            assert len(sent_messages) == 0
+            assert bot.edit_message_text.await_count == 2
+
+            mid_stats = await repository.get_deeptalk_session_stats(sid)
+            assert mid_stats["checked_in_count"] == 2
+            assert mid_stats["on_time_count"] == 1
+            assert mid_stats["walk_in_count"] == 1
+            assert mid_stats["missed_count"] == 1
 
             # 6. Live discussion messages captured by listener -> increments message_count!
             for i in range(3):
@@ -720,19 +742,23 @@ async def test_end_to_end_deeptalk_lifecycle_group_pv_checkins_extension_and_sta
             assert len(sent_messages) == 1
             end_card = sent_messages[0]["text"]
             assert "وقت دیپ‌تاک به پایان رسید! می‌تونید جمع‌بندی کنید!" in end_card
+            assert "غایبین" in end_card
             assert "سریع‌ترین اعلام حضور" in end_card
             assert "@ali_creator" in end_card
             assert "۴ پیام" in end_card
             assert "علی کریتور" in end_card
             assert "امید یهویی" in end_card
+            assert sent_messages[0]["reply_markup"].inline_keyboard[0][0].text == "📋 لیست حاضرین و غایبین"
 
-            # 9. PV refresh ('pref') after end shows خوش‌قول, ورود یهویی, and جامانده‌ها!
+            # 9. PV refresh ('pref') after end shows حاضرین & غایبین with خوش‌قول, ورود یهویی, and @sara_editor!
             pv_c_cb = _make_cb(user_id=user_c, chat_id=user_c, chat_type="private", message_id=960)
             await handle_deeptalk_callback(pv_c_cb, DeepTalkCB(action="pref", sid=sid), bot, c_fsm)
             refreshed_pv = pv_c_cb.message.edit_text.call_args.kwargs["text"]
+            assert "لیست حاضرین و غایبین دیپ‌تاک" in refreshed_pv
+            assert "حاضرین" in refreshed_pv
+            assert "غایبین" in refreshed_pv
             assert "خوش‌قول" in refreshed_pv
             assert "ورود یهویی" in refreshed_pv
-            assert "جامانده‌ها" in refreshed_pv
             assert "@sara_editor" in refreshed_pv
     finally:
         set_scheduler(None)

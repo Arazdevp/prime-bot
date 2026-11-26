@@ -1,7 +1,6 @@
-"""20 distinct Persian DeepTalk check-in messages, shuffle-bag draw, and HTML card formatters."""
+"""Persian DeepTalk HTML card and PV attendance list formatters."""
 
 from datetime import datetime
-import random
 from typing import Any
 from zoneinfo import ZoneInfo
 from bot.utils.dates import format_persian_date
@@ -13,55 +12,6 @@ from bot.utils.timer_parser import (
     parse_utc_iso,
     to_persian_digits,
 )
-
-# 20 distinct, energetic Persian check-in templates (every entry contains {user} and balanced Telegram HTML)
-DEEPTALK_CHECKIN_MESSAGES: list[str] = [
-    "🎙 {user} اعلام حضور کرد! خوش اومدی به دیپ‌تاک 🔥",
-    "✅ {user} حضور خودش رو تأیید کرد؛ بفرما بالا رفیق! 🙌",
-    "🚀 {user} وارد دیپ‌تاک شد! ببینیم چه ایده‌ای تو آستین داره 😎",
-    "⚡ میکروفون باز شد؛ {user} هم به جمع دیپ‌تاک پیوست!",
-    "🔥 به به! {user} با انرژیِ تمام پرید وسط میدان گفتگو!",
-    "🪑 صندلی ردیف اول رزرو شد؛ {user} اعلام حضور کرد! ✨",
-    "💡 {user} چراغ ورودش رو روشن کرد و وارد بحث شد!",
-    "🎯 حضور {user} ثبت شد! آماده‌ایم نظرت رو بشنویم رفیق 👀",
-    "🌊 موج دیپ‌تاک قوی‌تر شد؛ {user} هم به گفتگو اضافه شد! 🔥",
-    "☕ {user} با دستِ پر وارد دیپ‌تاک شد! خوش اومدی 🌟",
-    "🫡 گزارش از اتاق دیپ‌ورک: {user} رسماً وارد جلسه شد!",
-    "🎬 سکانسِ گفتگو داغ‌تر شد؛ {user} اعلام حضور کرد! ⚡",
-    "🧠 یه ذهن خلاق دیگه رسید! {user} حضورش رو در دیپ‌تاک ثبت کرد 🔥",
-    "🙌 دستا بالا! {user} هم وارد حلقه دیپ‌تاک شد!",
-    "🔔 دینگ! {user} کارت حضورش رو زد و اومد تو بحث 😎",
-    "🌟 جمعِ دیپ‌تاک تکمیل‌تر شد؛ خوش اومدی {user} عزیز!",
-    "⚡ با ورود {user} تنور این دیپ‌تاک رسماً داغ شد! 🔥",
-    "🎤 نوبت تریبون رسید؛ {user} اعلام حضور کرد و آماده بحثه!",
-    "🚀 {user} کمربندش رو بست و وارد مدار دیپ‌تاک شد! ✨",
-    "🤝 ایول! {user} حضور خودش رو تأیید کرد و به جمع پیوست 🔥",
-]
-
-
-def draw_next_checkin_index(
-    deck: list[int] | None,
-    last_index: int | None = None,
-) -> tuple[int, list[int]]:
-    """Draw the next check-in message index from a shuffle-bag without repeating until all 20 are used."""
-    total = len(DEEPTALK_CHECKIN_MESSAGES)
-    valid_deck: list[int] = []
-    if isinstance(deck, list):
-        seen: set[int] = set()
-        for item in deck:
-            if isinstance(item, int) and 0 <= item < total and item not in seen:
-                valid_deck.append(item)
-                seen.add(item)
-
-    if not valid_deck:
-        valid_deck = list(range(total))
-        random.shuffle(valid_deck)
-        if last_index is not None and total > 1 and valid_deck[0] == last_index:
-            swap_pos = random.randrange(1, total)
-            valid_deck[0], valid_deck[swap_pos] = valid_deck[swap_pos], valid_deck[0]
-
-    chosen = valid_deck.pop(0)
-    return chosen, valid_deck
 
 
 def format_deeptalk_user_mention(
@@ -76,19 +26,6 @@ def format_deeptalk_user_mention(
         clean_u = escape_html(username.strip().lstrip("@"))
         return f"<b>{link}</b> (@{clean_u})"
     return f"<b>{link}</b>"
-
-
-def format_checkin_announcement(
-    template_index: int,
-    *,
-    user_id: int,
-    username: str | None,
-    full_name: str | None,
-) -> str:
-    """Render one of the 20 check-in messages for a participant."""
-    safe_idx = template_index % len(DEEPTALK_CHECKIN_MESSAGES)
-    mention = format_deeptalk_user_mention(user_id, username, full_name)
-    return DEEPTALK_CHECKIN_MESSAGES[safe_idx].format(user=mention)
 
 
 def format_deeptalk_announcement_card(
@@ -302,11 +239,19 @@ def format_deeptalk_end_card(
 
     reg_cnt = int(stats.get("registered_count") or 0)
     chk_cnt = int(stats.get("checked_in_count") or 0)
+    missed = int(stats.get("missed_count") or 0)
     on_time = int(stats.get("on_time_count") or 0)
     walk_in = int(stats.get("walk_in_count") or 0)
     total_msgs = int(stats.get("total_messages") or 0)
     first_resp = stats.get("first_responder")
     top_speakers: list[dict[str, Any]] = stats.get("top_speakers") or []
+
+    attendance_line = (
+        f"• 👥 <b>حاضرین جلسه:</b> <b>{to_persian_digits(chk_cnt)} نفر</b> "
+        f"(از {to_persian_digits(reg_cnt)} ثبت‌نام اولیه)"
+    )
+    if missed > 0:
+        attendance_line += f" | ❌ <b>غایبین:</b> <b>{to_persian_digits(missed)} نفر</b>"
 
     lines = [
         "⏰ <b>وقت دیپ‌تاک به پایان رسید! می‌تونید جمع‌بندی کنید!</b> 🏁",
@@ -315,8 +260,7 @@ def format_deeptalk_end_card(
         f"⏳ <b>مدت برگزاری:</b> {dur_str}",
         "",
         "📊 <b>گزارش بامزه این نوبت دیپ‌تاک:</b>",
-        f"• 👥 <b>حاضرین جلسه:</b> <b>{to_persian_digits(chk_cnt)} نفر</b> "
-        f"(از {to_persian_digits(reg_cnt)} ثبت‌نام اولیه)",
+        attendance_line,
     ]
 
     if chk_cnt > 0:
@@ -395,8 +339,13 @@ def format_deeptalk_participants_pv(
     }
     status_label = status_map.get(status, status)
 
+    header_title = (
+        "📋 <b>لیست ثبت‌نام‌شدگان دیپ‌تاک</b>"
+        if status == "scheduled"
+        else "📋 <b>لیست حاضرین و غایبین دیپ‌تاک</b>"
+    )
     lines = [
-        "📋 <b>لیست شرکت‌کنندگان دیپ‌تاک</b>",
+        header_title,
         "",
         f"🎯 <b>محوریت:</b> <b>{subject}</b>",
     ]
@@ -428,26 +377,34 @@ def format_deeptalk_participants_pv(
         if int(p.get("registered") or 0) == 1 and int(p.get("checked_in") or 0) == 0
     ]
 
+    lines.append(f"✅ <b>حاضرین ({to_persian_digits(len(checked_list))} نفر):</b>")
     if checked_list:
-        lines.append(f"🟢 <b>حاضرین در گفتگو ({to_persian_digits(len(checked_list))} نفر):</b>")
         for idx, p in enumerate(checked_list, start=1):
             was_reg = int(p.get("registered") or 0) == 1
             badge = "<i>(⭐ خوش‌قول)</i>" if was_reg else "<i>(⚡ ورود یهویی)</i>"
             lines.append(_format_pv_person_line(idx, p, badge))
-        lines.append("")
+    else:
+        lines.append("<i>هنوز کسی اعلام حضور نکرده است.</i>")
+
+    lines.append("")
+
+    if status == "live":
+        lines.append(
+            f"❌ <b>غایبین — منتظر اعلام حضور ({to_persian_digits(len(waiting_or_missed))} نفر):</b>"
+        )
+    else:
+        lines.append(
+            f"❌ <b>غایبین — ثبت‌نام کردن ولی نیومدن ({to_persian_digits(len(waiting_or_missed))} نفر):</b>"
+        )
 
     if waiting_or_missed:
-        if status == "live":
-            lines.append(
-                f"⏳ <b>ثبت‌نام‌شدگان منتظر اعلام حضور ({to_persian_digits(len(waiting_or_missed))} نفر):</b>"
-            )
-            badge = "<i>(منتظر ورود)</i>"
-        else:
-            lines.append(
-                f"😴 <b>جامانده‌ها — ثبت‌نام کردن ولی نیومدن ({to_persian_digits(len(waiting_or_missed))} نفر):</b>"
-            )
-            badge = "<i>(غایب)</i>"
         for idx, p in enumerate(waiting_or_missed, start=1):
-            lines.append(_format_pv_person_line(idx, p, badge))
+            lines.append(_format_pv_person_line(idx, p, "<i>(غایب)</i>"))
+    else:
+        any_reg_checked_in = any(int(p.get("registered") or 0) == 1 for p in checked_list)
+        if any_reg_checked_in:
+            lines.append("<i>همه ثبت‌نام‌شدگان حاضر شدند! 🎉</i>")
+        else:
+            lines.append("<i>غایبی ثبت نشده است.</i>")
 
     return "\n".join(lines).rstrip()
