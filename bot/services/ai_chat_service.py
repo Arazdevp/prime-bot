@@ -17,6 +17,15 @@ from bot.config import (
 )
 from bot.database import repository
 from bot.services.access import is_global_admin
+from bot.services.ai_media_reaction_service import (
+    ParsedAiDirectives,
+    canonical_media_tag,
+    format_directive_history_placeholder,
+    get_ai_chat_media_counts_cached,
+    init_ai_media_state,
+    parse_ai_chat_directives,
+    reset_ai_media_caches,
+)
 from bot.services.ai_memory_service import build_live_and_learned_context, reset_ai_memory_caches
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
@@ -65,6 +74,7 @@ def reset_ai_chat_state() -> None:
     _user_quota_timestamps.clear()
     _user_quota_notice_ts.clear()
     reset_ai_memory_caches()
+    reset_ai_media_caches()
 
 
 def is_ai_chat_enabled_cached() -> bool:
@@ -94,6 +104,7 @@ async def init_ai_chat_state() -> bool:
     _ai_chat_provider_cache = await repository.get_ai_chat_provider()
     _ai_chat_access_mode_cache = await repository.get_ai_chat_access_mode()
     _ai_chat_user_limit_cache = await repository.get_ai_chat_user_limit()
+    await init_ai_media_state()
     return _ai_chat_enabled_cache
 
 
@@ -405,6 +416,13 @@ async def generate_ai_chat_reply(
         except Exception as ctx_exc:
             logger.debug("Skipping live/learned context injection due to error: %s", ctx_exc)
 
+        media_counts: dict[str, int] = {}
+        try:
+            media_counts = await get_ai_chat_media_counts_cached()
+        except Exception as media_exc:
+            logger.debug("Skipping AI chat media availability lookup: %s", media_exc)
+        available_media_types = [k for k, v in media_counts.items() if v > 0]
+
         runtime_system = build_runtime_system_prompt(
             base_prompt,
             speaker_name=speaker_name,
@@ -414,6 +432,7 @@ async def generate_ai_chat_reply(
             group_memory=mem_ctx.get("group_memory"),
             member_profiles=mem_ctx.get("member_profiles"),
             recent_messages_text=mem_ctx.get("recent_messages_text"),
+            available_media_types=available_media_types,
         )
 
         raw_reply: str | None = None
@@ -499,9 +518,21 @@ async def generate_ai_chat_reply(
         if raw_reply is None:
             raise LLMError("All AI chat model candidates failed", status_code=503, is_retryable=True)
 
-        sanitized = sanitize_telegram_html(raw_reply)
-        if not sanitized:
-            sanitized = escape_html(raw_reply.strip())
+        parsed = parse_ai_chat_directives(raw_reply)
+        sanitized_text = ""
+        if parsed.text:
+            sanitized_text = sanitize_telegram_html(parsed.text)
+            if not sanitized_text:
+                sanitized_text = escape_html(parsed.text.strip())
+
+        history_text = format_directive_history_placeholder(
+            ParsedAiDirectives(
+                text=sanitized_text,
+                reaction=parsed.reaction,
+                media_type=parsed.media_type,
+                media_mood=parsed.media_mood,
+            )
+        )
 
         if state is None:
             state = _ConversationState(messages=[], updated_at=now)
@@ -511,9 +542,22 @@ async def generate_ai_chat_reply(
             [
                 *existing_messages,
                 {"role": "user", "text": prompt_input},
-                {"role": "model", "text": sanitized},
+                {"role": "model", "text": history_text or sanitized_text},
             ],
             max_turns=history_limit,
         )
         state.updated_at = time.monotonic()
-        return sanitized
+
+        if not parsed.reaction and not parsed.media_type:
+            return sanitized_text
+        if parsed.reaction and not sanitized_text and not parsed.media_type:
+            return f"[REACT:{parsed.reaction}]"
+
+        out_parts: list[str] = []
+        if parsed.reaction:
+            out_parts.append(f"[REACT:{parsed.reaction}]")
+        if sanitized_text:
+            out_parts.append(sanitized_text)
+        if parsed.media_type:
+            out_parts.append(canonical_media_tag(parsed.media_type, parsed.media_mood))
+        return "\n".join(out_parts)

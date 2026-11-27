@@ -21,6 +21,9 @@ from bot.database import repository
 from bot.handlers.panel import safe_answer_callback, safe_edit_message
 from bot.keyboards.ai_chat import (
     AiChatCB,
+    build_ai_media_done_kb,
+    build_ai_media_mood_kb,
+    build_ai_media_panel_kb,
     build_ai_memory_view_kb,
     build_ai_prompt_cancel_kb,
     build_ai_prompt_view_kb,
@@ -50,6 +53,23 @@ from bot.services.ai_chat_service import (
     should_send_quota_notice,
     strip_bot_mention,
 )
+from bot.services.ai_media_reaction_service import (
+    classify_emoji_sentiment,
+    classify_zero_token_reaction,
+    detect_explicit_media_request,
+    extract_ai_chat_media,
+    get_ai_chat_media_counts_cached,
+    infer_mood_from_emoji,
+    invalidate_ai_media_counts_cache,
+    is_ai_chat_media_autocollect_cached,
+    maybe_capture_ai_chat_media,
+    mood_to_reaction,
+    parse_ai_chat_directives,
+    send_ai_chat_media_reply,
+    send_ai_reaction,
+    set_ai_chat_media_autocollect_state,
+    should_reply_with_media_to_media,
+)
 from bot.services.ai_memory_service import (
     bind_memory_source_topic,
     ensure_memory_source_for_group,
@@ -69,15 +89,17 @@ logger = logging.getLogger(__name__)
 router = Router(name="ai_chat_router")
 
 FSM_PROMPT_TTL_SECONDS = 180.0
+MEDIA_FSM_TTL_SECONDS = 300.0
 AI_MEMORY_PAGE_SIZE = 5
 _DIGIT_TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
 
 class AiChatStates(StatesGroup):
-    """FSM states for entering custom system prompt or quota limit in /manage_ai."""
+    """FSM states for entering custom system prompt, quota limit, or chat media in /manage_ai."""
 
     waiting_custom_prompt = State()
     waiting_quota_limit = State()
+    waiting_chat_media = State()
 
 
 def _parse_quota_value(raw: str | None) -> int | None:
@@ -154,6 +176,8 @@ def _parse_manage_arg(raw_text: str | None) -> tuple[bool | None, str | None, st
         if rest.lower() in ("reset", "clear", "ریست", "پاک"):
             return None, None, "quota", "reset"
         return None, None, "quota", rest
+    if cmd in ("media", "رسانه", "استیکر", "گیف"):
+        return None, None, "media", ""
     return None, None, None, ""
 
 
@@ -386,6 +410,29 @@ async def _render_quota_panel(owner_id: int) -> tuple[str, InlineKeyboardMarkup]
     return text, build_ai_quota_kb(owner_id=owner_id, current_limit=limit_count)
 
 
+async def _render_media_panel(owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Render AI chat media bank panel (stickers, GIFs, video notes, and auto-collect)."""
+    counts = await repository.count_ai_chat_media_by_type()
+    sources = await repository.count_ai_chat_media_by_source()
+    autocollect = is_ai_chat_media_autocollect_cached()
+    auto_badge = "🟢 <b>روشن</b>" if autocollect else "🔴 <b>خاموش</b>"
+
+    text = (
+        "🎭 <b>مدیریت رسانه و واکنش چت هوش مصنوعی</b>\n\n"
+        f"• استیکر: <b>{counts.get('sticker', 0)}</b> عدد\n"
+        f"• گیف (GIF): <b>{counts.get('animation', 0)}</b> عدد\n"
+        f"• ویدیومسیج (ویدیو گرد): <b>{counts.get('video_note', 0)}</b> عدد\n"
+        f"• منبع ذخیره: 👤 دستی <b>{sources.get('manual', 0)}</b> | 🤖 خودکار <b>{sources.get('auto', 0)}</b>\n"
+        f"• جمع‌آوری خودکار از گفتگوی آزاد: {auto_badge}\n\n"
+        "<b>نحوه عملکرد:</b>\n"
+        "• پیام‌های ایموجی یا کوتاهِ بی‌نیاز به جواب (مثل «آفرین»، «دقیقاً»، «مرسی»، «اوکی») "
+        "بدون مصرف هیچ توکنی فقط با ریکشن (👍 / 👎 / 😁) جواب می‌گیرن.\n"
+        "• ربات توی جواب‌هاش به‌تناسب فضا از استیکر، گیف و ویدیومسیج‌های این بانک هم استفاده می‌کنه.\n"
+        "• <i>ویدیومسیج فقط به‌صورت دستی از همینجا اضافه می‌شه (برای حفظ حریم خصوصی اعضا).</i>"
+    )
+    return text, build_ai_media_panel_kb(owner_id=owner_id, autocollect=autocollect, counts=counts)
+
+
 async def _run_manual_memory_learn(
     chat_id: int | None,
     chat_type: str,
@@ -453,6 +500,10 @@ async def render_manage_ai_panel(
         active_model = settings.AI_CHAT_MODEL
     key_badge = _format_key_status(settings, provider)
     prompt_badge = "✏️ سفارشی" if custom_prompt else "🇮🇷 پیش‌فرض (لحن طبیعی ایرانی)"
+    try:
+        media_counts = await get_ai_chat_media_counts_cached()
+    except Exception:
+        media_counts = {"sticker": 0, "animation": 0, "video_note": 0}
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
     preferred_gateway = _pick_preferred_gateway_provider(settings)
     gateway_label = "9Router" if preferred_gateway == "9router" else "OpenAI"
@@ -467,11 +518,12 @@ async def render_manage_ai_panel(
         f"• کلید API: {key_badge}\n"
         f"• پرامپت فعال: {prompt_badge}\n"
         f"• تاپیک یادگیری: 📚 {source_label}\n"
+        f"• بانک رسانه: 🎭 استیکر <b>{media_counts.get('sticker', 0)}</b> | گیف <b>{media_counts.get('animation', 0)}</b> | ویدیومسیج <b>{media_counts.get('video_note', 0)}</b>\n"
         f"• حافظه بلندمدت: 👥 <b>{learned_count}</b> عضو شناخته‌شده | مکالمه‌های موقت: <b>{conv_count}</b>\n\n"
         "<b>نحوه استفاده هنگام روشن بودن:</b>\n"
         f"• فقط در گفتگوی آزاد: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
         "• در پیوی: فقط مدیر ربات\n"
-        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>9router</code> | <code>gemini</code> | <code>quota</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
+        "• میانبر سریع: <code>/manage_ai on</code> | <code>off</code> | <code>9router</code> | <code>gemini</code> | <code>quota</code> | <code>media</code> | <code>bind</code> | <code>learn</code> | <code>memory</code>"
     )
     kb = build_manage_ai_kb(
         enabled=enabled,
@@ -558,6 +610,10 @@ async def cmd_manage_ai(message: Message, bot: Bot, state: FSMContext) -> None:
                 q_notice = f"✅ سهمیه کاربران معمولی روی <b>{_format_quota_summary(effective, window_hours)}</b> تنظیم شد.\n\n"
         q_text, q_kb = await _render_quota_panel(owner_id=user.id)
         await _send_in_context(message, f"{q_notice}{q_text}", reply_markup=q_kb, bot=bot)
+        return
+    elif sub_action == "media":
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await _send_in_context(message, m_text, reply_markup=m_kb, bot=bot)
         return
 
     _, bot_username = await ensure_ai_bot_identity(bot)
@@ -799,6 +855,100 @@ async def on_manage_ai_callback(
         await safe_edit_message(callback, text, kb)
         return
 
+    if action == "media":
+        await state.clear()
+        await safe_answer_callback(callback)
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await safe_edit_message(callback, m_text, m_kb)
+        return
+
+    if action == "madd":
+        arg = (callback_data.arg or "").strip().lower()
+        if arg in ("", "pick"):
+            await state.clear()
+            await safe_answer_callback(callback)
+            mood_text = (
+                "🎭 <b>افزودن رسانه به بانک هوش مصنوعی</b>\n\n"
+                "اول حس‌وحال (Mood) رسانه‌هایی که می‌خوای بفرستی رو انتخاب کن:"
+            )
+            await safe_edit_message(callback, mood_text, build_ai_media_mood_kb(owner_id=user.id))
+            return
+
+        selected_mood = arg if arg in ("auto", *repository.AI_CHAT_MEDIA_MOODS) else "auto"
+        await safe_answer_callback(callback)
+        await state.set_state(AiChatStates.waiting_chat_media)
+        await state.update_data(
+            fsm_started_at=time.monotonic(),
+            media_mood=selected_mood,
+        )
+        mood_labels = {
+            "auto": "✨ خودکار / عمومی",
+            "laugh": "😁 خنده",
+            "agree": "👍 تایید",
+            "disagree": "👎 مخالفت",
+            "hype": "🔥 هیجان",
+            "general": "✨ عمومی",
+        }
+        upload_text = (
+            f"📥 <b>ارسال رسانه ({mood_labels.get(selected_mood, selected_mood)})</b>\n\n"
+            "الان هر چند تا <b>استیکر</b>، <b>گیف (GIF)</b> یا <b>ویدیومسیج (ویدیو گرد)</b> می‌خوای همینجا بفرست تا ذخیره بشن.\n"
+            "<i>وقتی کارت تموم شد، دکمه «اتمام و بازگشت» یا /done رو بزن.</i>"
+        )
+        await safe_edit_message(callback, upload_text, build_ai_media_done_kb(owner_id=user.id))
+        return
+
+    if action == "mdone":
+        await state.clear()
+        await safe_answer_callback(callback, "✅ ثبت رسانه‌ها تمام شد.")
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await safe_edit_message(callback, m_text, m_kb)
+        return
+
+    if action == "mauto":
+        new_auto = await set_ai_chat_media_autocollect_state(not is_ai_chat_media_autocollect_cached())
+        toast = "🤖 جمع‌آوری خودکار استیکر و گیف روشن شد." if new_auto else "⏸ جمع‌آوری خودکار استیکر و گیف خاموش شد."
+        await safe_answer_callback(callback, toast)
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await safe_edit_message(callback, m_text, m_kb)
+        return
+
+    if action == "mtest":
+        target_type = (callback_data.arg or "").strip()
+        if target_type not in repository.AI_CHAT_MEDIA_TYPES or not callback.message or not callback.message.chat:
+            await safe_answer_callback(callback, "⚠️ نوع رسانه نامعتبر است.", show_alert=True)
+            return
+        test_chat = callback.message.chat
+        test_tid = resolve_thread_id(callback.message) if test_chat.type != "private" else 0
+        test_send_tid = to_send_thread_id(test_tid) if test_chat.type != "private" else None
+        sent = await send_ai_chat_media_reply(
+            bot,
+            chat_id=test_chat.id,
+            thread_id=test_tid,
+            send_thread_id=test_send_tid,
+            media_type=target_type,
+            mood="general",
+        )
+        await safe_answer_callback(
+            callback,
+            "✅ ارسال شد!" if sent else "⚠️ رسانه‌ای از این نوع در بانک موجود نیست.",
+            show_alert=not sent,
+        )
+        return
+
+    if action == "mclr":
+        clr_mode = (callback_data.arg or "all").strip().lower()
+        if clr_mode == "auto":
+            deleted = await repository.clear_ai_chat_media(source="auto")
+            toast = f"🗑 {deleted} رسانه خودکار پاک شد."
+        else:
+            deleted = await repository.clear_ai_chat_media()
+            toast = f"🗑 کل بانک رسانه ({deleted} مورد) پاک شد."
+        invalidate_ai_media_counts_cache()
+        await safe_answer_callback(callback, toast)
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await safe_edit_message(callback, m_text, m_kb)
+        return
+
     if action == "cancel":
         await state.clear()
         await safe_answer_callback(callback, "لغو شد.")
@@ -910,6 +1060,80 @@ async def on_custom_quota_input(message: Message, bot: Bot, state: FSMContext) -
     )
 
 
+@router.message(StateFilter(AiChatStates.waiting_chat_media))
+async def on_chat_media_upload(message: Message, bot: Bot, state: FSMContext) -> None:
+    """Receive stickers, GIFs (animations), or circular video notes from the bot owner."""
+    user = message.from_user
+    if user is None or not is_global_admin(user.id):
+        return
+
+    data = await state.get_data()
+    started_at = data.get("fsm_started_at")
+    if isinstance(started_at, (int, float)) and (time.monotonic() - started_at) > MEDIA_FSM_TTL_SECONDS:
+        await state.clear()
+        await _send_in_context(
+            message,
+            "⏰ زمان افزودن رسانه تموم شد. دوباره <code>/manage_ai media</code> رو بزن.",
+            bot=bot,
+        )
+        return
+
+    raw_text = (message.text or "").strip()
+    if raw_text.lower().startswith(("/cancel", "/done")) or raw_text in ("تموم", "پایان", "بس", "انصراف"):
+        await state.clear()
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await _send_in_context(message, f"✅ ثبت رسانه‌ها تمام شد.\n\n{m_text}", reply_markup=m_kb, bot=bot)
+        return
+
+    media = extract_ai_chat_media(message)
+    if media is None:
+        await _send_in_context(
+            message,
+            "⚠️ لطفاً فقط <b>استیکر</b>، <b>گیف (GIF)</b> یا <b>ویدیومسیج (ویدیو گرد)</b> بفرست (برای پایان /done بزن).",
+            reply_markup=build_ai_media_done_kb(owner_id=user.id),
+            bot=bot,
+        )
+        return
+
+    selected_mood = str(data.get("media_mood") or "auto").strip().lower()
+    effective_mood = (
+        infer_mood_from_emoji(media.get("emoji"))
+        if selected_mood == "auto"
+        else (selected_mood if selected_mood in repository.AI_CHAT_MEDIA_MOODS else "general")
+    )
+
+    _, is_new = await repository.upsert_ai_chat_media(
+        media_type=media["media_type"],
+        file_id=media["file_id"],
+        file_unique_id=media["file_unique_id"],
+        mood=effective_mood,
+        emoji=media.get("emoji"),
+        source="manual",
+        added_by=user.id,
+        chat_id=message.chat.id if message.chat else None,
+    )
+    invalidate_ai_media_counts_cache()
+    await state.update_data(fsm_started_at=time.monotonic())
+
+    counts = await repository.count_ai_chat_media_by_type()
+    type_label = {"sticker": "استیکر", "animation": "گیف", "video_note": "ویدیومسیج"}.get(
+        media["media_type"], media["media_type"]
+    )
+    status_word = "ذخیره شد" if is_new else "به‌روزرسانی شد (از قبل بود)"
+    await _send_in_context(
+        message,
+        (
+            f"✅ {type_label} با حس <code>{escape_html(effective_mood)}</code> {status_word}!\n"
+            f"📦 موجودی فعلی: استیکر <b>{counts.get('sticker', 0)}</b> | "
+            f"گیف <b>{counts.get('animation', 0)}</b> | "
+            f"ویدیومسیج <b>{counts.get('video_note', 0)}</b>\n"
+            "<i>می‌تونی بازم بفرستی یا دکمه زیر رو بزنی.</i>"
+        ),
+        reply_markup=build_ai_media_done_kb(owner_id=user.id),
+        bot=bot,
+    )
+
+
 class AiChatTriggerFilter(Filter):
     """Allow interactive AI chat in PV (owner-only) or in the free-chat group topic when addressed."""
 
@@ -924,7 +1148,10 @@ class AiChatTriggerFilter(Filter):
             return False
 
         raw_text = (message.text or message.caption or "").strip()
-        if not raw_text or raw_text.startswith("/"):
+        has_media = extract_ai_chat_media(message) is not None
+        if raw_text.startswith("/"):
+            return False
+        if not raw_text and not has_media:
             return False
 
         is_owner = is_global_admin(message.from_user.id)
@@ -952,7 +1179,7 @@ class AiChatTriggerFilter(Filter):
 
 @router.message(StateFilter(default_state), AiChatTriggerFilter())
 async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
-    """Respond naturally in Iranian Persian in PV (owner) or free-chat topic (with 20/2h user quota)."""
+    """Respond naturally in Iranian Persian with zero-token reactions and sticker/GIF/video_note replies."""
     chat = message.chat
     user = message.from_user
     if chat is None or user is None:
@@ -962,6 +1189,76 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
     thread_id = resolve_thread_id(message) if is_group else 0
     send_thread_id = to_send_thread_id(thread_id) if is_group else None
 
+    _, bot_username = await ensure_ai_bot_identity(bot)
+    raw_text = (message.text or message.caption or "").strip()
+    stripped_text = strip_bot_mention(raw_text, bot_username)
+    incoming_media = extract_ai_chat_media(message)
+
+    # Best-effort passive capture if group user addressed the bot with a sticker/GIF
+    if is_group and incoming_media is not None:
+        try:
+            await maybe_capture_ai_chat_media(message)
+        except Exception:
+            pass
+
+    # 1. Zero-token fast-path for media-only messages (sticker / GIF / video_note)
+    if not stripped_text and incoming_media is not None:
+        if incoming_media["media_type"] == "sticker" and incoming_media.get("emoji"):
+            react_emoji = classify_emoji_sentiment(str(incoming_media["emoji"]))
+        elif incoming_media["media_type"] == "animation":
+            react_emoji = "😁"
+        else:
+            react_emoji = "👍"
+        await send_ai_reaction(bot, chat.id, message.message_id, react_emoji)
+
+        try:
+            media_counts = await get_ai_chat_media_counts_cached()
+        except Exception:
+            media_counts = {}
+        if media_counts.get(incoming_media["media_type"], 0) > 0 and should_reply_with_media_to_media(
+            chat.id, thread_id
+        ):
+            mood = infer_mood_from_emoji(incoming_media.get("emoji"))
+            await send_ai_chat_media_reply(
+                bot,
+                chat_id=chat.id,
+                thread_id=thread_id,
+                send_thread_id=send_thread_id,
+                media_type=incoming_media["media_type"],
+                mood=mood,
+                reply_to_message_id=message.message_id if is_group else None,
+            )
+        return
+
+    # 2. Zero-token fast-path for emoji-only or short no-reply acknowledgments
+    zero_token_react = classify_zero_token_reaction(stripped_text)
+    if zero_token_react is not None:
+        await send_ai_reaction(bot, chat.id, message.message_id, zero_token_react)
+        return
+
+    # 3. Zero-token fast-path for explicit sticker / GIF / video_note requests
+    requested_media = detect_explicit_media_request(stripped_text)
+    if requested_media is not None:
+        sent = await send_ai_chat_media_reply(
+            bot,
+            chat_id=chat.id,
+            thread_id=thread_id,
+            send_thread_id=send_thread_id,
+            media_type=requested_media,
+            mood="general",
+            reply_to_message_id=message.message_id if is_group else None,
+        )
+        if not sent:
+            media_label = {"sticker": "استیکر", "animation": "گیف", "video_note": "ویدیومسیج"}.get(
+                requested_media, "رسانه"
+            )
+            empty_msg = f"هنوز {media_label}ی توی بانکم ذخیره نشده 😅"
+            if is_global_admin(user.id):
+                empty_msg += "\n💡 از <code>/manage_ai media</code> می‌تونی اضافه کنی."
+            await _send_in_context(message, empty_msg, bot=bot)
+        return
+
+    # 4. Standard LLM conversational path (quota-guarded)
     allowed, _remaining, wait_mins = check_and_consume_user_quota(user.id)
     if not allowed:
         if should_send_quota_notice(user.id):
@@ -988,9 +1285,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
                 pass
         return
 
-    _, bot_username = await ensure_ai_bot_identity(bot)
-    raw_text = (message.text or message.caption or "").strip()
-    user_text = strip_bot_mention(raw_text, bot_username) or "سلام"
+    user_text = stripped_text or "سلام"
 
     topic_name: str | None = None
     if is_group:
@@ -1062,40 +1357,59 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         )
         return
 
-    parts = smart_split(reply_html, limit=TELEGRAM_MESSAGE_MAX_CHARS, count_rendered=True)
-    if not parts:
+    parsed = parse_ai_chat_directives(reply_html)
+    if parsed.reaction and not parsed.text and not parsed.media_type:
+        await send_ai_reaction(bot, chat.id, message.message_id, parsed.reaction)
         return
 
-    for idx, part in enumerate(parts):
-        reply_to = message.message_id if (is_group and idx == 0) else None
-        try:
-            await bot.send_message(
-                chat_id=chat.id,
-                message_thread_id=send_thread_id,
-                text=part,
-                parse_mode="HTML",
-                reply_to_message_id=reply_to,
-                disable_web_page_preview=True,
-            )
-        except TelegramBadRequest as exc:
-            err_lower = str(exc).lower()
-            if "can't parse entities" in err_lower or "parsing" in err_lower:
-                await bot.send_message(
-                    chat_id=chat.id,
-                    message_thread_id=send_thread_id,
-                    text=strip_html_tags(part),
-                    parse_mode=None,
-                    reply_to_message_id=reply_to,
-                    disable_web_page_preview=True,
-                )
-            elif "message to be replied not found" in err_lower or "reply" in err_lower:
+    if parsed.reaction:
+        await send_ai_reaction(bot, chat.id, message.message_id, parsed.reaction)
+
+    if parsed.text:
+        parts = smart_split(parsed.text, limit=TELEGRAM_MESSAGE_MAX_CHARS, count_rendered=True)
+        for idx, part in enumerate(parts):
+            reply_to = message.message_id if (is_group and idx == 0) else None
+            try:
                 await bot.send_message(
                     chat_id=chat.id,
                     message_thread_id=send_thread_id,
                     text=part,
                     parse_mode="HTML",
+                    reply_to_message_id=reply_to,
                     disable_web_page_preview=True,
                 )
-            else:
-                logger.error("Failed sending AI chat reply to %s: %s", chat.id, exc)
-                break
+            except TelegramBadRequest as exc:
+                err_lower = str(exc).lower()
+                if "can't parse entities" in err_lower or "parsing" in err_lower:
+                    await bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=send_thread_id,
+                        text=strip_html_tags(part),
+                        parse_mode=None,
+                        reply_to_message_id=reply_to,
+                        disable_web_page_preview=True,
+                    )
+                elif "message to be replied not found" in err_lower or "reply" in err_lower:
+                    await bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=send_thread_id,
+                        text=part,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                else:
+                    logger.error("Failed sending AI chat reply to %s: %s", chat.id, exc)
+                    break
+
+    if parsed.media_type:
+        sent_media = await send_ai_chat_media_reply(
+            bot,
+            chat_id=chat.id,
+            thread_id=thread_id,
+            send_thread_id=send_thread_id,
+            media_type=parsed.media_type,
+            mood=parsed.media_mood,
+            reply_to_message_id=message.message_id if (is_group and not parsed.text) else None,
+        )
+        if not sent_media and not parsed.text:
+            await send_ai_reaction(bot, chat.id, message.message_id, mood_to_reaction(parsed.media_mood))

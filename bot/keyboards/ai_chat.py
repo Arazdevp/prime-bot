@@ -88,6 +88,12 @@ def build_manage_ai_kb(
                 callback_data=AiChatCB(action="mem", owner_id=owner_id, page=0).pack(),
             ),
         ],
+        [
+            InlineKeyboardButton(
+                text="🎭 رسانه چت (استیکر/گیف/ویدیو)",
+                callback_data=AiChatCB(action="media", owner_id=owner_id).pack(),
+            )
+        ],
     ]
     if has_custom_prompt:
         rows.append(
@@ -297,6 +303,137 @@ def build_ai_prompt_view_kb(owner_id: int) -> InlineKeyboardMarkup:
                     text="🔙 بازگشت به پنل",
                     callback_data=AiChatCB(action="refresh", owner_id=owner_id).pack(),
                 ),
+            ]
+        ]
+    )
+
+
+def build_ai_media_panel_kb(
+    owner_id: int,
+    autocollect: bool,
+    counts: dict[str, int],
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for managing AI chat stickers, GIFs, and video messages."""
+    auto_label = (
+        "🤖 جمع‌آوری خودکار استیکر/گیف: روشن"
+        if autocollect
+        else "🤖 جمع‌آوری خودکار استیکر/گیف: خاموش"
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="➕ افزودن استیکر / گیف / ویدیومسیج",
+                callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="pick").pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=auto_label,
+                callback_data=AiChatCB(action="mauto", owner_id=owner_id).pack(),
+            )
+        ],
+    ]
+
+    test_row: list[InlineKeyboardButton] = []
+    if counts.get("sticker", 0) > 0:
+        test_row.append(
+            InlineKeyboardButton(
+                text="تست استیکر",
+                callback_data=AiChatCB(action="mtest", owner_id=owner_id, arg="sticker").pack(),
+            )
+        )
+    if counts.get("animation", 0) > 0:
+        test_row.append(
+            InlineKeyboardButton(
+                text="تست گیف",
+                callback_data=AiChatCB(action="mtest", owner_id=owner_id, arg="animation").pack(),
+            )
+        )
+    if counts.get("video_note", 0) > 0:
+        test_row.append(
+            InlineKeyboardButton(
+                text="تست ویدیومسیج",
+                callback_data=AiChatCB(action="mtest", owner_id=owner_id, arg="video_note").pack(),
+            )
+        )
+    if test_row:
+        rows.append(test_row)
+
+    total = sum(counts.values())
+    if total > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 پاک کردن خودکارها",
+                    callback_data=AiChatCB(action="mclr", owner_id=owner_id, arg="auto").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="🗑 پاک کردن همه",
+                    callback_data=AiChatCB(action="mclr", owner_id=owner_id, arg="all").pack(),
+                ),
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 بازگشت به پنل",
+                callback_data=AiChatCB(action="refresh", owner_id=owner_id).pack(),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_ai_media_mood_kb(owner_id: int) -> InlineKeyboardMarkup:
+    """Build mood selector keyboard before uploading AI chat media items."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✨ خودکار / عمومی",
+                    callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="auto").pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="😁 خنده",
+                    callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="laugh").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="👍 تایید",
+                    callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="agree").pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👎 مخالفت",
+                    callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="disagree").pack(),
+                ),
+                InlineKeyboardButton(
+                    text="🔥 هیجان",
+                    callback_data=AiChatCB(action="madd", owner_id=owner_id, arg="hype").pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت",
+                    callback_data=AiChatCB(action="media", owner_id=owner_id).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def build_ai_media_done_kb(owner_id: int) -> InlineKeyboardMarkup:
+    """Build finish/back button shown during AI chat media upload FSM."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ اتمام و بازگشت",
+                    callback_data=AiChatCB(action="mdone", owner_id=owner_id).pack(),
+                )
             ]
         ]
     )

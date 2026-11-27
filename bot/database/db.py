@@ -262,6 +262,25 @@ CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_created
 
 CREATE INDEX IF NOT EXISTS idx_music_tracks_chat_msg
     ON music_tracks(chat_id, message_id);
+
+CREATE TABLE IF NOT EXISTS ai_chat_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_type TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    file_unique_id TEXT NOT NULL,
+    mood TEXT NOT NULL DEFAULT 'general',
+    emoji TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
+    added_by INTEGER,
+    chat_id INTEGER,
+    created_at TEXT NOT NULL,
+    use_count INTEGER NOT NULL DEFAULT 0,
+    last_used_at TEXT,
+    UNIQUE(media_type, file_unique_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_chat_media_type_mood
+    ON ai_chat_media(media_type, mood, use_count ASC);
 """
 
 
@@ -543,6 +562,29 @@ async def _apply_migrations(conn: aiosqlite.Connection) -> None:
                 ON music_tracks(chat_id, message_id);
         """)
         await conn.execute("PRAGMA user_version = 9;")
+        await conn.commit()
+
+    if current_version < 10:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS ai_chat_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_type TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                mood TEXT NOT NULL DEFAULT 'general',
+                emoji TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                added_by INTEGER,
+                chat_id INTEGER,
+                created_at TEXT NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                UNIQUE(media_type, file_unique_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_chat_media_type_mood
+                ON ai_chat_media(media_type, mood, use_count ASC);
+        """)
+        await conn.execute("PRAGMA user_version = 10;")
         await conn.commit()
 
 

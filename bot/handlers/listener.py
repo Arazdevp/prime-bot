@@ -8,6 +8,7 @@ from aiogram.types import ChatMemberUpdated, Message
 from bot.config import get_settings
 from bot.database import repository
 from bot.filters import ForumGroupFilter
+from bot.services.ai_media_reaction_service import maybe_capture_ai_chat_media
 from bot.services.deeptalk_service import get_live_session_id_for_topic
 from bot.services.music_service import maybe_capture_music_message
 from bot.texts.private_texts import pick
@@ -214,6 +215,13 @@ async def capture_message(message: Message) -> None:
         # 1. Skip bots (unless sender_chat is set, e.g. GroupAnonymousBot)
         if message.from_user and message.from_user.is_bot and not message.sender_chat:
             return
+
+        # 1b. Passively index stickers and GIFs from free-chat topic for AI chat replies
+        if message.sticker or message.animation:
+            try:
+                await maybe_capture_ai_chat_media(message)
+            except Exception as media_exc:
+                logger.debug("Failed capturing AI chat media: %s", media_exc)
 
         # 2. Skip animations, stickers, and purely decorative media
         if message.animation or message.sticker:

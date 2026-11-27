@@ -118,6 +118,7 @@ def build_runtime_system_prompt(
     group_memory: dict[str, Any] | None = None,
     member_profiles: list[dict[str, Any]] | None = None,
     recent_messages_text: str | None = None,
+    available_media_types: tuple[str, ...] | list[str] | set[str] | None = None,
     now_tehran: datetime | None = None,
 ) -> str:
     """Combine persona prompt with Tehran time, group presence, learned memory, and live topic context."""
@@ -144,6 +145,24 @@ def build_runtime_system_prompt(
             "کاملاً حواست به اینکه داخل گروهی و کی داره باهات حرف می‌زنه هست."
         )
 
+    action_lines = [
+        "- نکته ارسال: پاسخ کامل را طوری بنویس که در یک پیام تلگرامی جا بگیرد و از مارک‌داون (** یا #) استفاده نکن.",
+        "- اگر پیام کاربر کوتاه بود یا اصلاً نیازی به جواب متنی نداشت و یک واکنش ساده کافی بود، کل پاسخت را دقیقاً فقط یکی از این سه مورد بنویس (بدون هیچ متن اضافه‌ای): [REACT:👍] یا [REACT:👎] یا [REACT:😁]",
+    ]
+    media_set = {str(m).strip().lower() for m in (available_media_types or ()) if str(m).strip()}
+    media_tags: list[str] = []
+    if "sticker" in media_set:
+        media_tags.append("[STICKER:mood]")
+    if "animation" in media_set:
+        media_tags.append("[GIF:mood]")
+    if "video_note" in media_set:
+        media_tags.append("[VIDEONOTE:mood]")
+    if media_tags:
+        tags_str = "، ".join(media_tags)
+        action_lines.append(
+            f"- ارسال رسانه (فقط وقتی فضا بخوره یا طرف بخواد، نه هر پیام): می‌تونی در انتهای جواب یا به‌تنهایی یکی از تگ‌های {tags_str} رو بگذاری (mood یکی از laugh, agree, disagree, hype, general)."
+        )
+
     sections = [
         base_prompt.strip(),
         (
@@ -152,7 +171,7 @@ def build_runtime_system_prompt(
             f"- طرف صحبت الان: {safe_speaker}\n"
             f"- محل گفتگو: {place_desc}\n"
             f"{presence_line}\n"
-            "- نکته ارسال: پاسخ کامل را طوری بنویس که در یک پیام تلگرامی جا بگیرد و از مارک‌داون (** یا #) استفاده نکن."
+            + "\n".join(action_lines)
         ),
     ]
 

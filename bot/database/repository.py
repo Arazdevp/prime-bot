@@ -2947,3 +2947,258 @@ async def increment_music_download_count(track_id: int) -> None:
             (track_id,),
         )
         await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# AI Chat Media Bank & Auto-Collect Settings
+# ---------------------------------------------------------------------------
+
+AI_CHAT_MEDIA_TYPES: tuple[str, ...] = ("sticker", "animation", "video_note")
+AI_CHAT_MEDIA_MOODS: tuple[str, ...] = ("laugh", "agree", "disagree", "hype", "general")
+AI_CHAT_AUTO_MEDIA_MAX_PER_TYPE = 80
+
+
+async def get_ai_chat_media_autocollect() -> bool:
+    """Return True unless passive sticker/GIF auto-collection is explicitly disabled in meta."""
+    val = await get_meta_value("ai_chat_media_autocollect")
+    if val is None:
+        return True
+    cleaned = val.strip().lower()
+    if cleaned in ("0", "false", "off", "no", "disabled"):
+        return False
+    return True
+
+
+async def set_ai_chat_media_autocollect(enabled: bool) -> None:
+    """Persist passive sticker/GIF auto-collection toggle ('1' or '0') in meta."""
+    await set_meta_value("ai_chat_media_autocollect", "1" if enabled else "0")
+
+
+def _normalize_media_mood(mood: str | None) -> str:
+    cleaned = (mood or "general").strip().lower()
+    return cleaned if cleaned in AI_CHAT_MEDIA_MOODS else "general"
+
+
+async def upsert_ai_chat_media(
+    *,
+    media_type: str,
+    file_id: str,
+    file_unique_id: str,
+    mood: str = "general",
+    emoji: str | None = None,
+    source: str = "manual",
+    added_by: int | None = None,
+    chat_id: int | None = None,
+) -> tuple[int, bool]:
+    """Insert or update an AI chat media entry; returns (row_id, is_new)."""
+    if media_type not in AI_CHAT_MEDIA_TYPES:
+        raise ValueError(f"Unsupported AI chat media_type: {media_type}")
+    clean_fid = str(file_id or "").strip()
+    clean_uid = str(file_unique_id or "").strip()
+    if not clean_fid or not clean_uid:
+        raise ValueError("file_id and file_unique_id must be non-empty")
+
+    norm_mood = _normalize_media_mood(mood)
+    clean_emoji = emoji.strip() if isinstance(emoji, str) and emoji.strip() else None
+    clean_source = "manual" if str(source).strip().lower() == "manual" else "auto"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cur = await conn.execute(
+            "SELECT id, source FROM ai_chat_media WHERE media_type = ? AND file_unique_id = ?;",
+            (media_type, clean_uid),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            row_id = int(existing["id"])
+            if clean_source == "manual":
+                await conn.execute(
+                    """
+                    UPDATE ai_chat_media
+                    SET file_id = ?,
+                        mood = ?,
+                        emoji = COALESCE(?, emoji),
+                        source = 'manual',
+                        added_by = COALESCE(?, added_by),
+                        chat_id = COALESCE(?, chat_id)
+                    WHERE id = ?;
+                    """,
+                    (clean_fid, norm_mood, clean_emoji, added_by, chat_id, row_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE ai_chat_media
+                    SET file_id = ?,
+                        emoji = COALESCE(?, emoji)
+                    WHERE id = ?;
+                    """,
+                    (clean_fid, clean_emoji, row_id),
+                )
+            await conn.commit()
+            return row_id, False
+
+        ins = await conn.execute(
+            """
+            INSERT INTO ai_chat_media (
+                media_type, file_id, file_unique_id, mood, emoji, source,
+                added_by, chat_id, created_at, use_count, last_used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL);
+            """,
+            (
+                media_type,
+                clean_fid,
+                clean_uid,
+                norm_mood,
+                clean_emoji,
+                clean_source,
+                added_by,
+                chat_id,
+                now_iso,
+            ),
+        )
+        row_id = int(ins.lastrowid)
+
+        if clean_source == "auto":
+            cnt_cur = await conn.execute(
+                "SELECT COUNT(*) AS cnt FROM ai_chat_media WHERE media_type = ? AND source = 'auto';",
+                (media_type,),
+            )
+            cnt_row = await cnt_cur.fetchone()
+            auto_count = int(cnt_row["cnt"]) if cnt_row else 0
+            overflow = auto_count - AI_CHAT_AUTO_MEDIA_MAX_PER_TYPE
+            if overflow > 0:
+                await conn.execute(
+                    """
+                    DELETE FROM ai_chat_media
+                    WHERE id IN (
+                        SELECT id FROM ai_chat_media
+                        WHERE media_type = ? AND source = 'auto'
+                        ORDER BY use_count ASC, created_at ASC, id ASC
+                        LIMIT ?
+                    );
+                    """,
+                    (media_type, overflow),
+                )
+
+        await conn.commit()
+        return row_id, True
+
+
+async def count_ai_chat_media_by_type() -> dict[str, int]:
+    """Return total stored AI chat media counts keyed by media_type."""
+    counts = {mtype: 0 for mtype in AI_CHAT_MEDIA_TYPES}
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT media_type, COUNT(*) AS cnt FROM ai_chat_media GROUP BY media_type;"
+    )
+    for row in await cursor.fetchall():
+        mtype = str(row["media_type"])
+        if mtype in counts:
+            counts[mtype] = int(row["cnt"] or 0)
+    return counts
+
+
+async def count_ai_chat_media_by_source() -> dict[str, int]:
+    """Return total stored AI chat media counts keyed by source ('manual', 'auto')."""
+    counts = {"manual": 0, "auto": 0}
+    conn = get_db()
+    cursor = await conn.execute(
+        "SELECT source, COUNT(*) AS cnt FROM ai_chat_media GROUP BY source;"
+    )
+    for row in await cursor.fetchall():
+        src = str(row["source"])
+        if src in counts:
+            counts[src] = int(row["cnt"] or 0)
+    return counts
+
+
+async def list_ai_chat_media_candidates(
+    media_type: str,
+    *,
+    mood: str | None = None,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    """Fetch candidate AI chat media items preferring manual items and least-recently-used ones."""
+    if media_type not in AI_CHAT_MEDIA_TYPES:
+        return []
+    conn = get_db()
+    safe_limit = max(1, min(int(limit), 50))
+    order_clause = (
+        "ORDER BY CASE WHEN source = 'manual' THEN 0 ELSE 1 END ASC, "
+        "use_count ASC, COALESCE(last_used_at, '') ASC, id DESC LIMIT ?;"
+    )
+    if mood is not None:
+        norm_mood = _normalize_media_mood(mood)
+        cursor = await conn.execute(
+            f"""
+            SELECT id, media_type, file_id, file_unique_id, mood, emoji, source,
+                   added_by, chat_id, created_at, use_count, last_used_at
+            FROM ai_chat_media
+            WHERE media_type = ? AND mood = ?
+            {order_clause}
+            """,
+            (media_type, norm_mood, safe_limit),
+        )
+    else:
+        cursor = await conn.execute(
+            f"""
+            SELECT id, media_type, file_id, file_unique_id, mood, emoji, source,
+                   added_by, chat_id, created_at, use_count, last_used_at
+            FROM ai_chat_media
+            WHERE media_type = ?
+            {order_clause}
+            """,
+            (media_type, safe_limit),
+        )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def mark_ai_chat_media_used(media_id: int) -> None:
+    """Increment use_count and update last_used_at for a sent AI chat media item."""
+    conn = get_db()
+    lock = get_write_lock()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with lock:
+        await conn.execute(
+            "UPDATE ai_chat_media SET use_count = use_count + 1, last_used_at = ? WHERE id = ?;",
+            (now_iso, int(media_id)),
+        )
+        await conn.commit()
+
+
+async def delete_ai_chat_media_by_id(media_id: int) -> bool:
+    """Delete a single AI chat media entry by id."""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cur = await conn.execute("DELETE FROM ai_chat_media WHERE id = ?;", (int(media_id),))
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def clear_ai_chat_media(
+    *,
+    media_type: str | None = None,
+    source: str | None = None,
+) -> int:
+    """Delete AI chat media entries optionally filtered by media_type and/or source."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if media_type is not None:
+        clauses.append("media_type = ?")
+        params.append(media_type)
+    if source is not None:
+        clauses.append("source = ?")
+        params.append(source)
+
+    where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = get_db()
+    lock = get_write_lock()
+    async with lock:
+        cur = await conn.execute(f"DELETE FROM ai_chat_media{where_sql};", tuple(params))
+        await conn.commit()
+        return int(cur.rowcount or 0)
