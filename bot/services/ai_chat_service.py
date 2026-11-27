@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import logging
 import re
 import time
+from typing import Any
 from aiogram import Bot
 from aiogram.types import Message
 from bot.config import (
