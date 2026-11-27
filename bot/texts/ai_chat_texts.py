@@ -119,6 +119,8 @@ def build_runtime_system_prompt(
     member_profiles: list[dict[str, Any]] | None = None,
     recent_messages_text: str | None = None,
     available_media_types: tuple[str, ...] | list[str] | set[str] | None = None,
+    profile_context: str | None = None,
+    visual_context_note: str | None = None,
     now_tehran: datetime | None = None,
 ) -> str:
     """Combine persona prompt with Tehran time, group presence, learned memory, and live topic context."""
@@ -195,6 +197,21 @@ def build_runtime_system_prompt(
     elif group_mem_block or members_block:
         sections.append(
             "(از این شناخت درباره فضای گروه و شخصیت اعضا خیلی طبیعی و نامحسوس استفاده کن، نه با لحن ربات‌گونه.)"
+        )
+
+    if profile_context and profile_context.strip():
+        sections.append(
+            "[اطلاعات پروفایل و بیوگرافی تلگرام]\n"
+            f"{profile_context.strip()}\n"
+            "(بر اساس جزئیات واقعی همین عکس پروفایل و بیوگرافی، با لحن خودمونی، واقعی و دقیق نظر و در صورت درخواست نمره بده؛ "
+            "اگر عکس یا بیوگرافی به خاطر حریم خصوصی بسته بود، خیلی راحت و صادقانه بگو برات باز نیست و الکی حدس نزن.)"
+        )
+
+    if visual_context_note and visual_context_note.strip():
+        sections.append(
+            "[محتوای تصویری/رسانه‌ای پیوست‌شده]\n"
+            f"- {visual_context_note.strip()}\n"
+            "(به جزئیات تصویر/گیف/استیکر پیوست‌شده نگاه کن و مثل یه آدم واقعی توی گروه دقیقاً متناسب با صحنه و حس‌وحالش جواب بده.)"
         )
 
     return "\n\n".join(sections)

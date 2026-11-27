@@ -501,20 +501,29 @@ class GeminiClient(BaseLLMClient):
     async def generate_chat(
         self,
         system_prompt: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float = 0.85,
         max_output_tokens: int | None = None,
         model: str | None = None,
     ) -> str:
-        """Generate a multi-turn conversational reply using Gemini REST contents history."""
-        contents = [
-            {
-                "role": msg["role"],
-                "parts": [{"text": msg["text"]}],
-            }
-            for msg in messages
-            if msg.get("text")
-        ]
+        """Generate a multi-turn conversational reply using Gemini REST contents history (supports inline attachments)."""
+        contents: list[dict[str, Any]] = []
+        for msg in messages:
+            txt = str(msg.get("text") or "")
+            atts = msg.get("attachments") or []
+            parts: list[dict[str, Any]] = []
+            if txt:
+                parts.append({"text": txt})
+            if isinstance(atts, list):
+                for att in atts:
+                    if not isinstance(att, dict):
+                        continue
+                    mime = str(att.get("mime_type") or "").strip()
+                    b64 = str(att.get("data_b64") or "").strip()
+                    if mime and b64:
+                        parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+            if parts:
+                contents.append({"role": msg["role"], "parts": parts})
         if not contents:
             raise LLMError("Cannot generate chat reply without messages", status_code=400, is_retryable=False)
 
@@ -830,32 +839,78 @@ class OpenAIClient(BaseLLMClient):
     async def generate_chat(
         self,
         system_prompt: str,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         temperature: float = 0.85,
         max_output_tokens: int | None = None,
         model: str | None = None,
     ) -> str:
-        """Generate a multi-turn conversational reply via OpenAI-compatible chat/completions."""
+        """Generate a multi-turn conversational reply via OpenAI-compatible chat/completions (supports image_url)."""
         chat_messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        text_only_messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         has_turn = False
+        has_multimodal = False
+
         for msg in messages:
-            txt = (msg.get("text") or "").strip()
-            if not txt:
-                continue
+            txt = str(msg.get("text") or "").strip()
+            atts = msg.get("attachments") or []
             role = "assistant" if msg.get("role") == "model" else "user"
-            chat_messages.append({"role": role, "content": txt})
+
+            image_blocks: list[dict[str, Any]] = []
+            if isinstance(atts, list):
+                for att in atts:
+                    if not isinstance(att, dict):
+                        continue
+                    mime = str(att.get("mime_type") or "").strip().lower()
+                    b64 = str(att.get("data_b64") or "").strip()
+                    if mime.startswith("image/") and b64:
+                        image_blocks.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            }
+                        )
+
+            if not txt and not image_blocks:
+                continue
             has_turn = True
+            if image_blocks:
+                has_multimodal = True
+                blocks: list[dict[str, Any]] = []
+                if txt:
+                    blocks.append({"type": "text", "text": txt})
+                blocks.extend(image_blocks)
+                chat_messages.append({"role": role, "content": blocks})
+                if txt:
+                    text_only_messages.append({"role": role, "content": txt})
+            else:
+                chat_messages.append({"role": role, "content": txt})
+                text_only_messages.append({"role": role, "content": txt})
 
         if not has_turn:
             raise LLMError("Cannot generate chat reply without messages", status_code=400, is_retryable=False)
 
-        return await self._post_chat_completions(
-            chat_messages,
-            temperature=float(temperature),
-            max_tokens=int(max_output_tokens or self.max_output_tokens),
-            allow_truncated=True,
-            model=model,
-        )
+        try:
+            return await self._post_chat_completions(
+                chat_messages,
+                temperature=float(temperature),
+                max_tokens=int(max_output_tokens or self.max_output_tokens),
+                allow_truncated=True,
+                model=model,
+            )
+        except LLMError as exc:
+            if has_multimodal and exc.status_code == 400 and len(text_only_messages) > 1:
+                logger.warning(
+                    "OpenAI-compatible model '%s' rejected multimodal payload (400); retrying text-only.",
+                    (model or self.model),
+                )
+                return await self._post_chat_completions(
+                    text_only_messages,
+                    temperature=float(temperature),
+                    max_tokens=int(max_output_tokens or self.max_output_tokens),
+                    allow_truncated=True,
+                    model=model,
+                )
+            raise
 
     async def close(self) -> None:
         if self._owns_client and self._client and not self._client.is_closed:

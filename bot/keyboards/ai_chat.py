@@ -312,12 +312,18 @@ def build_ai_media_panel_kb(
     owner_id: int,
     autocollect: bool,
     counts: dict[str, int],
+    vision_enabled: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Build inline keyboard for managing AI chat stickers, GIFs, and video messages."""
+    """Build inline keyboard for managing AI chat stickers, GIFs, video messages, and Vision."""
     auto_label = (
         "🤖 جمع‌آوری خودکار استیکر/گیف: روشن"
         if autocollect
         else "🤖 جمع‌آوری خودکار استیکر/گیف: خاموش"
+    )
+    vision_label = (
+        "👁 بینایی و پروفایل (گیف/عکس/بیو): روشن"
+        if vision_enabled
+        else "👁 بینایی و پروفایل (گیف/عکس/بیو): خاموش"
     )
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -330,6 +336,12 @@ def build_ai_media_panel_kb(
             InlineKeyboardButton(
                 text=auto_label,
                 callback_data=AiChatCB(action="mauto", owner_id=owner_id).pack(),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=vision_label,
+                callback_data=AiChatCB(action="mvis", owner_id=owner_id).pack(),
             )
         ],
     ]

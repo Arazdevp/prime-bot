@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from typing import Any
 from aiogram import Bot, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, Filter, StateFilter
@@ -76,6 +77,15 @@ from bot.services.ai_memory_service import (
     is_allowed_ai_chat_topic,
     learn_from_topic_messages,
     resolve_memory_group,
+)
+from bot.services.ai_vision_service import (
+    detect_profile_inspection_intent,
+    extract_visual_attachment_from_message,
+    fetch_user_profile_context,
+    has_supported_visual_input,
+    has_visual_photo,
+    is_ai_chat_vision_enabled_cached,
+    set_ai_chat_vision_enabled_state,
 )
 from bot.services.llm_client import LLMError
 from bot.services.publisher import strip_html_tags
@@ -411,26 +421,35 @@ async def _render_quota_panel(owner_id: int) -> tuple[str, InlineKeyboardMarkup]
 
 
 async def _render_media_panel(owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Render AI chat media bank panel (stickers, GIFs, video notes, and auto-collect)."""
+    """Render AI chat media bank & Vision panel (stickers, GIFs, video notes, auto-collect, profile/GIF vision)."""
     counts = await repository.count_ai_chat_media_by_type()
     sources = await repository.count_ai_chat_media_by_source()
     autocollect = is_ai_chat_media_autocollect_cached()
+    vision_enabled = is_ai_chat_vision_enabled_cached()
     auto_badge = "🟢 <b>روشن</b>" if autocollect else "🔴 <b>خاموش</b>"
+    vision_badge = "🟢 <b>روشن</b>" if vision_enabled else "🔴 <b>خاموش</b>"
 
     text = (
-        "🎭 <b>مدیریت رسانه و واکنش چت هوش مصنوعی</b>\n\n"
+        "🎭 <b>مدیریت رسانه، بینایی و واکنش چت هوش مصنوعی</b>\n\n"
         f"• استیکر: <b>{counts.get('sticker', 0)}</b> عدد\n"
         f"• گیف (GIF): <b>{counts.get('animation', 0)}</b> عدد\n"
         f"• ویدیومسیج (ویدیو گرد): <b>{counts.get('video_note', 0)}</b> عدد\n"
         f"• منبع ذخیره: 👤 دستی <b>{sources.get('manual', 0)}</b> | 🤖 خودکار <b>{sources.get('auto', 0)}</b>\n"
-        f"• جمع‌آوری خودکار از گفتگوی آزاد: {auto_badge}\n\n"
+        f"• جمع‌آوری خودکار از گفتگوی آزاد: {auto_badge}\n"
+        f"• بینایی (فهم گیف/عکس/پروفایل و بیو): {vision_badge}\n\n"
         "<b>نحوه عملکرد:</b>\n"
         "• پیام‌های ایموجی یا کوتاهِ بی‌نیاز به جواب (مثل «آفرین»، «دقیقاً»، «مرسی»، «اوکی») "
         "بدون مصرف هیچ توکنی فقط با ریکشن (👍 / 👎 / 😁) جواب می‌گیرن.\n"
+        "• با روشن بودن بینایی، ربات عکس و گیف‌هایی که براش می‌فرستن رو می‌بینه، و اگر کسی بخواد (مثلاً «پروفایلم چطوره / به استایلم نمره بده»)، بیوگرافی و عکس پروفایلش رو می‌خونه و نظر می‌ده.\n"
         "• ربات توی جواب‌هاش به‌تناسب فضا از استیکر، گیف و ویدیومسیج‌های این بانک هم استفاده می‌کنه.\n"
         "• <i>ویدیومسیج فقط به‌صورت دستی از همینجا اضافه می‌شه (برای حفظ حریم خصوصی اعضا).</i>"
     )
-    return text, build_ai_media_panel_kb(owner_id=owner_id, autocollect=autocollect, counts=counts)
+    return text, build_ai_media_panel_kb(
+        owner_id=owner_id,
+        autocollect=autocollect,
+        counts=counts,
+        vision_enabled=vision_enabled,
+    )
 
 
 async def _run_manual_memory_learn(
@@ -504,6 +523,7 @@ async def render_manage_ai_panel(
         media_counts = await get_ai_chat_media_counts_cached()
     except Exception:
         media_counts = {"sticker": 0, "animation": 0, "video_note": 0}
+    vision_badge = "🟢 روشن" if is_ai_chat_vision_enabled_cached() else "🔴 خاموش"
     mention_hint = f"<code>@{escape_html(bot_username)}</code>" if bot_username else "منشن ربات"
     preferred_gateway = _pick_preferred_gateway_provider(settings)
     gateway_label = "9Router" if preferred_gateway == "9router" else "OpenAI"
@@ -518,7 +538,7 @@ async def render_manage_ai_panel(
         f"• کلید API: {key_badge}\n"
         f"• پرامپت فعال: {prompt_badge}\n"
         f"• تاپیک یادگیری: 📚 {source_label}\n"
-        f"• بانک رسانه: 🎭 استیکر <b>{media_counts.get('sticker', 0)}</b> | گیف <b>{media_counts.get('animation', 0)}</b> | ویدیومسیج <b>{media_counts.get('video_note', 0)}</b>\n"
+        f"• بانک رسانه: 🎭 استیکر <b>{media_counts.get('sticker', 0)}</b> | گیف <b>{media_counts.get('animation', 0)}</b> | ویدیومسیج <b>{media_counts.get('video_note', 0)}</b> | بینایی: {vision_badge}\n"
         f"• حافظه بلندمدت: 👥 <b>{learned_count}</b> عضو شناخته‌شده | مکالمه‌های موقت: <b>{conv_count}</b>\n\n"
         "<b>نحوه استفاده هنگام روشن بودن:</b>\n"
         f"• فقط در گفتگوی آزاد: روی پیام ربات <b>ریپلای</b> بزن یا با {mention_hint} صداش کن\n"
@@ -912,6 +932,18 @@ async def on_manage_ai_callback(
         await safe_edit_message(callback, m_text, m_kb)
         return
 
+    if action == "mvis":
+        new_vis = await set_ai_chat_vision_enabled_state(not is_ai_chat_vision_enabled_cached())
+        toast = (
+            "👁 بینایی و تحلیل پروفایل روشن شد."
+            if new_vis
+            else "🙈 بینایی و تحلیل پروفایل خاموش شد."
+        )
+        await safe_answer_callback(callback, toast)
+        m_text, m_kb = await _render_media_panel(owner_id=user.id)
+        await safe_edit_message(callback, m_text, m_kb)
+        return
+
     if action == "mtest":
         target_type = (callback_data.arg or "").strip()
         if target_type not in repository.AI_CHAT_MEDIA_TYPES or not callback.message or not callback.message.chat:
@@ -1148,7 +1180,10 @@ class AiChatTriggerFilter(Filter):
             return False
 
         raw_text = (message.text or message.caption or "").strip()
-        has_media = extract_ai_chat_media(message) is not None
+        has_media = (
+            extract_ai_chat_media(message) is not None
+            or has_supported_visual_input(message)
+        )
         if raw_text.startswith("/"):
             return False
         if not raw_text and not has_media:
@@ -1193,6 +1228,13 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
     raw_text = (message.text or message.caption or "").strip()
     stripped_text = strip_bot_mention(raw_text, bot_username)
     incoming_media = extract_ai_chat_media(message)
+    vision_enabled = is_ai_chat_vision_enabled_cached()
+    is_bare_photo = not stripped_text and has_visual_photo(message)
+    is_bare_gif = (
+        not stripped_text
+        and incoming_media is not None
+        and incoming_media["media_type"] == "animation"
+    )
 
     # Best-effort passive capture if group user addressed the bot with a sticker/GIF
     if is_group and incoming_media is not None:
@@ -1201,11 +1243,13 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         except Exception:
             pass
 
-    # 1. Zero-token fast-path for media-only messages (sticker / GIF / video_note)
-    if not stripped_text and incoming_media is not None:
-        if incoming_media["media_type"] == "sticker" and incoming_media.get("emoji"):
-            react_emoji = classify_emoji_sentiment(str(incoming_media["emoji"]))
-        elif incoming_media["media_type"] == "animation":
+    async def _reply_bare_media_zero_token(media_info: dict[str, Any] | None) -> None:
+        if media_info is None:
+            await send_ai_reaction(bot, chat.id, message.message_id, "👍")
+            return
+        if media_info["media_type"] == "sticker" and media_info.get("emoji"):
+            react_emoji = classify_emoji_sentiment(str(media_info["emoji"]))
+        elif media_info["media_type"] == "animation":
             react_emoji = "😁"
         else:
             react_emoji = "👍"
@@ -1215,19 +1259,27 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             media_counts = await get_ai_chat_media_counts_cached()
         except Exception:
             media_counts = {}
-        if media_counts.get(incoming_media["media_type"], 0) > 0 and should_reply_with_media_to_media(
+        if media_counts.get(media_info["media_type"], 0) > 0 and should_reply_with_media_to_media(
             chat.id, thread_id
         ):
-            mood = infer_mood_from_emoji(incoming_media.get("emoji"))
+            mood = infer_mood_from_emoji(media_info.get("emoji"))
             await send_ai_chat_media_reply(
                 bot,
                 chat_id=chat.id,
                 thread_id=thread_id,
                 send_thread_id=send_thread_id,
-                media_type=incoming_media["media_type"],
+                media_type=media_info["media_type"],
                 mood=mood,
                 reply_to_message_id=message.message_id if is_group else None,
             )
+
+    # 1. Zero-token fast-path for media-only sticker / video_note (and GIF when Vision is OFF)
+    if not stripped_text and incoming_media is not None and not (vision_enabled and is_bare_gif):
+        await _reply_bare_media_zero_token(incoming_media)
+        return
+
+    if not stripped_text and is_bare_photo and not vision_enabled:
+        await send_ai_reaction(bot, chat.id, message.message_id, "👍")
         return
 
     # 2. Zero-token fast-path for emoji-only or short no-reply acknowledgments
@@ -1258,6 +1310,20 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             await _send_in_context(message, empty_msg, bot=bot)
         return
 
+    # Pre-extract bare GIF/photo attachment before consuming quota so download failures stay zero-token
+    pre_vis_att: dict[str, str] | None = None
+    pre_vis_note: str | None = None
+    if vision_enabled and (is_bare_gif or is_bare_photo):
+        pre_vis_att, pre_vis_note = await extract_visual_attachment_from_message(
+            bot,
+            message,
+            provider=get_effective_ai_chat_provider(),
+            include_reply=False,
+        )
+        if pre_vis_att is None:
+            await _reply_bare_media_zero_token(incoming_media)
+            return
+
     # 4. Standard LLM conversational path (quota-guarded)
     allowed, _remaining, wait_mins = check_and_consume_user_quota(user.id)
     if not allowed:
@@ -1285,7 +1351,14 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
                 pass
         return
 
-    user_text = stripped_text or "سلام"
+    if stripped_text:
+        user_text = stripped_text
+    elif is_bare_gif:
+        user_text = "[کاربر یک گیف فرستاد]"
+    elif is_bare_photo:
+        user_text = "[کاربر یک عکس فرستاد]"
+    else:
+        user_text = "سلام"
 
     topic_name: str | None = None
     if is_group:
@@ -1303,6 +1376,62 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
 
     speaker_name = (user.first_name or user.full_name or "دوست عزیز").strip() or "دوست عزیز"
 
+    attachments: list[dict[str, str]] = []
+    profile_context: str | None = None
+    visual_context_note: str | None = pre_vis_note
+
+    if pre_vis_att is not None:
+        attachments.append(pre_vis_att)
+    elif vision_enabled:
+        reply_user = getattr(reply, "from_user", None) if (reply and not getattr(reply, "forum_topic_created", None)) else None
+        has_replied_human = bool(
+            reply_user is not None
+            and not getattr(reply_user, "is_bot", False)
+            and getattr(reply_user, "id", None) != user.id
+        )
+        wants_profile, inspect_replied = detect_profile_inspection_intent(
+            stripped_text,
+            has_replied_human=has_replied_human,
+        )
+        if wants_profile:
+            target_user_obj: Any = reply_user if (inspect_replied and reply_user is not None) else user
+            # Support inspecting a mentioned @username if known in the database
+            if not inspect_replied and stripped_text:
+                mention_match = re.search(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{3,})", stripped_text)
+                if mention_match:
+                    try:
+                        known_u = await repository.find_known_user_by_username(mention_match.group(1))
+                        if known_u and known_u.get("user_id"):
+                            target_user_obj = type(
+                                "_TargetUser",
+                                (),
+                                {
+                                    "id": int(known_u["user_id"]),
+                                    "username": known_u.get("username"),
+                                    "full_name": known_u.get("full_name"),
+                                    "first_name": known_u.get("full_name"),
+                                },
+                            )()
+                    except Exception:
+                        pass
+            try:
+                prof_data = await fetch_user_profile_context(bot, target_user_obj)
+                profile_context = prof_data.get("context_text")
+                if prof_data.get("attachment"):
+                    attachments.append(prof_data["attachment"])
+            except Exception as prof_exc:
+                logger.debug("Profile inspection lookup failed: %s", prof_exc)
+
+        vis_att, vis_note = await extract_visual_attachment_from_message(
+            bot,
+            message,
+            provider=get_effective_ai_chat_provider(),
+            include_reply=not wants_profile,
+        )
+        if vis_att is not None:
+            attachments.append(vis_att)
+            visual_context_note = vis_note
+
     try:
         await bot.send_chat_action(
             chat_id=chat.id,
@@ -1311,6 +1440,14 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
         )
     except Exception:
         pass
+
+    extra_gen_kwargs: dict[str, Any] = {}
+    if attachments:
+        extra_gen_kwargs["attachments"] = attachments
+    if profile_context:
+        extra_gen_kwargs["profile_context"] = profile_context
+    if visual_context_note:
+        extra_gen_kwargs["visual_context_note"] = visual_context_note
 
     try:
         reply_html = await generate_ai_chat_reply(
@@ -1322,6 +1459,7 @@ async def handle_ai_chat_message(message: Message, bot: Bot) -> None:
             speaker_user_id=user.id,
             topic_name=topic_name,
             reply_context=reply_context,
+            **extra_gen_kwargs,
         )
     except ValueError as exc:
         refund_user_quota(user.id)

@@ -2974,6 +2974,22 @@ async def set_ai_chat_media_autocollect(enabled: bool) -> None:
     await set_meta_value("ai_chat_media_autocollect", "1" if enabled else "0")
 
 
+async def get_ai_chat_vision_enabled() -> bool:
+    """Return True unless AI chat Vision & profile inspection is explicitly disabled in meta."""
+    val = await get_meta_value("ai_chat_vision_enabled")
+    if val is None:
+        return True
+    cleaned = val.strip().lower()
+    if cleaned in ("0", "false", "off", "no", "disabled"):
+        return False
+    return True
+
+
+async def set_ai_chat_vision_enabled(enabled: bool) -> None:
+    """Persist AI chat Vision & profile inspection toggle ('1' or '0') in meta."""
+    await set_meta_value("ai_chat_vision_enabled", "1" if enabled else "0")
+
+
 def _normalize_media_mood(mood: str | None) -> str:
     cleaned = (mood or "general").strip().lower()
     return cleaned if cleaned in AI_CHAT_MEDIA_MOODS else "general"

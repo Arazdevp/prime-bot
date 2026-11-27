@@ -27,6 +27,7 @@ from bot.services.ai_media_reaction_service import (
     reset_ai_media_caches,
 )
 from bot.services.ai_memory_service import build_live_and_learned_context, reset_ai_memory_caches
+from bot.services.ai_vision_service import init_ai_vision_state, reset_ai_vision_caches
 from bot.services.llm_client import GeminiClient, LLMError, OpenAIClient, get_ai_chat_client
 from bot.services.summarizer import sanitize_telegram_html
 from bot.services.timer_service import get_bot_username
@@ -75,6 +76,7 @@ def reset_ai_chat_state() -> None:
     _user_quota_notice_ts.clear()
     reset_ai_memory_caches()
     reset_ai_media_caches()
+    reset_ai_vision_caches()
 
 
 def is_ai_chat_enabled_cached() -> bool:
@@ -105,6 +107,7 @@ async def init_ai_chat_state() -> bool:
     _ai_chat_access_mode_cache = await repository.get_ai_chat_access_mode()
     _ai_chat_user_limit_cache = await repository.get_ai_chat_user_limit()
     await init_ai_media_state()
+    await init_ai_vision_state()
     return _ai_chat_enabled_cache
 
 
@@ -356,7 +359,7 @@ def _get_conv_lock(key: tuple[int, int]) -> asyncio.Lock:
     return lock
 
 
-def _normalize_turns(turns: list[dict[str, str]], max_turns: int) -> list[dict[str, str]]:
+def _normalize_turns(turns: list[dict[str, Any]], max_turns: int) -> list[dict[str, Any]]:
     """Trim history to max_turns while ensuring the sequence starts with a 'user' turn."""
     trimmed = list(turns[-max_turns:]) if max_turns > 0 else list(turns)
     while trimmed and trimmed[0].get("role") != "user":
@@ -374,6 +377,9 @@ async def generate_ai_chat_reply(
     speaker_user_id: int | None = None,
     topic_name: str | None = None,
     reply_context: str | None = None,
+    attachments: list[dict[str, str]] | None = None,
+    profile_context: str | None = None,
+    visual_context_note: str | None = None,
     client: GeminiClient | OpenAIClient | None = None,
 ) -> str:
     """Generate a natural Iranian Persian conversational reply and update rolling memory."""
@@ -397,8 +403,11 @@ async def generate_ai_chat_reply(
             prompt_input = f"{clean_speaker}: {prompt_input}"
 
         history_limit = max(2, int(settings.AI_CHAT_HISTORY_LIMIT))
+        current_user_turn: dict[str, Any] = {"role": "user", "text": prompt_input}
+        if attachments:
+            current_user_turn["attachments"] = list(attachments)
         pending_turns = _normalize_turns(
-            [*existing_messages, {"role": "user", "text": prompt_input}],
+            [*existing_messages, current_user_turn],
             max_turns=history_limit,
         )
 
@@ -433,6 +442,8 @@ async def generate_ai_chat_reply(
             member_profiles=mem_ctx.get("member_profiles"),
             recent_messages_text=mem_ctx.get("recent_messages_text"),
             available_media_types=available_media_types,
+            profile_context=profile_context,
+            visual_context_note=visual_context_note,
         )
 
         raw_reply: str | None = None
